@@ -192,21 +192,30 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
     if bnb_price <= 0:
         logger.warning("无法获取 BNB 价格，使用默认值 600")
         bnb_price = 600.0
+    logger.info("行情数据: BNB=$%.2f, 共 %d 个交易对", bnb_price, len(ticker_prices))
+
+    skip_reasons: dict[str, int] = {
+        "already_pushed": 0, "too_old": 0, "not_publish": 0,
+        "price_too_high": 0, "price_zero": 0, "holders_low": 0,
+    }
 
     for token in tokens:
         addr = token.get("tokenAddress", "")
 
         # 跳过已推送
         if addr in pushed_tokens:
+            skip_reasons["already_pushed"] += 1
             continue
 
         # 时间过滤
         create_ts = int(token.get("createDate", 0))
         if create_ts <= 0 or (now_ms - create_ts) > max_age_ms:
+            skip_reasons["too_old"] += 1
             continue
 
         # 状态过滤（只要未迁移的）
         if token.get("status", "") != "PUBLISH":
+            skip_reasons["not_publish"] += 1
             continue
 
         # 价格过滤：将 token 价格转换为 USD
@@ -220,12 +229,17 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
         else:
             price_usd = raw_price * bnb_price  # fallback
 
-        if price_usd <= 0 or price_usd > max_price:
+        if price_usd <= 0:
+            skip_reasons["price_zero"] += 1
+            continue
+        if price_usd > max_price:
+            skip_reasons["price_too_high"] += 1
             continue
 
         # 持币人数预筛选（列表接口 hold 字段）
         hold_count = int(token.get("hold", 0) or 0)
         if hold_count < min_holders:
+            skip_reasons["holders_low"] += 1
             continue
 
         token["_price_usd"] = price_usd
@@ -233,6 +247,13 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
         results.append(token)
 
     # 按交易量降序排列，优先推送有交易的
+    logger.info(
+        "初筛统计: 已推送=%d, 太旧=%d, 非PUBLISH=%d, 价格为0=%d, 价格过高=%d, 持币人少=%d, 通过=%d",
+        skip_reasons["already_pushed"], skip_reasons["too_old"],
+        skip_reasons["not_publish"], skip_reasons["price_zero"],
+        skip_reasons["price_too_high"], skip_reasons["holders_low"],
+        len(results),
+    )
     results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
     return results
 

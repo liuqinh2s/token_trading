@@ -24,9 +24,11 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 创建虚拟环境并安装依赖
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 pip3 install -r requirements.txt
 ```
 
