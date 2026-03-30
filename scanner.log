@@ -1,0 +1,274 @@
+2026-03-31 07:11:01 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:11:01 [INFO] 🚀 BSC 土狗扫描器启动
+2026-03-31 07:11:01 [INFO] 配置文件: /Users/a1-6/git/token_trading/config.json
+2026-03-31 07:11:01 [INFO] 筛选参数: 当前价格<$3e-05 | ATH<$4e-05 | 持币人>150 | 年龄<48h | 每轮推送≤3
+2026-03-31 07:11:01 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:11:01 [INFO] 开始扫描...
+2026-03-31 07:11:03 [INFO] 获取到 201 个代币，开始筛选...
+2026-03-31 07:11:03 [INFO] 行情数据: BNB=$607.90, 共 18 个交易对
+2026-03-31 07:11:03 [INFO] 初筛统计: 已推送=0, 太旧=9, 非PUBLISH=0, 价格为0=0, 价格过高=1, 持币人少=186, 通过=5
+2026-03-31 07:11:03 [INFO] 筛选出 5 个初筛候选代币，开始二次筛选（媒体链接 + 持币人数 + ATH）...
+2026-03-31 07:11:06 [INFO] 二次筛选通过 5 个代币
+2026-03-31 07:11:06 [INFO] 推送 3 个代币到 Telegram...
+2026-03-31 07:11:07 [INFO] Telegram 推送成功
+2026-03-31 07:11:07 [INFO] 下次扫描: 15 分钟后
+2026-03-31 07:14:34 [INFO] 用户中断，退出程序
+2026-03-31 07:23:59 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:23:59 [INFO] 🚀 BSC 土狗扫描器启动
+2026-03-31 07:23:59 [INFO] 配置文件: /Users/a1-6/git/token_trading/config.json
+2026-03-31 07:23:59 [INFO] 筛选参数: 当前价格<$3e-05 | ATH<$4e-05 | 持币人>150 | 年龄<72h | 每轮推送≤3
+2026-03-31 07:23:59 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:23:59 [INFO] 开始扫描...
+2026-03-31 07:24:01 [INFO] 获取到 197 个代币，开始筛选...
+2026-03-31 07:24:01 [INFO] 行情数据: BNB=$608.56, 共 18 个交易对
+2026-03-31 07:24:01 [INFO] 初筛统计: 已推送=0, 太旧=9, 非PUBLISH=0, 进度低=172, 价格为0=0, 价格过高=1, 持币人少=12, 通过=3
+2026-03-31 07:24:01 [INFO] 筛选出 3 个初筛候选代币，开始二次筛选（媒体链接 + 持币人数 + ATH）...
+2026-03-31 07:24:01 [INFO] 详情接口原始字段: {
+  "id": 102007403,
+  "address": "0x22125377c918cd92303a29ff5a891f7ee0e9ffff",
+  "image": "https://static.four.meme/market/33088S9kwfdzf.png",
+  "name": "全网最全的新闻热门推送网站",
+  "shortName": "监控狗Pro",
+  "symbol": "BNB",
+  "descr": "全网最全的新闻热门推送网站",
+  "twitterUrl": "https://x.com/xiaotiancaiDEV/status/2038591742497456259",
+  "totalAmount": "1000000000",
+  "saleAmount": "800000000",
+  "b0": "6.164383561643835616438356164384",
+  "t0": "1073972602.739726027397168628310578654491",
+  "launchTime": 1774873572000,
+  "minBuy": "0",
+  "maxBuy": "0",
+  "userId": 108099809,
+  "userAddress": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userName": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userAvatar": "",
+  "status": "PUBLISH",
+  "showStatus": "SHOW",
+  "tokenPrice": {
+    "price": "0.000000033160907448",
+    "maxPrice": "0.0000000882",
+    "increase": "4.7773669865",
+    "amount": "627157108.417681923",
+    "marketCap": "33.160907448",
+    "trading": "436.165105816387988488",
+    "dayIncrease": "4.8153575747",
+    "minuteIncrease": "-0.1518941396",
+    "oneMinuteIncrease": "4.8153575747",
+    "hourIncrease": "0.1997706554",
+    "fourHourIncrease": "0.0336487985",
+    "dayTrading": "265318.81",
+    "raisedAmount": "8.652423692603173532",
+    "progress": "0.7839463856",
+    "liquidity": "0",
+    "tradingUsd": "265432.63",
+    "holderCount": 301,
+    "createDate": "1774873577000",
+    "modifyDate": "1774913034121",
+    "bamount": "6.164383561643835616438356164384",
+    "tamount": "1073972602.739726027397260273972602739727"
+  },
+  "oscarStatus": "Hide",
+  "progressTag": true,
+  "ctoTag": false,
+  "version": "V9",
+  "clickFunCheck": false,
+  "reserveAmount": "0",
+  "raisedAmount": "18",
+  "networkCode": "BSC",
+  "label": "Meme",
+  "createDate": "1774873577000",
+  "modifyDate": "1774874121000",
+  "isRush": false,
+  "dexType": "PANCAKE_SWAP",
+  "lastId": 102006708,
+  "taxInfo": {
+    "feeRate": 1,
+    "recipientRate": 100,
+    "burnRate": 0,
+    "divideRate": 0,
+    "liquidityRate": 0,
+    "recipientAddress": "0x71c40c8d3a242851de99b19a75e06576050870d4",
+    "minSharing": 0,
+    "m": 0,
+    "e": 0
+  },
+  "feePlan": false,
+  "aiCreator": true
+}
+2026-03-31 07:24:03 [INFO] 二次筛选通过 3 个代币
+2026-03-31 07:24:03 [INFO] 推送 3 个代币到 Telegram...
+2026-03-31 07:24:04 [INFO] Telegram 推送成功
+2026-03-31 07:24:04 [INFO] 下次扫描: 15 分钟后
+2026-03-31 07:26:19 [INFO] 用户中断，退出程序
+2026-03-31 07:26:21 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:26:21 [INFO] 🚀 BSC 土狗扫描器启动
+2026-03-31 07:26:21 [INFO] 配置文件: /Users/a1-6/git/token_trading/config.json
+2026-03-31 07:26:21 [INFO] 筛选参数: 当前价格<$3e-05 | ATH<$4e-05 | 持币人>150 | 年龄<72h | 每轮推送≤3
+2026-03-31 07:26:21 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:26:21 [INFO] 开始扫描...
+2026-03-31 07:26:23 [INFO] 获取到 198 个代币，开始筛选...
+2026-03-31 07:26:23 [INFO] 行情数据: BNB=$608.29, 共 18 个交易对
+2026-03-31 07:26:23 [INFO] 初筛统计: 已推送=0, 太旧=9, 非PUBLISH=0, 进度低=175, 价格为0=0, 价格过高=1, 持币人少=10, 通过=3
+2026-03-31 07:26:23 [INFO] 筛选出 3 个初筛候选代币，开始二次筛选（媒体链接 + 持币人数 + ATH）...
+2026-03-31 07:26:24 [INFO] 详情接口原始字段: {
+  "id": 102007403,
+  "address": "0x22125377c918cd92303a29ff5a891f7ee0e9ffff",
+  "image": "https://static.four.meme/market/33088S9kwfdzf.png",
+  "name": "全网最全的新闻热门推送网站",
+  "shortName": "监控狗Pro",
+  "symbol": "BNB",
+  "descr": "全网最全的新闻热门推送网站",
+  "twitterUrl": "https://x.com/xiaotiancaiDEV/status/2038591742497456259",
+  "totalAmount": "1000000000",
+  "saleAmount": "800000000",
+  "b0": "6.164383561643835616438356164384",
+  "t0": "1073972602.739726027397168628310578654491",
+  "launchTime": 1774873572000,
+  "minBuy": "0",
+  "maxBuy": "0",
+  "userId": 108099809,
+  "userAddress": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userName": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userAvatar": "",
+  "status": "PUBLISH",
+  "showStatus": "SHOW",
+  "tokenPrice": {
+    "price": "0.000000035082688426",
+    "maxPrice": "0.0000000882",
+    "increase": "5.1121839391",
+    "amount": "639567423.168009256",
+    "marketCap": "35.082688426",
+    "trading": "436.590670871527985442",
+    "dayIncrease": "4.8017354053",
+    "minuteIncrease": "-0.1590366006",
+    "oneMinuteIncrease": "4.8017354053",
+    "hourIncrease": "0.197974251",
+    "fourHourIncrease": "0.0998926036",
+    "dayTrading": "265553.34",
+    "raisedAmount": "9.075718004594200756",
+    "progress": "0.799459279",
+    "liquidity": "0",
+    "tradingUsd": "265464.59",
+    "holderCount": 301,
+    "createDate": "1774873577000",
+    "modifyDate": "1774913163120",
+    "bamount": "6.164383561643835616438356164384",
+    "tamount": "1073972602.739726027397260273972602739727"
+  },
+  "oscarStatus": "Hide",
+  "progressTag": true,
+  "ctoTag": false,
+  "version": "V9",
+  "clickFunCheck": false,
+  "reserveAmount": "0",
+  "raisedAmount": "18",
+  "networkCode": "BSC",
+  "label": "Meme",
+  "createDate": "1774873577000",
+  "modifyDate": "1774874121000",
+  "isRush": false,
+  "dexType": "PANCAKE_SWAP",
+  "lastId": 102006708,
+  "taxInfo": {
+    "feeRate": 1,
+    "recipientRate": 100,
+    "burnRate": 0,
+    "divideRate": 0,
+    "liquidityRate": 0,
+    "recipientAddress": "0x71c40c8d3a242851de99b19a75e06576050870d4",
+    "minSharing": 0,
+    "m": 0,
+    "e": 0
+  },
+  "feePlan": false,
+  "aiCreator": true
+}
+2026-03-31 07:26:25 [INFO] 本轮无通过二次筛选的代币
+2026-03-31 07:26:25 [INFO] 下次扫描: 15 分钟后
+2026-03-31 07:27:06 [INFO] 用户中断，退出程序
+2026-03-31 07:27:08 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:27:08 [INFO] 🚀 BSC 土狗扫描器启动
+2026-03-31 07:27:08 [INFO] 配置文件: /Users/a1-6/git/token_trading/config.json
+2026-03-31 07:27:08 [INFO] 筛选参数: 当前价格<$3e-05 | ATH<$4e-05 | 持币人>150 | 年龄<72h | 每轮推送≤3
+2026-03-31 07:27:08 [INFO] 已启用代理: http://127.0.0.1:7890
+2026-03-31 07:27:08 [INFO] 开始扫描...
+2026-03-31 07:27:10 [INFO] 获取到 198 个代币，开始筛选...
+2026-03-31 07:27:10 [INFO] 行情数据: BNB=$608.42, 共 18 个交易对
+2026-03-31 07:27:10 [INFO] 初筛统计: 已推送=0, 太旧=9, 非PUBLISH=1, 进度低=174, 价格为0=0, 价格过高=1, 持币人少=10, 通过=3
+2026-03-31 07:27:10 [INFO] 筛选出 3 个初筛候选代币，开始二次筛选（媒体链接 + 持币人数 + ATH）...
+2026-03-31 07:27:10 [INFO] 详情接口原始字段: {
+  "id": 102007403,
+  "address": "0x22125377c918cd92303a29ff5a891f7ee0e9ffff",
+  "image": "https://static.four.meme/market/33088S9kwfdzf.png",
+  "name": "全网最全的新闻热门推送网站",
+  "shortName": "监控狗Pro",
+  "symbol": "BNB",
+  "descr": "全网最全的新闻热门推送网站",
+  "twitterUrl": "https://x.com/xiaotiancaiDEV/status/2038591742497456259",
+  "totalAmount": "1000000000",
+  "saleAmount": "800000000",
+  "b0": "6.164383561643835616438356164384",
+  "t0": "1073972602.739726027397168628310578654491",
+  "launchTime": 1774873572000,
+  "minBuy": "0",
+  "maxBuy": "0",
+  "userId": 108099809,
+  "userAddress": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userName": "0xed9f9e23e2a0ea387f97d5757274ed3d01bd73cd",
+  "userAvatar": "",
+  "status": "PUBLISH",
+  "showStatus": "SHOW",
+  "tokenPrice": {
+    "price": "0.000000035627420119",
+    "maxPrice": "0.0000000882",
+    "increase": "5.2070883052",
+    "amount": "642901172.36189823",
+    "marketCap": "35.627420119",
+    "trading": "436.708532257666599289",
+    "dayIncrease": "4.7773669865",
+    "minuteIncrease": "-0.1574759916",
+    "oneMinuteIncrease": "0",
+    "hourIncrease": "0.1919327895",
+    "fourHourIncrease": "0.026896174",
+    "dayTrading": "265432.63",
+    "raisedAmount": "9.193579390732814603",
+    "progress": "0.8036264655",
+    "liquidity": "0",
+    "tradingUsd": "265645.43",
+    "holderCount": 301,
+    "createDate": "1774873577000",
+    "modifyDate": "1774913190177",
+    "bamount": "6.164383561643835616438356164384",
+    "tamount": "1073972602.739726027397260273972602739727"
+  },
+  "oscarStatus": "Hide",
+  "progressTag": true,
+  "ctoTag": false,
+  "version": "V9",
+  "clickFunCheck": false,
+  "reserveAmount": "0",
+  "raisedAmount": "18",
+  "networkCode": "BSC",
+  "label": "Meme",
+  "createDate": "1774873577000",
+  "modifyDate": "1774874121000",
+  "isRush": false,
+  "dexType": "PANCAKE_SWAP",
+  "lastId": 102006708,
+  "taxInfo": {
+    "feeRate": 1,
+    "recipientRate": 100,
+    "burnRate": 0,
+    "divideRate": 0,
+    "liquidityRate": 0,
+    "recipientAddress": "0x71c40c8d3a242851de99b19a75e06576050870d4",
+    "minSharing": 0,
+    "m": 0,
+    "e": 0
+  },
+  "feePlan": false,
+  "aiCreator": true
+}
+2026-03-31 07:27:12 [INFO] 本轮无通过二次筛选的代币
+2026-03-31 07:27:12 [INFO] 下次扫描: 15 分钟后

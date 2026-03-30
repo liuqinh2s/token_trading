@@ -21,6 +21,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("scanner.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -100,33 +104,41 @@ pushed_tokens: set[str] = set()
 MAX_CACHE_SIZE = 5000
 
 
-def fetch_new_tokens(page_size: int = 50) -> list[dict]:
+def fetch_new_tokens(page_size: int = 50, max_pages: int = 1) -> list[dict]:
     """从 four.meme 获取最新发布的代币列表（未迁移，仍在 bonding curve）
-    分别拉取 HOT 和 NEW 排序，合并去重以兼顾热度和时效
+    分别拉取 HOT 和 NEW 排序，支持多页，合并去重以兼顾热度和时效
     """
     all_tokens: dict[str, dict] = {}
     for sort_type, list_type in [("HOT", "ADV"), ("NEW", "NOR")]:
-        payload = {
-            "pageIndex": 1,
-            "pageSize": page_size,
-            "type": sort_type,
-            "listType": list_type,
-            "sort": "DESC",
-            "status": "PUBLISH",
-        }
-        try:
-            resp = _session.post(
-                FOUR_MEME_SEARCH_URL, json=payload, timeout=15
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") == 0:
-                for t in data.get("data", []):
-                    addr = t.get("tokenAddress", "")
-                    if addr and addr not in all_tokens:
-                        all_tokens[addr] = t
-        except Exception as e:
-            logger.error("获取代币列表失败 [%s]: %s", sort_type, e)
+        for page in range(1, max_pages + 1):
+            payload = {
+                "pageIndex": page,
+                "pageSize": page_size,
+                "type": sort_type,
+                "listType": list_type,
+                "sort": "DESC",
+                "status": "PUBLISH",
+            }
+            try:
+                resp = _session.post(
+                    FOUR_MEME_SEARCH_URL, json=payload, timeout=15
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") == 0:
+                    items = data.get("data", [])
+                    for t in items:
+                        addr = t.get("tokenAddress", "")
+                        if addr and addr not in all_tokens:
+                            all_tokens[addr] = t
+                    # 如果返回数量不足一页，说明没有更多了
+                    if len(items) < page_size:
+                        break
+            except Exception as e:
+                logger.error("获取代币列表失败 [%s] 第%d页: %s", sort_type, page, e)
+                break
+            if page < max_pages:
+                time.sleep(0.3)  # 多页时限流
     return list(all_tokens.values())
 
 
@@ -141,7 +153,12 @@ def fetch_token_detail(token_address: str) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == 0:
-            return data.get("data")
+            detail = data.get("data")
+            # 调试: 打印详情接口原始字段（仅首次）
+            if detail and not getattr(fetch_token_detail, "_logged", False):
+                logger.info("详情接口原始字段: %s", json.dumps(detail, ensure_ascii=False, indent=2))
+                fetch_token_detail._logged = True
+            return detail
         return None
     except Exception as e:
         logger.error("获取代币详情失败 [%s]: %s", token_address, e)
@@ -172,31 +189,27 @@ def fetch_ticker_prices() -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # 筛选逻辑
 # ---------------------------------------------------------------------------
-def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
+def filter_tokens(
+    tokens: list[dict], cfg: dict,
+    ticker_prices: dict[str, float], bnb_price: float,
+) -> list[dict]:
     """
     初筛条件（基于列表数据，无需额外请求）：
     1. 发币时间 < max_age_hours（默认 48 小时）
     2. 未迁移（status == PUBLISH）
-    3. 价格 <= max_price (USD)
+    3. 当前价格 <= max_current_price (USD)
     4. 未推送过
     """
     now_ms = int(time.time() * 1000)
     max_age_ms = cfg.get("max_age_hours", 48) * 3600 * 1000
-    max_price = cfg.get("max_price", 0.00003)
+    max_current_price = cfg.get("max_current_price", 0.00003)
     min_holders = cfg.get("min_holders", 150)
     results = []
-
-    # 获取行情价格用于换算
-    ticker_prices = fetch_ticker_prices()
-    bnb_price = ticker_prices.get("BNB", 600.0)
-    if bnb_price <= 0:
-        logger.warning("无法获取 BNB 价格，使用默认值 600")
-        bnb_price = 600.0
-    logger.info("行情数据: BNB=$%.2f, 共 %d 个交易对", bnb_price, len(ticker_prices))
 
     skip_reasons: dict[str, int] = {
         "already_pushed": 0, "too_old": 0, "not_publish": 0,
         "price_too_high": 0, "price_zero": 0, "holders_low": 0,
+        "progress_low": 0,
     }
 
     for token in tokens:
@@ -218,6 +231,13 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
             skip_reasons["not_publish"] += 1
             continue
 
+        # Bonding Curve 进度过滤
+        progress = float(token.get("progress", 0))
+        min_progress = cfg.get("min_progress", 0.3)
+        if progress < min_progress:
+            skip_reasons["progress_low"] += 1
+            continue
+
         # 价格过滤：将 token 价格转换为 USD
         raw_price = float(token.get("price", 0))
         base_symbol = token.get("symbol", "BNB").upper()
@@ -232,7 +252,7 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
         if price_usd <= 0:
             skip_reasons["price_zero"] += 1
             continue
-        if price_usd > max_price:
+        if price_usd > max_current_price:
             skip_reasons["price_too_high"] += 1
             continue
 
@@ -248,11 +268,11 @@ def filter_tokens(tokens: list[dict], cfg: dict) -> list[dict]:
 
     # 按交易量降序排列，优先推送有交易的
     logger.info(
-        "初筛统计: 已推送=%d, 太旧=%d, 非PUBLISH=%d, 价格为0=%d, 价格过高=%d, 持币人少=%d, 通过=%d",
+        "初筛统计: 已推送=%d, 太旧=%d, 非PUBLISH=%d, 进度低=%d, 价格为0=%d, 价格过高=%d, 持币人少=%d, 通过=%d",
         skip_reasons["already_pushed"], skip_reasons["too_old"],
-        skip_reasons["not_publish"], skip_reasons["price_zero"],
-        skip_reasons["price_too_high"], skip_reasons["holders_low"],
-        len(results),
+        skip_reasons["not_publish"], skip_reasons["progress_low"],
+        skip_reasons["price_zero"], skip_reasons["price_too_high"],
+        skip_reasons["holders_low"], len(results),
     )
     results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
     return results
@@ -270,6 +290,23 @@ def has_media_links(detail: dict) -> bool:
     return False
 
 
+def extract_social_links(detail: dict) -> list[dict]:
+    """提取并去重所有社交/媒体链接"""
+    links: list[dict] = []
+    seen_urls: set[str] = set()
+    link_map = {
+        "twitterUrl": "Twitter",
+        "telegramUrl": "Telegram",
+        "webUrl": "Website",
+    }
+    for key, label in link_map.items():
+        url = (detail.get(key) or "").strip()
+        if url and url not in seen_urls:
+            links.append({"type": label, "url": url})
+            seen_urls.add(url)
+    return links
+
+
 def get_holder_count(detail: dict) -> int:
     """从详情中提取持币人数"""
     # 优先从 tokenPrice 子对象取
@@ -282,7 +319,8 @@ def get_holder_count(detail: dict) -> int:
 
 
 def apply_detail_filters(
-    candidates: list[dict], cfg: dict, max_check: int = 20
+    candidates: list[dict], cfg: dict,
+    max_check: int = 20,
 ) -> list[tuple[dict, dict]]:
     """
     对初筛候选币逐个拉取详情，做二次筛选：
@@ -307,15 +345,27 @@ def apply_detail_filters(
             continue
 
         # 媒体链接过滤
-        if not has_media_links(detail):
+        social_links = extract_social_links(detail)
+        if not social_links:
             logger.debug("跳过 %s: 无关联媒体链接", detail.get("name", addr))
             continue
 
+        # 将社交链接存入 detail 方便后续展示
+        detail["_social_links"] = social_links
+
         # 持币人数过滤（用详情接口的精确数据更新）
         holders = get_holder_count(detail)
+        logger.debug(
+            "代币 %s: 详情holderCount=%d, 列表hold=%d",
+            detail.get("name", addr), holders, token.get("_holder_count", 0),
+        )
         if holders <= 0:
             # 详情接口有时返回 0，回退到列表接口的 hold 字段
             holders = token.get("_holder_count", 0)
+            logger.warning(
+                "代币 %s 详情接口 holderCount=0，回退使用列表 hold=%d，数据可能不准",
+                detail.get("name", addr), holders,
+            )
         if holders < min_holders:
             logger.debug(
                 "跳过 %s: 持币人数 %d < %d",
@@ -364,6 +414,14 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def format_social_links(links: list[dict]) -> str:
+    """格式化社交链接为 HTML 文本"""
+    parts = []
+    for link in links:
+        parts.append(f"  • <a href='{link['url']}'>{link['type']}</a>")
+    return "\n".join(parts)
+
+
 def format_message(tokens_info: list[dict]) -> str:
     """格式化推送消息"""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -385,6 +443,13 @@ def format_message(tokens_info: list[dict]) -> str:
         lines.append(f"👥 持币人数: {info.get('holders', 'N/A')}")
         lines.append(f"🕐 创建: {create_time}")
         lines.append(f"📝 {desc}")
+
+        # 社交链接
+        social_links = info.get("social_links", [])
+        if social_links:
+            lines.append(f"🌐 社交链接:")
+            lines.append(format_social_links(social_links))
+
         lines.append(f"🔗 <a href='https://four.meme/token/{addr}'>four.meme</a>"
                       f" | <a href='https://bscscan.com/token/{addr}'>BscScan</a>")
         lines.append("")
@@ -403,15 +468,25 @@ def scan_once(cfg: dict) -> None:
     max_push = cfg.get("max_push_count", 3)
 
     # 拉取最新代币
-    tokens = fetch_new_tokens(page_size=50)
+    page_size = cfg.get("page_size", 50)
+    max_pages = cfg.get("max_pages", 3)
+    tokens = fetch_new_tokens(page_size=page_size, max_pages=max_pages)
     if not tokens:
         logger.info("未获取到代币数据")
         return
 
     logger.info("获取到 %d 个代币，开始筛选...", len(tokens))
 
+    # 获取行情价格（供初筛价格换算）
+    ticker_prices = fetch_ticker_prices()
+    bnb_price = ticker_prices.get("BNB", 600.0)
+    if bnb_price <= 0:
+        logger.warning("无法获取 BNB 价格，使用默认值 600")
+        bnb_price = 600.0
+    logger.info("行情数据: BNB=$%.2f, 共 %d 个交易对", bnb_price, len(ticker_prices))
+
     # 筛选
-    qualified = filter_tokens(tokens, cfg)
+    qualified = filter_tokens(tokens, cfg, ticker_prices, bnb_price)
     if not qualified:
         logger.info("本轮无符合条件的代币")
         return
@@ -420,7 +495,9 @@ def scan_once(cfg: dict) -> None:
 
     # 二次筛选：拉取详情，检查媒体链接和持币人数
     # max_check 多查一些以确保能凑够 max_push 个
-    passed = apply_detail_filters(qualified, cfg, max_check=max_push * 5)
+    passed = apply_detail_filters(
+        qualified, cfg, max_check=max_push * 5
+    )
     if not passed:
         logger.info("本轮无通过二次筛选的代币")
         return
@@ -447,6 +524,7 @@ def scan_once(cfg: dict) -> None:
             "progress": f"{progress_raw * 100:.1f}",
             "holders": token.get("_holder_count", 0),
             "description": get_description_from_detail(detail),
+            "social_links": detail.get("_social_links", []),
         }
         tokens_info.append(info)
 
@@ -491,6 +569,15 @@ def main():
         try:
             global _session
             cfg = load_config()  # 每轮重新加载配置，方便热更新
+            # 启动时打印筛选参数，方便确认配置
+            logger.info(
+                "筛选参数: 当前价格<$%s | 持币人>%d | 年龄<%dh | 进度>%s | 每轮推送≤%d",
+                cfg.get("max_current_price", 0.00003),
+                cfg.get("min_holders", 150),
+                cfg.get("max_age_hours", 48),
+                cfg.get("min_progress", 0.3),
+                cfg.get("max_push_count", 3),
+            )
             _session = _build_session(cfg.get("proxy"))  # 代理配置热更新
             scan_once(cfg)
             interval = cfg.get("scan_interval_minutes", 15)

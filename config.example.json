@@ -4,12 +4,15 @@
     "scan_interval_minutes": 15,
     "max_push_count": 3,
     "max_age_hours": 48,
-    "max_price": 0.00003,
+    "max_current_price": 0.00003,
     "min_holders": 150,
     "proxy": {
         "enabled": false,
         "http": "http://127.0.0.1:1234",
         "https": "http://127.0.0.1:1234",
         "socks5": "socks5://127.0.0.1:1234"
-    }
+    },
+    "page_size": 50,
+    "max_pages": 3,
+    "min_progress": 0.3
 }
