@@ -153,12 +153,7 @@ def fetch_token_detail(token_address: str) -> dict | None:
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") == 0:
-            detail = data.get("data")
-            # 调试: 打印详情接口原始字段（仅首次）
-            if detail and not getattr(fetch_token_detail, "_logged", False):
-                logger.info("详情接口原始字段: %s", json.dumps(detail, ensure_ascii=False, indent=2))
-                fetch_token_detail._logged = True
-            return detail
+            return data.get("data")
         return None
     except Exception as e:
         logger.error("获取代币详情失败 [%s]: %s", token_address, e)
