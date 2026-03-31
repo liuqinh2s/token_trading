@@ -316,6 +316,7 @@ def get_holder_count(detail: dict) -> int:
 def apply_detail_filters(
     candidates: list[dict], cfg: dict,
     max_check: int = 20,
+    bnb_price: float = 600.0,
 ) -> list[tuple[dict, dict]]:
     """
     对初筛候选币逐个拉取详情，做二次筛选：
@@ -336,13 +337,13 @@ def apply_detail_filters(
         detail = fetch_token_detail(addr)
         checked += 1
         if not detail:
-            logger.debug("跳过 %s: 无法获取详情", addr)
+            logger.info("二次筛选跳过 %s: 无法获取详情", addr)
             continue
 
         # 媒体链接过滤
         social_links = extract_social_links(detail)
         if not social_links:
-            logger.debug("跳过 %s: 无关联媒体链接", detail.get("name", addr))
+            logger.info("二次筛选跳过 %s: 无关联媒体链接", detail.get("name", addr))
             continue
 
         # 将社交链接存入 detail 方便后续展示
@@ -350,8 +351,8 @@ def apply_detail_filters(
 
         # 持币人数过滤（用详情接口的精确数据更新）
         holders = get_holder_count(detail)
-        logger.debug(
-            "代币 %s: 详情holderCount=%d, 列表hold=%d",
+        logger.info(
+            "二次筛选 %s: 详情holderCount=%d, 列表hold=%d",
             detail.get("name", addr), holders, token.get("_holder_count", 0),
         )
         if holders <= 0:
@@ -362,16 +363,43 @@ def apply_detail_filters(
                 detail.get("name", addr), holders,
             )
         if holders < min_holders:
-            logger.debug(
-                "跳过 %s: 持币人数 %d < %d",
+            logger.info(
+                "二次筛选跳过 %s: 持币人数 %d < %d",
                 detail.get("name", addr), holders, min_holders,
             )
             continue
 
-        # 将持币人数存入 token 方便后续展示
+        # 市值 / (持币地址数 - 100) 过滤
+        # 市值单位为 k$（千美元），从 token 或 detail 中获取
+        raw_mcap = float(token.get("cap", 0) or 0)
+        mcap_k = raw_mcap * bnb_price / 1000.0  # cap 为 BNB 计价，转换为 k$ 单位
+        denominator = holders - 100
+        if denominator > 0 and mcap_k > 0:
+            ratio = mcap_k / denominator
+            logger.info(
+                "二次筛选 %s: 市值=%.2fk$, 持币=%d, 市值/(持币-100)=%.4f",
+                detail.get("name", addr), mcap_k, holders, ratio,
+            )
+            if ratio >= cfg.get("max_mcap_ratio", 0.09):
+                logger.info(
+                    "二次筛选跳过 %s: 市值/(持币-100)=%.4f >= %.4f",
+                    detail.get("name", addr), ratio, cfg.get("max_mcap_ratio", 0.09),
+                )
+                continue
+        else:
+            logger.info(
+                "二次筛选跳过 %s: 市值=%.2fk$ 或持币人数 %d <= 100，无法计算市值比",
+                detail.get("name", addr), mcap_k, holders,
+            )
+            continue
+
+        # 将持币人数和市值比存入 token 方便后续排序和展示
         token["_holder_count"] = holders
+        token["_mcap_ratio"] = ratio
         results.append((token, detail))
 
+    # 按市值/(持币-100)升序排列，数值小的优先推送
+    results.sort(key=lambda x: x[0].get("_mcap_ratio", float("inf")))
     return results
 
 
@@ -491,7 +519,7 @@ def scan_once(cfg: dict) -> None:
     # 二次筛选：拉取详情，检查媒体链接和持币人数
     # max_check 多查一些以确保能凑够 max_push 个
     passed = apply_detail_filters(
-        qualified, cfg, max_check=max_push * 5
+        qualified, cfg, max_check=max_push * 5, bnb_price=bnb_price
     )
     if not passed:
         logger.info("本轮无通过二次筛选的代币")
