@@ -3,10 +3,11 @@ BSC 土狗扫盘程序 - four.meme 新币扫描器 v2
 数据源: four.meme API (代币发现/详情) + GeckoTerminal API (K线数据)
 
 筛选条件：
-1. 代币总量 = 10亿, 发行时间 > 2小时 且 < 3天
-2. 前2小时最高价 ≤ 0.00002 USD, 当前价 ≤ 0.00003 USD
+1. 代币总量 = 10亿, 发行时间 > 4小时 且 < 3天
+2. 历史最高价 ≤ 0.00014 USD, 前2小时最高价 ≤ 0.00004 USD, 当前价 ≤ 0.00002 USD
 3. 持币地址数 ≥ 150
 4. 关联社交媒体 ≥ 1
+5. 有对应热点新闻
 """
 
 from __future__ import annotations
@@ -171,7 +172,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     """, (oldest, newest, min_holders)).fetchall()
 
     # 解析 JSON, 应用价格过滤
-    max_price = cfg.get("max_price_current", 0.00003)
+    max_price = cfg.get("max_price_current", 0.00002)
     bnb_price = ticker.get("BNB", 600.0)
     results = []
 
@@ -655,6 +656,26 @@ def calc_all_time_high(candles: list[list]) -> float | None:
     return max_high if max_high > 0 else None
 
 
+def calc_max_price_first_n_hours(candles: list[list], hours: int = 2) -> float | None:
+    """从 OHLCV 中提取前 N 小时内的最高价 (USD)
+    candles: [[ts, o, h, l, c, vol], ...] 最新在前
+    利用最旧蜡烛的时间戳作为起始时间
+    """
+    if not candles:
+        return None
+    # 找到最早的时间戳（即代币上线附近的时间）
+    oldest_ts = min(int(c[0]) for c in candles)
+    cutoff_ts = oldest_ts + hours * 3600  # 前 N 小时的截止时间戳
+    max_high = 0.0
+    for c in candles:
+        ts = int(c[0])
+        if ts <= cutoff_ts:
+            high = float(c[2])
+            if high > max_high:
+                max_high = high
+    return max_high if max_high > 0 else None
+
+
 # ===================================================================
 #  三级筛选管线
 # ===================================================================
@@ -670,7 +691,7 @@ def stage1_initial(tokens: list[dict], cfg: dict,
     now_ms = int(time.time() * 1000)
     min_age_ms = cfg.get("min_age_hours", 4) * 3600 * 1000
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
-    max_price = cfg.get("max_price_current", 0.00003)
+    max_price = cfg.get("max_price_current", 0.00002)
     min_holders = cfg.get("min_holders", 150)
     bnb_price = ticker.get("BNB", 600.0)
     results = []
@@ -763,8 +784,10 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
     """
     K线筛（GeckoTerminal OHLCV）:
       - 历史最高价 ≤ max_price_ath
+      - 前2小时最高价 ≤ max_price_2h
     """
-    max_ath = cfg.get("max_price_ath", 0.00003)
+    max_ath = cfg.get("max_price_ath", 0.00014)
+    max_2h = cfg.get("max_price_2h", 0.00004)
     results: list[tuple[dict, dict]] = []
 
     for i, (tk, detail) in enumerate(candidates):
@@ -797,7 +820,15 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
         if high_ath > max_ath:
             continue
 
+        # 前2小时最高价检查
+        high_2h = calc_max_price_first_n_hours(candles, hours=2)
+        if high_2h is not None and high_2h > max_2h:
+            log.info("  %s: 前2h最高 $%.10f > 阈值 $%.10f, 跳过",
+                     name, high_2h, max_2h)
+            continue
+
         tk["_high_ath"] = high_ath
+        tk["_high_2h"] = high_2h
         results.append((tk, detail))
 
     log.info("K线筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
@@ -1019,11 +1050,12 @@ def main():
             # 热更新 session (代理等)
             _fm_session, _gt_session = _init_sessions(cfg.get("proxy"))
             log.info(
-                "筛选: 年龄 %d~%dh | 当前价<$%s | 历史最高<$%s | 总量=%s | 持币>%d | 社交>%d",
+                "筛选: 年龄 %d~%dh | 当前价<$%s | 历史最高<$%s | 前2h最高<$%s | 总量=%s | 持币>%d | 社交>%d",
                 cfg.get("min_age_hours", 4),
                 cfg.get("max_age_hours", 72),
-                cfg.get("max_price_current", 0.00003),
-                cfg.get("max_price_ath", 0.00003),
+                cfg.get("max_price_current", 0.00002),
+                cfg.get("max_price_ath", 0.00014),
+                cfg.get("max_price_2h", 0.00004),
                 cfg.get("required_total_supply", 1_000_000_000),
                 cfg.get("min_holders", 150),
                 cfg.get("min_social_links", 1),

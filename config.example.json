@@ -5,8 +5,9 @@
     "max_push_count": 3,
     "min_age_hours": 4,
     "max_age_hours": 72,
-    "max_price_current": 0.00003,
-    "max_price_ath": 0.00003,
+    "max_price_current": 0.00002,
+    "max_price_ath": 0.00014,
+    "max_price_2h": 0.00004,
     "required_total_supply": 1000000000,
     "min_holders": 150,
     "min_social_links": 1,
@@ -19,7 +20,10 @@
         "enabled": true,
         "weibo": true,
         "google": true,
-        "google_geos": ["US", "CN"],
+        "google_geos": [
+            "US",
+            "CN"
+        ],
         "twitter": true
     }
 }
