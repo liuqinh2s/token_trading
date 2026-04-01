@@ -1,74 +1,48 @@
-# BSC 土狗扫描器
+# BSC 土狗扫描器 v2
 
 扫描 [four.meme](https://four.meme) 平台上新发行的 BSC 代币，自动筛选后推送到 Telegram。
 
-## 功能
+## 数据源
 
-- 定时拉取 four.meme 最新代币（HOT + NEW 双排序合并去重）
-- 多维度自动筛选：发币时间、价格、持币人数、媒体链接等
-- 筛选结果推送到 Telegram（含合约地址、价格、Bonding Curve 进度等）
-- 支持 HTTP/SOCKS5 代理
-- 配置文件热更新，无需重启
+| API | 用途 | 限流 |
+|-----|------|------|
+| **four.meme** | 代币发现、详情（总量/社交链接/描述）、行情价格 | ~2 req/s |
+| **GeckoTerminal** | K线 OHLCV 数据（含 Bonding Curve 阶段） | ~30 req/min，自动退避重试 |
 
-## 筛选逻辑
+## 三级筛选管线
 
-初筛（列表数据）：
-- 发币时间 < 配置的最大小时数
-- 未迁移（仍在 Bonding Curve 阶段）
-- 价格 ≤ 配置的最大价格（USD）
-- 持币人数 ≥ 配置的最小值
+| 阶段 | 条件 | 数据源 | 请求开销 |
+|------|------|--------|----------|
+| **初筛** | 发行 2h~3d、当前价 ≤ $0.00003、持币 ≥ 150、未推送 | 列表 API（批量） | 0 额外请求 |
+| **详情筛** | 总量 = 10亿、社交媒体 ≥ 1 | four.meme 详情 | 每候选 1 请求 |
+| **K线筛** | 前 2h 最高价 ≤ $0.00002 | GeckoTerminal OHLCV | 每候选 2 请求 |
 
-二次筛选（详情数据）：
-- 至少有一个关联媒体链接（Twitter / Telegram / 官网）
-- 持币人数精确校验
+逐级收窄，避免不必要的 API 调用。
 
 ## 快速开始
 
-### 1. 创建虚拟环境并安装依赖
+### 1. 安装依赖
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate
 pip3 install -r requirements.txt
 ```
 
 ### 2. 配置
 
-复制示例配置并填入你的信息：
-
 ```bash
 cp config.example.json config.json
 ```
 
-编辑 `config.json`：
+编辑 `config.json`，填入 Telegram Bot Token 和 Chat ID：
 
 ```json
 {
-  "telegram_bot_token": "你的 Bot Token",
-  "telegram_chat_id": "你的 Chat ID",
-  "scan_interval_minutes": 15,
-  "max_push_count": 3,
-  "max_age_hours": 48,
-  "max_price": 0.00003,
-  "min_holders": 150,
-  "proxy": {
-    "enabled": true,
-    "http": "http://127.0.0.1:7890",
-    "https": "http://127.0.0.1:7890"
-  }
+    "telegram_bot_token": "你的 Bot Token",
+    "telegram_chat_id": "你的 Chat ID"
 }
 ```
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `telegram_bot_token` | Telegram Bot Token | - |
-| `telegram_chat_id` | 推送目标 Chat ID | - |
-| `scan_interval_minutes` | 扫描间隔（分钟） | 15 |
-| `max_push_count` | 每轮最多推送数量 | 3 |
-| `max_age_hours` | 代币最大年龄（小时） | 48 |
-| `max_price` | 最大价格过滤（USD） | 0.00003 |
-| `min_holders` | 最小持币人数 | 150 |
-| `proxy.enabled` | 是否启用代理 | false |
 
 ### 3. 运行
 
@@ -78,6 +52,25 @@ python3 scanner.py
 
 未配置 Telegram 时，筛选结果会打印到控制台。
 
+## 配置参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `telegram_bot_token` | Telegram Bot Token | - |
+| `telegram_chat_id` | 推送目标 Chat ID | - |
+| `scan_interval_minutes` | 扫描间隔（分钟） | 15 |
+| `max_push_count` | 每轮最多推送数量 | 3 |
+| `min_age_hours` | 代币最小年龄（小时） | 2 |
+| `max_age_hours` | 代币最大年龄（小时） | 72 |
+| `max_price_current` | 当前价上限 (USD) | 0.00003 |
+| `max_price_first_2h` | 前2h最高价上限 (USD) | 0.00002 |
+| `required_total_supply` | 要求的代币总量 | 1000000000 |
+| `min_holders` | 最小持币地址数 | 150 |
+| `min_social_links` | 最小社交媒体数 | 1 |
+| `proxy.enabled` | 是否启用代理 | false |
+
+所有参数支持热更新（每轮扫描重新读取配置文件）。
+
 ## 推送示例
 
 ```
@@ -86,16 +79,20 @@ python3 scanner.py
 
 #1 SomeToken (STK)
 📄 合约: 0x1234...abcd
-💰 价格: $0.0000012345
-📊 Bonding Curve: 45.2%
+💰 当前价: $0.0000012345
+📈 前2h最高: $0.0000008000
 👥 持币人数: 320
+🔗 社交媒体: 2 个
+  • Twitter
+  • Telegram
 🕐 创建: 2025-01-01 10:00 UTC
 📝 这是一个示例代币描述...
-🔗 four.meme | BscScan
+🌐 four.meme | BscScan
 ```
 
 ## 注意事项
 
 - 本工具仅用于信息扫描，不构成任何投资建议
 - BSC 土狗币风险极高，请自行判断
+- GeckoTerminal 免费 API 有限流（~30 req/min），程序内置自动退避重试
 - 建议配合代理使用，避免 IP 被限流

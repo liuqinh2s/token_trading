@@ -1,6 +1,12 @@
 """
-BSC 土狗扫盘程序 - four.meme 新币扫描器
-扫描 four.meme 上新发行的代币，筛选后推送到 Telegram
+BSC 土狗扫盘程序 - four.meme 新币扫描器 v2
+数据源: four.meme API (代币发现/详情) + GeckoTerminal API (K线数据)
+
+筛选条件：
+1. 代币总量 = 10亿, 发行时间 > 2小时 且 < 3天
+2. 前2小时最高价 ≤ 0.00002 USD, 当前价 ≤ 0.00003 USD
+3. 持币地址数 ≥ 150
+4. 关联社交媒体 ≥ 1
 """
 
 from __future__ import annotations
@@ -8,29 +14,31 @@ from __future__ import annotations
 import json
 import time
 import logging
+import re
+import sys
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# 日志配置
-# ---------------------------------------------------------------------------
+# ===================================================================
+#  日志
+# ===================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.StreamHandler(),
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler("scanner.log", encoding="utf-8"),
     ],
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# 配置加载
-# ---------------------------------------------------------------------------
+# ===================================================================
+#  配置
+# ===================================================================
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
@@ -39,579 +47,623 @@ def load_config() -> dict:
         return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# four.meme API
-# ---------------------------------------------------------------------------
-FOUR_MEME_SEARCH_URL = "https://four.meme/meme-api/v1/public/token/search"
-FOUR_MEME_DETAIL_URL = "https://four.meme/meme-api/v1/private/token/get/v2"
-FOUR_MEME_TICKER_URL = "https://four.meme/meme-api/v1/public/ticker"
+# ===================================================================
+#  常量 & API
+# ===================================================================
+FM_SEARCH = "https://four.meme/meme-api/v1/public/token/search"
+FM_DETAIL = "https://four.meme/meme-api/v1/private/token/get/v2"
+FM_TICKER = "https://four.meme/meme-api/v1/public/ticker"
+GT_BASE = "https://api.geckoterminal.com/api/v2"
 
-HEADERS = {
+FM_HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
     "Origin": "https://four.meme",
     "Referer": "https://four.meme/",
 }
+GT_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+pushed_tokens: set[str] = set()
+MAX_CACHE = 5000
 
 
-def _build_session(proxy_cfg: dict | None = None) -> requests.Session:
-    """构建带自动重试、连接复用和代理的 Session"""
+# ===================================================================
+#  Session 构建（带重试 + 代理）
+# ===================================================================
+def _build_session(proxy_cfg: dict | None = None,
+                   extra_headers: dict | None = None) -> requests.Session:
     session = requests.Session()
-    retry_strategy = Retry(
-        total=3,                    # 最多重试 3 次
-        backoff_factor=1,           # 退避: 1s, 2s, 4s
-        status_forcelist=[429, 500, 502, 503, 504],
+    retry = Retry(
+        total=3, backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=5,
-        pool_maxsize=10,
-    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update(HEADERS)
-
-    # 代理配置
+    if extra_headers:
+        session.headers.update(extra_headers)
     if proxy_cfg and proxy_cfg.get("enabled"):
         session.proxies = {
             "http": proxy_cfg.get("http", ""),
             "https": proxy_cfg.get("https", ""),
         }
-        logger.info("已启用代理: %s", proxy_cfg.get("https", ""))
-
+        log.info("代理已启用: %s", proxy_cfg.get("https", ""))
     return session
 
 
-def _init_session() -> requests.Session:
-    """从配置文件读取代理设置并初始化 Session"""
-    try:
-        cfg = load_config()
-        proxy_cfg = cfg.get("proxy")
-    except Exception:
-        proxy_cfg = None
-    return _build_session(proxy_cfg)
+def _init_sessions(proxy_cfg: dict | None = None):
+    """初始化 four.meme 和 GeckoTerminal 两个 session"""
+    fm = _build_session(proxy_cfg, FM_HEADERS)
+    gt = _build_session(proxy_cfg, GT_HEADERS)
+    return fm, gt
 
 
-# 全局复用 Session，减少 TLS 握手开销
-_session = _init_session()
-
-# 已推送过的合约地址缓存（避免重复推送）
-pushed_tokens: set[str] = set()
-# 最多缓存数量，防止内存无限增长
-MAX_CACHE_SIZE = 5000
+# 全局 Session
+_fm_session: requests.Session = None  # type: ignore
+_gt_session: requests.Session = None  # type: ignore
 
 
-def fetch_new_tokens(page_size: int = 50, max_pages: int = 1) -> list[dict]:
-    """从 four.meme 获取最新发布的代币列表（未迁移，仍在 bonding curve）
-    分别拉取 HOT 和 NEW 排序，支持多页，合并去重以兼顾热度和时效
+def _ensure_sessions():
+    global _fm_session, _gt_session
+    if _fm_session is None:
+        try:
+            cfg = load_config()
+            proxy = cfg.get("proxy")
+        except Exception:
+            proxy = None
+        _fm_session, _gt_session = _init_sessions(proxy)
+
+
+# ===================================================================
+#  four.meme API 层
+# ===================================================================
+def fm_search_tokens(cfg: dict) -> list[dict]:
     """
-    all_tokens: dict[str, dict] = {}
-    for sort_type, list_type in [("HOT", "ADV"), ("NEW", "NOR")]:
+    全量扫描 four.meme 代币, 尽可能覆盖完整时间窗口。
+
+    策略:
+      - 按 symbol 分片查询 NEW 排序 (BNB/USD1/USDT/CAKE), 每片最多 10 页 × 100
+        BNB ~10h, USD1 ~61h, USDT/CAKE >72h  →  合计覆盖绝大多数代币
+      - 补充 HOT / VOL / PROGRESS 排序, 各 1 页, 捕获老但活跃的代币
+      - 同时拉取 PUBLISH + TRADE 状态
+      - 当某页最旧代币超过 max_age 时提前停止翻页
+    """
+    _ensure_sessions()
+    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
+    now_ms = int(time.time() * 1000)
+    seen: dict[str, dict] = {}
+    page_size = 100  # API 最大支持 100
+    max_pages = 10   # API 最大支持 10 页
+
+    def _add_tokens(items: list[dict]):
+        for t in items:
+            addr = t.get("tokenAddress", "")
+            if addr and addr not in seen:
+                seen[addr] = t
+
+    def _fetch_pages(query: dict, label: str):
+        """逐页拉取, 超出时间窗口时提前停止"""
         for page in range(1, max_pages + 1):
-            payload = {
-                "pageIndex": page,
-                "pageSize": page_size,
-                "type": sort_type,
-                "listType": list_type,
-                "sort": "DESC",
-                "status": "PUBLISH",
-            }
+            payload = {"pageIndex": page, "pageSize": page_size, **query}
             try:
-                resp = _session.post(
-                    FOUR_MEME_SEARCH_URL, json=payload, timeout=15
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("code") == 0:
-                    items = data.get("data", [])
-                    for t in items:
-                        addr = t.get("tokenAddress", "")
-                        if addr and addr not in all_tokens:
-                            all_tokens[addr] = t
-                    # 如果返回数量不足一页，说明没有更多了
-                    if len(items) < page_size:
-                        break
+                r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
+                r.raise_for_status()
+                d = r.json()
+                if d.get("code") != 0:
+                    break
+                items = d.get("data", [])
+                if not items:
+                    break
+                _add_tokens(items)
+
+                # 检查最旧代币是否超出时间窗口
+                oldest_ts = min(int(t.get("createDate", 0)) for t in items)
+                if oldest_ts > 0 and (now_ms - oldest_ts) > max_age_ms:
+                    log.debug("  %s p%d: 已超出 %dh 时间窗口, 停止翻页",
+                              label, page, cfg.get("max_age_hours", 72))
+                    break
+                if len(items) < page_size:
+                    break
             except Exception as e:
-                logger.error("获取代币列表失败 [%s] 第%d页: %s", sort_type, page, e)
+                log.error("fm_search [%s] p%d: %s", label, page, e)
                 break
-            if page < max_pages:
-                time.sleep(0.3)  # 多页时限流
-    return list(all_tokens.values())
+            time.sleep(0.3)
 
-
-def fetch_token_detail(token_address: str) -> dict | None:
-    """获取单个代币的详细信息（含描述）"""
-    try:
-        resp = _session.get(
-            FOUR_MEME_DETAIL_URL,
-            params={"address": token_address},
-            timeout=20,
+    # ── 1. 按 symbol 分片查询 NEW 排序 (PUBLISH) ──
+    for sym in ("BNB", "USD1", "USDT", "CAKE"):
+        _fetch_pages(
+            {"type": "NEW", "listType": "NOR", "sort": "DESC",
+             "status": "PUBLISH", "symbol": sym},
+            label=f"NEW/PUBLISH/{sym}",
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 0:
-            return data.get("data")
-        return None
+
+    # ── 2. 补充排序: HOT / VOL / PROGRESS (PUBLISH), 各 1 页 ──
+    for sort_type, list_type in [("HOT", "ADV"), ("VOL", "NOR"), ("PROGRESS", "NOR")]:
+        payload = {"pageIndex": 1, "pageSize": page_size,
+                   "type": sort_type, "listType": list_type, "status": "PUBLISH"}
+        try:
+            r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("code") == 0:
+                _add_tokens(d.get("data", []))
+        except Exception as e:
+            log.error("fm_search [%s]: %s", sort_type, e)
+        time.sleep(0.3)
+
+    # ── 3. 已迁移代币 (TRADE) ──
+    for sym in ("BNB", "USD1", "USDT"):
+        _fetch_pages(
+            {"type": "NEW", "listType": "NOR_DEX", "sort": "DESC",
+             "status": "TRADE", "symbol": sym},
+            label=f"NEW/TRADE/{sym}",
+        )
+
+    log.info("fm_search: 共获取 %d 个代币", len(seen))
+    return list(seen.values())
+
+
+def fm_detail(address: str) -> dict | None:
+    _ensure_sessions()
+    try:
+        r = _fm_session.get(FM_DETAIL, params={"address": address}, timeout=20)
+        r.raise_for_status()
+        d = r.json()
+        return d.get("data") if d.get("code") == 0 else None
     except Exception as e:
-        logger.error("获取代币详情失败 [%s]: %s", token_address, e)
+        log.error("fm_detail [%s]: %s", address[:20], e)
         return None
 
 
-def fetch_ticker_prices() -> dict[str, float]:
-    """获取所有交易对的 USDT 价格映射，如 {'BNB': 619.0, 'CAKE': 1.4, 'USD1': 1.0, ...}"""
+def fm_ticker_prices() -> dict[str, float]:
+    """返回 {BASE_SYMBOL: usdt_price}"""
+    _ensure_sessions()
     prices: dict[str, float] = {}
     try:
-        resp = _session.post(FOUR_MEME_TICKER_URL, json={}, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 0:
-            for t in data.get("data", []):
+        r = _fm_session.post(FM_TICKER, json={}, timeout=20)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code") == 0:
+            for t in d.get("data", []):
                 sym = t.get("symbol", "")
                 if sym.endswith("USDT"):
-                    base = sym[: -4]  # 去掉 USDT 后缀
+                    base = sym[:-4].upper()
                     try:
-                        prices[base.upper()] = float(t.get("price", 0))
-                    except (ValueError, TypeError):
+                        prices[base] = float(t["price"])
+                    except (ValueError, TypeError, KeyError):
                         pass
     except Exception as e:
-        logger.error("获取行情失败: %s", e)
+        log.error("fm_ticker: %s", e)
     return prices
 
 
-# ---------------------------------------------------------------------------
-# 筛选逻辑
-# ---------------------------------------------------------------------------
-def filter_tokens(
-    tokens: list[dict], cfg: dict,
-    ticker_prices: dict[str, float], bnb_price: float,
-) -> list[dict]:
+# ===================================================================
+#  GeckoTerminal API 层
+# ===================================================================
+def _gt_request(url: str, params: dict | None = None,
+                max_retries: int = 3) -> dict | None:
+    """带退避重试的 GeckoTerminal 请求"""
+    _ensure_sessions()
+    for attempt in range(max_retries):
+        try:
+            r = _gt_session.get(url, params=params, timeout=15)
+            if r.status_code == 429:
+                wait = 5 * (attempt + 1)
+                log.warning("GeckoTerminal 429, 等待 %ds (%d/%d)",
+                            wait, attempt + 1, max_retries)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                raise
+    return None
+
+
+def gt_get_pool(token_address: str) -> str | None:
+    """查询代币在 BSC 上的首个交易池地址"""
+    try:
+        data = _gt_request(f"{GT_BASE}/networks/bsc/tokens/{token_address}")
+        if not data:
+            return None
+        pools = (data.get("data", {})
+                 .get("relationships", {})
+                 .get("top_pools", {})
+                 .get("data", []))
+        if pools:
+            return pools[0]["id"].replace("bsc_", "")
+        return None
+    except Exception as e:
+        log.error("gt_get_pool [%s]: %s", token_address[:20], e)
+        return None
+
+
+def gt_ohlcv_hourly(pool_address: str, limit: int = 72) -> list[list]:
+    """获取小时级 OHLCV: [[ts, o, h, l, c, vol], ...] 最新在前"""
+    try:
+        data = _gt_request(
+            f"{GT_BASE}/networks/bsc/pools/{pool_address}/ohlcv/hour",
+            params={"aggregate": 1, "limit": limit},
+        )
+        if not data:
+            return []
+        return (data.get("data", {})
+                .get("attributes", {})
+                .get("ohlcv_list", []))
+    except Exception as e:
+        log.error("gt_ohlcv [%s]: %s", pool_address[:20], e)
+        return []
+
+
+def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
+    """从 OHLCV 中提取发币后前 2 小时内的最高价 (USD)
+    candles: [[ts, o, h, l, c, vol], ...] 最新在前
     """
-    初筛条件（基于列表数据，无需额外请求）：
-    1. 发币时间 < max_age_hours（默认 48 小时）
-    2. 未迁移（status == PUBLISH）
-    3. 当前价格 <= max_current_price (USD)
-    4. 未推送过
+    if not candles:
+        return None
+    cutoff = create_ts_sec + 2 * 3600
+    max_high = 0.0
+    found = False
+    for c in candles:
+        ts = int(c[0])
+        if ts > cutoff:
+            continue
+        if ts < create_ts_sec - 3600:
+            continue
+        high = float(c[2])
+        if high > max_high:
+            max_high = high
+        found = True
+    return max_high if found else None
+
+
+# ===================================================================
+#  三级筛选管线
+# ===================================================================
+def stage1_initial(tokens: list[dict], cfg: dict,
+                   ticker: dict[str, float]) -> list[dict]:
+    """
+    初筛（列表数据, 零额外请求）:
+      - 发行时间: min_age_hours < age < max_age_hours
+      - 当前价 ≤ max_price_current
+      - 持币地址 ≥ min_holders
+      - 未推送过
     """
     now_ms = int(time.time() * 1000)
-    max_age_ms = cfg.get("max_age_hours", 48) * 3600 * 1000
-    max_current_price = cfg.get("max_current_price", 0.00003)
+    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
+    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
+    max_price = cfg.get("max_price_current", 0.00003)
     min_holders = cfg.get("min_holders", 150)
+    bnb_price = ticker.get("BNB", 600.0)
     results = []
 
-    skip_reasons: dict[str, int] = {
-        "already_pushed": 0, "too_old": 0, "not_publish": 0,
-        "price_too_high": 0, "price_zero": 0, "holders_low": 0,
-        "progress_low": 0,
-    }
+    skip = {"pushed": 0, "age": 0, "price": 0, "holders": 0}
 
-    for token in tokens:
-        addr = token.get("tokenAddress", "")
-
-        # 跳过已推送
+    for tk in tokens:
+        addr = tk.get("tokenAddress", "")
         if addr in pushed_tokens:
-            skip_reasons["already_pushed"] += 1
-            continue
+            skip["pushed"] += 1; continue
 
-        # 时间过滤
-        create_ts = int(token.get("createDate", 0))
-        if create_ts <= 0 or (now_ms - create_ts) > max_age_ms:
-            skip_reasons["too_old"] += 1
-            continue
+        create_ts = int(tk.get("createDate", 0))
+        age = now_ms - create_ts
+        if create_ts <= 0 or age < min_age_ms or age > max_age_ms:
+            skip["age"] += 1; continue
 
-        # 状态过滤（只要未迁移的）
-        if token.get("status", "") != "PUBLISH":
-            skip_reasons["not_publish"] += 1
-            continue
-
-        # Bonding Curve 进度过滤
-        progress = float(token.get("progress", 0))
-        min_progress = cfg.get("min_progress", 0.3)
-        if progress < min_progress:
-            skip_reasons["progress_low"] += 1
-            continue
-
-        # 价格过滤：将 token 价格转换为 USD
-        raw_price = float(token.get("price", 0))
-        base_symbol = token.get("symbol", "BNB").upper()
-        base_price_usd = ticker_prices.get(base_symbol, 0)
-        if base_symbol in ("USDT",):
+        raw_price = float(tk.get("price", 0))
+        base = tk.get("symbol", "BNB").upper()
+        if base == "USDT":
             price_usd = raw_price
-        elif base_price_usd > 0:
-            price_usd = raw_price * base_price_usd
         else:
-            price_usd = raw_price * bnb_price  # fallback
+            price_usd = raw_price * ticker.get(base, bnb_price)
+        if price_usd <= 0 or price_usd > max_price:
+            skip["price"] += 1; continue
 
-        if price_usd <= 0:
-            skip_reasons["price_zero"] += 1
-            continue
-        if price_usd > max_current_price:
-            skip_reasons["price_too_high"] += 1
-            continue
+        holders = int(tk.get("hold", 0) or 0)
+        if holders < min_holders:
+            skip["holders"] += 1; continue
 
-        # 持币人数预筛选（列表接口 hold 字段）
-        hold_count = int(token.get("hold", 0) or 0)
-        if hold_count < min_holders:
-            skip_reasons["holders_low"] += 1
-            continue
+        tk["_price_usd"] = price_usd
+        tk["_holders"] = holders
+        results.append(tk)
 
-        token["_price_usd"] = price_usd
-        token["_holder_count"] = hold_count
-        results.append(token)
-
-    # 按交易量降序排列，优先推送有交易的
-    logger.info(
-        "初筛统计: 已推送=%d, 太旧=%d, 非PUBLISH=%d, 进度低=%d, 价格为0=%d, 价格过高=%d, 持币人少=%d, 通过=%d",
-        skip_reasons["already_pushed"], skip_reasons["too_old"],
-        skip_reasons["not_publish"], skip_reasons["progress_low"],
-        skip_reasons["price_zero"], skip_reasons["price_too_high"],
-        skip_reasons["holders_low"], len(results),
-    )
     results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
+    log.info("初筛: 通过=%d | 跳过: 已推=%d 年龄=%d 价格=%d 持币=%d",
+             len(results), skip["pushed"], skip["age"], skip["price"], skip["holders"])
     return results
 
 
-# ---------------------------------------------------------------------------
-# 描述处理
-# ---------------------------------------------------------------------------
-def has_media_links(detail: dict) -> bool:
-    """检查代币是否有至少一个关联媒体链接（Twitter / Telegram / 官网）"""
-    for key in ("twitterUrl", "telegramUrl", "webUrl"):
-        val = (detail.get(key) or "").strip()
-        if val:
-            return True
-    return False
+def stage2_detail(candidates: list[dict], cfg: dict,
+                  max_check: int = 30) -> list[tuple[dict, dict]]:
+    """
+    详情筛（four.meme 详情请求）:
+      - 代币总量 = required_total_supply (10亿)
+      - 关联社交媒体 ≥ min_social_links
+    """
+    required_supply = cfg.get("required_total_supply", 1_000_000_000)
+    min_links = cfg.get("min_social_links", 1)
+    results: list[tuple[dict, dict]] = []
+
+    for i, tk in enumerate(candidates):
+        if i >= max_check:
+            break
+        addr = tk.get("tokenAddress", "")
+        if i > 0:
+            time.sleep(0.5)
+        detail = fm_detail(addr)
+        if not detail:
+            continue
+
+        # 总量
+        try:
+            supply = int(float(detail.get("totalAmount", 0)))
+        except (ValueError, TypeError):
+            supply = 0
+        if supply != required_supply:
+            log.debug("跳过 %s: 总量 %s != %s",
+                      detail.get("name", addr), supply, required_supply)
+            continue
+
+        # 社交媒体
+        link_count = sum(
+            1 for k in ("twitterUrl", "telegramUrl", "webUrl")
+            if (detail.get(k) or "").strip()
+        )
+        if link_count < min_links:
+            log.debug("跳过 %s: 社交媒体 %d < %d",
+                      detail.get("name", addr), link_count, min_links)
+            continue
+
+        tk["_social_count"] = link_count
+        results.append((tk, detail))
+
+    log.info("详情筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
+    return results
 
 
+def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
+                 max_check: int = 15) -> list[tuple[dict, dict]]:
+    """
+    K线筛（GeckoTerminal OHLCV）:
+      - 前 2 小时最高价 ≤ max_price_first_2h
+    """
+    max_2h = cfg.get("max_price_first_2h", 0.00002)
+    results: list[tuple[dict, dict]] = []
+
+    for i, (tk, detail) in enumerate(candidates):
+        if i >= max_check:
+            break
+        addr = tk.get("tokenAddress", "")
+        name = tk.get("name", addr[:16])
+        create_ts_sec = int(tk.get("createDate", 0)) // 1000
+
+        if i > 0:
+            time.sleep(3)
+
+        pool = gt_get_pool(addr)
+        if not pool:
+            log.debug("跳过 %s: 无 GeckoTerminal 交易池", name)
+            continue
+
+        time.sleep(3)
+
+        candles = gt_ohlcv_hourly(pool, limit=72)
+        if not candles:
+            log.debug("跳过 %s: 无 K 线数据", name)
+            continue
+
+        high_2h = calc_first_2h_max(candles, create_ts_sec)
+        if high_2h is None:
+            log.debug("跳过 %s: 无法确定前 2h 最高价", name)
+            continue
+
+        log.info("  %s: 前2h最高 $%.10f (阈值 $%.10f)", name, high_2h, max_2h)
+        if high_2h > max_2h:
+            continue
+
+        tk["_high_2h"] = high_2h
+        results.append((tk, detail))
+
+    log.info("K线筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
+    return results
+
+
+# ===================================================================
+#  社交链接 & 描述
+# ===================================================================
 def extract_social_links(detail: dict) -> list[dict]:
-    """提取并去重所有社交/媒体链接"""
     links: list[dict] = []
-    seen_urls: set[str] = set()
-    link_map = {
-        "twitterUrl": "Twitter",
-        "telegramUrl": "Telegram",
-        "webUrl": "Website",
-    }
-    for key, label in link_map.items():
+    seen: set[str] = set()
+    for key, label in [("twitterUrl", "Twitter"),
+                       ("telegramUrl", "Telegram"),
+                       ("webUrl", "Website")]:
         url = (detail.get(key) or "").strip()
-        if url and url not in seen_urls:
+        if url and url not in seen:
             links.append({"type": label, "url": url})
-            seen_urls.add(url)
+            seen.add(url)
     return links
 
 
-def get_holder_count(detail: dict) -> int:
-    """从详情中提取持币人数"""
-    # 优先从 tokenPrice 子对象取
-    tp = detail.get("tokenPrice") or {}
-    hc = tp.get("holderCount", 0)
-    if hc:
-        return int(hc)
-    # fallback: 顶层字段
-    return int(detail.get("holderCount", 0))
-
-
-def apply_detail_filters(
-    candidates: list[dict], cfg: dict,
-    max_check: int = 20,
-    bnb_price: float = 600.0,
-) -> list[tuple[dict, dict]]:
-    """
-    对初筛候选币逐个拉取详情，做二次筛选：
-    - 至少有一个关联媒体链接
-    - 持币人数 > min_holders（默认 150）
-    返回 (search_token, detail) 元组列表
-    """
-    min_holders = cfg.get("min_holders", 150)
-    results: list[tuple[dict, dict]] = []
-
-    checked = 0
-    for token in candidates:
-        if checked >= max_check:
-            break
-        addr = token.get("tokenAddress", "")
-        if checked > 0:
-            time.sleep(0.5)  # 限流，避免 429
-        detail = fetch_token_detail(addr)
-        checked += 1
-        if not detail:
-            logger.info("二次筛选跳过 %s: 无法获取详情", addr)
-            continue
-
-        # 媒体链接过滤
-        social_links = extract_social_links(detail)
-        if not social_links:
-            logger.info("二次筛选跳过 %s: 无关联媒体链接", detail.get("name", addr))
-            continue
-
-        # 将社交链接存入 detail 方便后续展示
-        detail["_social_links"] = social_links
-
-        # 持币人数过滤（用详情接口的精确数据更新）
-        holders = get_holder_count(detail)
-        logger.info(
-            "二次筛选 %s: 详情holderCount=%d, 列表hold=%d",
-            detail.get("name", addr), holders, token.get("_holder_count", 0),
-        )
-        if holders <= 0:
-            # 详情接口有时返回 0，回退到列表接口的 hold 字段
-            holders = token.get("_holder_count", 0)
-            logger.warning(
-                "代币 %s 详情接口 holderCount=0，回退使用列表 hold=%d，数据可能不准",
-                detail.get("name", addr), holders,
-            )
-        if holders < min_holders:
-            logger.info(
-                "二次筛选跳过 %s: 持币人数 %d < %d",
-                detail.get("name", addr), holders, min_holders,
-            )
-            continue
-
-        # 市值 / (持币地址数 - 100) 过滤
-        # 市值单位为 k$（千美元），从 token 或 detail 中获取
-        raw_mcap = float(token.get("cap", 0) or 0)
-        mcap_k = raw_mcap * bnb_price / 1000.0  # cap 为 BNB 计价，转换为 k$ 单位
-        denominator = holders - 100
-        if denominator > 0 and mcap_k > 0:
-            ratio = mcap_k / denominator
-            logger.info(
-                "二次筛选 %s: 市值=%.2fk$, 持币=%d, 市值/(持币-100)=%.4f",
-                detail.get("name", addr), mcap_k, holders, ratio,
-            )
-            if ratio >= cfg.get("max_mcap_ratio", 0.09):
-                logger.info(
-                    "二次筛选跳过 %s: 市值/(持币-100)=%.4f >= %.4f",
-                    detail.get("name", addr), ratio, cfg.get("max_mcap_ratio", 0.09),
-                )
-                continue
-        else:
-            logger.info(
-                "二次筛选跳过 %s: 市值=%.2fk$ 或持币人数 %d <= 100，无法计算市值比",
-                detail.get("name", addr), mcap_k, holders,
-            )
-            continue
-
-        # 将持币人数和市值比存入 token 方便后续排序和展示
-        token["_holder_count"] = holders
-        token["_mcap_ratio"] = ratio
-        results.append((token, detail))
-
-    # 按市值/(持币-100)升序排列，数值小的优先推送
-    results.sort(key=lambda x: x[0].get("_mcap_ratio", float("inf")))
-    return results
-
-
-def get_description_from_detail(detail: dict) -> str:
-    """从已获取的详情中提取描述，截断到 100 字"""
+def truncate_desc(detail: dict, limit: int = 100) -> str:
     desc = (detail.get("descr") or "").strip()
     if not desc:
         return "暂无介绍"
-    if len(desc) > 100:
-        desc = desc[:97] + "..."
-    return desc
+    return desc[:limit - 3] + "..." if len(desc) > limit else desc
 
 
-# ---------------------------------------------------------------------------
-# Telegram 推送
-# ---------------------------------------------------------------------------
-def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        resp = _session.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("ok"):
-            return True
-        logger.warning("Telegram 发送失败: %s", result.get("description"))
-        return False
-    except Exception as e:
-        logger.error("Telegram 请求异常: %s", e)
-        return False
+# ===================================================================
+#  消息格式化 & 推送
+# ===================================================================
+def format_social_html(links: list[dict]) -> str:
+    return "\n".join(f"  • <a href='{l['url']}'>{l['type']}</a>" for l in links)
 
 
-def format_social_links(links: list[dict]) -> str:
-    """格式化社交链接为 HTML 文本"""
-    parts = []
-    for link in links:
-        parts.append(f"  • <a href='{link['url']}'>{link['type']}</a>")
-    return "\n".join(parts)
-
-
-def format_message(tokens_info: list[dict]) -> str:
-    """格式化推送消息"""
+def format_message(infos: list[dict]) -> str:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"🔍 <b>BSC 土狗扫描报告</b>", f"⏰ {now_str}", ""]
 
-    for i, info in enumerate(tokens_info, 1):
-        name = info["name"]
-        short = info.get("shortName", "")
-        addr = info["address"]
-        price_usd = info["price_usd"]
-        desc = info["description"]
-        create_time = info["create_time"]
-        progress = info.get("progress", "N/A")
-
-        lines.append(f"<b>#{i} {name} ({short})</b>")
-        lines.append(f"📄 合约: <code>{addr}</code>")
-        lines.append(f"💰 价格: ${price_usd:.10f}")
-        lines.append(f"📊 Bonding Curve: {progress}%")
-        lines.append(f"👥 持币人数: {info.get('holders', 'N/A')}")
-        lines.append(f"🕐 创建: {create_time}")
-        lines.append(f"📝 {desc}")
-
-        # 社交链接
+    for i, info in enumerate(infos, 1):
+        lines.append(f"<b>#{i} {info['name']} ({info['short']})</b>")
+        lines.append(f"📄 合约: <code>{info['address']}</code>")
+        lines.append(f"💰 当前价: ${info['price_usd']:.10f}")
+        lines.append(f"📈 前2h最高: ${info['high_2h']:.10f}")
+        lines.append(f"👥 持币人数: {info['holders']}")
+        lines.append(f"🔗 社交媒体: {info['social_count']} 个")
         social_links = info.get("social_links", [])
         if social_links:
-            lines.append(f"🌐 社交链接:")
-            lines.append(format_social_links(social_links))
-
-        lines.append(f"🔗 <a href='https://four.meme/token/{addr}'>four.meme</a>"
-                      f" | <a href='https://bscscan.com/token/{addr}'>BscScan</a>")
+            lines.append(format_social_html(social_links))
+        lines.append(f"🕐 创建: {info['create_time']}")
+        lines.append(f"📝 {info['desc']}")
+        a = info["address"]
+        lines.append(
+            f"🌐 <a href='https://four.meme/token/{a}'>four.meme</a>"
+            f" | <a href='https://bscscan.com/token/{a}'>BscScan</a>"
+        )
         lines.append("")
 
-    lines.append("—— four.meme 土狗扫描器 ——")
+    lines.append("—— four.meme 土狗扫描器 v2 ——")
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# 主扫描流程
-# ---------------------------------------------------------------------------
+def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+    _ensure_sessions()
+    try:
+        r = _fm_session.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
+        r.raise_for_status()
+        result = r.json()
+        if result.get("ok"):
+            return True
+        log.warning("Telegram: %s", result.get("description"))
+        return False
+    except Exception as e:
+        log.error("Telegram: %s", e)
+        return False
+
+
+def print_console(msg: str) -> None:
+    out = msg.replace("<b>", "").replace("</b>", "")
+    out = out.replace("<code>", "").replace("</code>", "")
+    out = re.sub(r"<a href='[^']*'>", "", out).replace("</a>", "")
+    print("\n" + "=" * 60)
+    print(out)
+    print("=" * 60 + "\n")
+
+
+# ===================================================================
+#  主扫描流程
+# ===================================================================
 def scan_once(cfg: dict) -> None:
     global pushed_tokens
-
-    logger.info("开始扫描...")
+    log.info("=" * 50)
+    log.info("开始扫描")
+    log.info("=" * 50)
     max_push = cfg.get("max_push_count", 3)
 
-    # 拉取最新代币
-    page_size = cfg.get("page_size", 50)
-    max_pages = cfg.get("max_pages", 3)
-    tokens = fetch_new_tokens(page_size=page_size, max_pages=max_pages)
+    # 0) 行情
+    ticker = fm_ticker_prices()
+    bnb = ticker.get("BNB", 0)
+    if bnb <= 0:
+        log.warning("BNB 价格获取失败, 使用默认 600")
+        ticker["BNB"] = 600.0
+    log.info("BNB=$%.2f", ticker.get("BNB", 0))
+
+    # 1) 拉取代币 (全量扫描)
+    tokens = fm_search_tokens(cfg)
     if not tokens:
-        logger.info("未获取到代币数据")
-        return
+        log.info("未获取到代币"); return
 
-    logger.info("获取到 %d 个代币，开始筛选...", len(tokens))
+    # 2) 初筛
+    s1 = stage1_initial(tokens, cfg, ticker)
+    if not s1:
+        log.info("初筛无结果"); return
 
-    # 获取行情价格（供初筛价格换算）
-    ticker_prices = fetch_ticker_prices()
-    bnb_price = ticker_prices.get("BNB", 600.0)
-    if bnb_price <= 0:
-        logger.warning("无法获取 BNB 价格，使用默认值 600")
-        bnb_price = 600.0
-    logger.info("行情数据: BNB=$%.2f, 共 %d 个交易对", bnb_price, len(ticker_prices))
+    # 3) 详情筛
+    s2 = stage2_detail(s1, cfg, max_check=max_push * 8)
+    if not s2:
+        log.info("详情筛无结果"); return
 
-    # 筛选
-    qualified = filter_tokens(tokens, cfg, ticker_prices, bnb_price)
-    if not qualified:
-        logger.info("本轮无符合条件的代币")
-        return
+    # 4) K线筛
+    s3 = stage3_kline(s2, cfg, max_check=max_push * 5)
+    if not s3:
+        log.info("K线筛无结果"); return
 
-    logger.info("筛选出 %d 个初筛候选代币，开始二次筛选（媒体链接 + 持币人数）...", len(qualified))
-
-    # 二次筛选：拉取详情，检查媒体链接和持币人数
-    # max_check 多查一些以确保能凑够 max_push 个
-    passed = apply_detail_filters(
-        qualified, cfg, max_check=max_push * 5, bnb_price=bnb_price
-    )
-    if not passed:
-        logger.info("本轮无通过二次筛选的代币")
-        return
-
-    logger.info("二次筛选通过 %d 个代币", len(passed))
-
-    # 取前 N 个
-    to_push = passed[:max_push]
-
-    # 组装推送信息（详情已在二次筛选中获取，无需重复请求）
-    tokens_info = []
-    for token, detail in to_push:
-        addr = token.get("tokenAddress", "")
-        create_ts = int(token.get("createDate", 0))
+    # 5) 组装推送
+    to_push = s3[:max_push]
+    infos = []
+    for tk, detail in to_push:
+        addr = tk["tokenAddress"]
+        create_ts = int(tk.get("createDate", 0))
         create_dt = datetime.fromtimestamp(create_ts / 1000, tz=timezone.utc)
-        progress_raw = float(token.get("progress", 0))
-
-        info = {
-            "name": token.get("name", "Unknown"),
-            "shortName": token.get("shortName", ""),
+        infos.append({
+            "name": tk.get("name", "Unknown"),
+            "short": tk.get("shortName", ""),
             "address": addr,
-            "price_usd": token.get("_price_usd", 0),
+            "price_usd": tk.get("_price_usd", 0),
+            "high_2h": tk.get("_high_2h", 0),
+            "holders": tk.get("_holders", 0),
+            "social_count": tk.get("_social_count", 0),
+            "social_links": extract_social_links(detail),
             "create_time": create_dt.strftime("%Y-%m-%d %H:%M UTC"),
-            "progress": f"{progress_raw * 100:.1f}",
-            "holders": token.get("_holder_count", 0),
-            "description": get_description_from_detail(detail),
-            "social_links": detail.get("_social_links", []),
-        }
-        tokens_info.append(info)
+            "desc": truncate_desc(detail),
+        })
 
-    # 格式化并推送
-    msg = format_message(tokens_info)
-    logger.info("推送 %d 个代币到 Telegram...", len(tokens_info))
+    msg = format_message(infos)
+    log.info("推送 %d 个代币", len(infos))
 
     bot_token = cfg.get("telegram_bot_token", "")
     chat_id = cfg.get("telegram_chat_id", "")
-
-    if bot_token == "YOUR_BOT_TOKEN_HERE" or chat_id == "YOUR_CHAT_ID_HERE":
-        logger.warning("⚠️  Telegram 未配置，仅打印消息:")
-        # 将 HTML 标签简单替换用于控制台显示
-        print("\n" + "=" * 60)
-        console_msg = msg.replace("<b>", "").replace("</b>", "")
-        console_msg = console_msg.replace("<code>", "").replace("</code>", "")
-        console_msg = console_msg.replace("<a href='", "[").replace("'>", "] ")
-        console_msg = console_msg.replace("</a>", "")
-        print(console_msg)
-        print("=" * 60 + "\n")
+    if not bot_token or not chat_id or "YOUR" in bot_token:
+        log.warning("Telegram 未配置, 仅打印:")
+        print_console(msg)
     else:
         ok = send_telegram(bot_token, chat_id, msg)
-        if ok:
-            logger.info("Telegram 推送成功")
-        else:
-            logger.error("Telegram 推送失败")
+        log.info("Telegram 推送%s", "成功" if ok else "失败")
 
-    # 记录已推送
-    for info in tokens_info:
+    for info in infos:
         pushed_tokens.add(info["address"])
-
-    # 清理缓存
-    if len(pushed_tokens) > MAX_CACHE_SIZE:
-        pushed_tokens = set(list(pushed_tokens)[-MAX_CACHE_SIZE // 2:])
+    if len(pushed_tokens) > MAX_CACHE:
+        pushed_tokens = set(list(pushed_tokens)[-MAX_CACHE // 2:])
 
 
 def main():
-    logger.info("🚀 BSC 土狗扫描器启动")
-    logger.info("配置文件: %s", CONFIG_PATH)
+    global _fm_session, _gt_session
+    log.info("🚀 BSC 土狗扫描器 v2 启动")
+    log.info("配置文件: %s", CONFIG_PATH)
 
     while True:
         try:
-            global _session
-            cfg = load_config()  # 每轮重新加载配置，方便热更新
-            # 启动时打印筛选参数，方便确认配置
-            logger.info(
-                "筛选参数: 当前价格<$%s | 持币人>%d | 年龄<%dh | 进度>%s | 每轮推送≤%d",
-                cfg.get("max_current_price", 0.00003),
+            cfg = load_config()
+            # 热更新 session (代理等)
+            _fm_session, _gt_session = _init_sessions(cfg.get("proxy"))
+            log.info(
+                "筛选: 年龄 %d~%dh | 当前价<$%s | 前2h价<$%s | 总量=%s | 持币>%d | 社交>%d",
+                cfg.get("min_age_hours", 2),
+                cfg.get("max_age_hours", 72),
+                cfg.get("max_price_current", 0.00003),
+                cfg.get("max_price_first_2h", 0.00002),
+                cfg.get("required_total_supply", 1_000_000_000),
                 cfg.get("min_holders", 150),
-                cfg.get("max_age_hours", 48),
-                cfg.get("min_progress", 0.3),
-                cfg.get("max_push_count", 3),
+                cfg.get("min_social_links", 1),
             )
-            _session = _build_session(cfg.get("proxy"))  # 代理配置热更新
             scan_once(cfg)
             interval = cfg.get("scan_interval_minutes", 15)
-            logger.info("下次扫描: %d 分钟后", interval)
+            log.info("下次扫描: %d 分钟后", interval)
             time.sleep(interval * 60)
         except KeyboardInterrupt:
-            logger.info("用户中断，退出程序")
-            break
+            log.info("用户中断, 退出"); break
         except Exception as e:
-            logger.error("扫描异常: %s", e, exc_info=True)
-            time.sleep(60)  # 出错后等 1 分钟重试
+            log.error("扫描异常: %s", e, exc_info=True)
+            time.sleep(60)
 
 
 if __name__ == "__main__":
