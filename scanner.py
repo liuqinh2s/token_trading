@@ -16,6 +16,7 @@ import time
 import logging
 import re
 import sys
+import sqlite3
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -66,6 +67,143 @@ GT_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 
 pushed_tokens: set[str] = set()
 MAX_CACHE = 5000
+
+DB_PATH = Path(__file__).parent / "tokens.db"
+
+
+# ===================================================================
+#  SQLite 本地代币缓存
+#  跨轮次累积代币, 解决 API 分页上限 (10页×100) 无法覆盖全时间窗口的问题
+#  每 15 分钟扫一次, 每次覆盖最新 ~5h, 运行数小时后即实现全量覆盖
+# ===================================================================
+def _init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            address      TEXT PRIMARY KEY,
+            name         TEXT,
+            short_name   TEXT,
+            symbol       TEXT,
+            status       TEXT,
+            create_date  INTEGER,
+            price        REAL,
+            hold         INTEGER,
+            day1_vol     REAL,
+            progress     REAL,
+            raw_json     TEXT,
+            first_seen   INTEGER,
+            last_updated INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tokens_create ON tokens(create_date)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_tokens_hold ON tokens(hold)
+    """)
+    conn.commit()
+    return conn
+
+
+def db_upsert_tokens(conn: sqlite3.Connection, tokens: list[dict]):
+    """批量插入或更新代币 (价格/持币人数/交易量等实时字段始终更新)"""
+    now_ms = int(time.time() * 1000)
+    rows = []
+    for t in tokens:
+        addr = t.get("tokenAddress", "")
+        if not addr:
+            continue
+        rows.append((
+            addr,
+            t.get("name", ""),
+            t.get("shortName", ""),
+            t.get("symbol", "BNB"),
+            t.get("status", ""),
+            int(t.get("createDate", 0)),
+            float(t.get("price", 0)),
+            int(t.get("hold", 0) or 0),
+            float(t.get("day1Vol", 0) or 0),
+            float(t.get("progress", 0) or 0),
+            json.dumps(t, ensure_ascii=False),
+            now_ms,
+            now_ms,
+        ))
+    conn.executemany("""
+        INSERT INTO tokens (address, name, short_name, symbol, status,
+                            create_date, price, hold, day1_vol, progress,
+                            raw_json, first_seen, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            price        = excluded.price,
+            hold         = excluded.hold,
+            day1_vol     = excluded.day1_vol,
+            progress     = excluded.progress,
+            status       = excluded.status,
+            raw_json     = excluded.raw_json,
+            last_updated = excluded.last_updated
+    """, rows)
+    conn.commit()
+
+
+def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
+                        ticker: dict[str, float]) -> list[dict]:
+    """
+    从本地数据库中查询符合初筛条件的代币:
+      - 发行时间在 [min_age, max_age] 范围内
+      - 持币人数 ≥ min_holders
+    价格过滤在 Python 层做 (需要汇率换算)
+    """
+    now_ms = int(time.time() * 1000)
+    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
+    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
+    min_holders = cfg.get("min_holders", 150)
+
+    oldest = now_ms - max_age_ms
+    newest = now_ms - min_age_ms
+
+    rows = conn.execute("""
+        SELECT raw_json FROM tokens
+        WHERE create_date BETWEEN ? AND ?
+          AND hold >= ?
+        ORDER BY day1_vol DESC
+    """, (oldest, newest, min_holders)).fetchall()
+
+    # 解析 JSON, 应用价格过滤
+    max_price = cfg.get("max_price_current", 0.00003)
+    bnb_price = ticker.get("BNB", 600.0)
+    results = []
+
+    for (raw,) in rows:
+        tk = json.loads(raw)
+        addr = tk.get("tokenAddress", "")
+        if addr in pushed_tokens:
+            continue
+
+        raw_price = float(tk.get("price", 0))
+        base = tk.get("symbol", "BNB").upper()
+        if base == "USDT":
+            price_usd = raw_price
+        else:
+            price_usd = raw_price * ticker.get(base, bnb_price)
+        if price_usd <= 0 or price_usd > max_price:
+            continue
+
+        tk["_price_usd"] = price_usd
+        tk["_holders"] = int(tk.get("hold", 0) or 0)
+        results.append(tk)
+
+    results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
+    return results
+
+
+def db_cleanup(conn: sqlite3.Connection, max_age_hours: int = 168):
+    """清理超过 max_age_hours 的旧记录 (默认 7 天)"""
+    cutoff = int(time.time() * 1000) - max_age_hours * 3600 * 1000
+    deleted = conn.execute("DELETE FROM tokens WHERE create_date < ?", (cutoff,)).rowcount
+    conn.commit()
+    if deleted > 0:
+        log.info("db_cleanup: 清理 %d 条过期记录", deleted)
 
 
 # ===================================================================
@@ -569,7 +707,8 @@ def scan_once(cfg: dict) -> None:
     log.info("=" * 50)
     max_push = cfg.get("max_push_count", 3)
 
-    # 0) 行情
+    # 0) 初始化数据库 & 行情
+    conn = _init_db()
     ticker = fm_ticker_prices()
     bnb = ticker.get("BNB", 0)
     if bnb <= 0:
@@ -577,25 +716,42 @@ def scan_once(cfg: dict) -> None:
         ticker["BNB"] = 600.0
     log.info("BNB=$%.2f", ticker.get("BNB", 0))
 
-    # 1) 拉取代币 (全量扫描)
+    # 1) 拉取代币 (全量扫描) → 存入 SQLite
     tokens = fm_search_tokens(cfg)
-    if not tokens:
-        log.info("未获取到代币"); return
+    if tokens:
+        db_upsert_tokens(conn, tokens)
+        log.info("已入库 %d 个代币", len(tokens))
+    else:
+        log.warning("本轮未获取到新代币, 继续使用数据库累积数据")
 
-    # 2) 初筛
-    s1 = stage1_initial(tokens, cfg, ticker)
+    # 统计数据库总量
+    total_db = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+    log.info("数据库累积代币总数: %d", total_db)
+
+    # 2) 从数据库查询初筛候选 (跨轮次累积, 覆盖全时间窗口)
+    s1 = db_query_candidates(conn, cfg, ticker)
     if not s1:
-        log.info("初筛无结果"); return
+        log.info("初筛无结果")
+        db_cleanup(conn)
+        conn.close()
+        return
+    log.info("初筛: 通过 %d 个候选", len(s1))
 
     # 3) 详情筛
     s2 = stage2_detail(s1, cfg, max_check=max_push * 8)
     if not s2:
-        log.info("详情筛无结果"); return
+        log.info("详情筛无结果")
+        db_cleanup(conn)
+        conn.close()
+        return
 
     # 4) K线筛
     s3 = stage3_kline(s2, cfg, max_check=max_push * 5)
     if not s3:
-        log.info("K线筛无结果"); return
+        log.info("K线筛无结果")
+        db_cleanup(conn)
+        conn.close()
+        return
 
     # 5) 组装推送
     to_push = s3[:max_push]
@@ -633,6 +789,10 @@ def scan_once(cfg: dict) -> None:
         pushed_tokens.add(info["address"])
     if len(pushed_tokens) > MAX_CACHE:
         pushed_tokens = set(list(pushed_tokens)[-MAX_CACHE // 2:])
+
+    # 6) 清理过期数据 & 关闭连接
+    db_cleanup(conn)
+    conn.close()
 
 
 def main():
