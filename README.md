@@ -30,6 +30,23 @@ four.meme API 分页上限为 10 页 × 100 = 1000 条，无法一次覆盖 72h 
 - 每 15 分钟扫一次，每次覆盖最新 ~5h，运行数小时后即实现 72h 全量覆盖
 - 自动清理超过 7 天的过期记录
 
+## 热点交叉验证
+
+自动抓取实时社会热点关键词，与代币名称/描述做交叉匹配。匹配热点的代币在通过三级筛选后**优先推送**（加分项，非必要条件）。
+
+| 数据源 | 覆盖范围 | 更新频率 |
+|--------|----------|----------|
+| **微博热搜** | 中文社交热点 Top50 | 实时 |
+| **Google Trends** | 全球搜索趋势（支持多地区） | 每日 |
+| **Twitter/X** | 英文社交热门话题 ~60 个 | 实时 |
+
+**匹配逻辑：**
+- 热点关键词与代币 name、shortName、description 做子串匹配
+- 短关键词（≤3字符）要求精确匹配名称，避免误匹配
+- 支持反向匹配（代币名包含在热点词中，如代币 "张雪" 匹配热点 "张雪机车"）
+- 按热点排名和来源加权评分，热点分高的代币排在推送队列前面
+- 热点数据缓存 15 分钟，避免重复请求
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -71,14 +88,19 @@ python3 scanner.py
 | `telegram_chat_id` | 推送目标 Chat ID | - |
 | `scan_interval_minutes` | 扫描间隔（分钟） | 15 |
 | `max_push_count` | 每轮最多推送数量 | 3 |
-| `min_age_hours` | 代币最小年龄（小时） | 2 |
+| `min_age_hours` | 代币最小年龄（小时） | 4 |
 | `max_age_hours` | 代币最大年龄（小时） | 72 |
 | `max_price_current` | 当前价上限 (USD) | 0.00003 |
-| `max_price_first_2h` | 前2h最高价上限 (USD) | 0.00002 |
+| `max_price_ath` | 历史最高价上限 (USD) | 0.00003 |
 | `required_total_supply` | 要求的代币总量 | 1000000000 |
 | `min_holders` | 最小持币地址数 | 150 |
 | `min_social_links` | 最小社交媒体数 | 1 |
 | `proxy.enabled` | 是否启用代理 | false |
+| `hotspot.enabled` | 是否启用热点匹配 | true |
+| `hotspot.weibo` | 启用微博热搜 | true |
+| `hotspot.google` | 启用 Google Trends | true |
+| `hotspot.google_geos` | Google Trends 地区 | ["US","CN"] |
+| `hotspot.twitter` | 启用 Twitter/X Trending | true |
 
 所有参数支持热更新（每轮扫描重新读取配置文件）。
 
@@ -91,12 +113,13 @@ python3 scanner.py
 #1 SomeToken (STK)
 📄 合约: 0x1234...abcd
 💰 当前价: $0.0000012345
-📈 前2h最高: $0.0000008000
+📈 历史最高: $0.0000008000
 👥 持币人数: 320
 🔗 社交媒体: 2 个
   • Twitter
   • Telegram
 🕐 创建: 2025-01-01 10:00 UTC
+🔥 热点匹配: 张雪机车(weibo)
 📝 这是一个示例代币描述...
 🌐 four.meme | BscScan
 ```

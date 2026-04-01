@@ -17,6 +17,7 @@ import logging
 import re
 import sys
 import sqlite3
+import xml.etree.ElementTree as ET
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -155,7 +156,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     价格过滤在 Python 层做 (需要汇率换算)
     """
     now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
+    min_age_ms = cfg.get("min_age_hours", 4) * 3600 * 1000
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
     min_holders = cfg.get("min_holders", 150)
 
@@ -207,7 +208,208 @@ def db_cleanup(conn: sqlite3.Connection, max_age_hours: int = 168):
 
 
 # ===================================================================
-#  Session 构建（带重试 + 代理）
+#  热点数据层
+#  从微博热搜 / Google Trends / Twitter(X) 抓取实时热点关键词,
+#  用于与代币名称/描述做交叉匹配 (加分项, 匹配的代币优先推送)
+# ===================================================================
+_hotspot_cache: dict = {"ts": 0, "keywords": []}
+HOTSPOT_CACHE_TTL = 900  # 缓存 15 分钟
+
+
+def fetch_weibo_hot() -> list[dict]:
+    """
+    获取微博实时热搜 Top50
+    返回: [{"word": "关键词", "rank": 0, "source": "weibo"}, ...]
+    """
+    url = "https://weibo.com/ajax/side/hotSearch"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://weibo.com/",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json",
+    }
+    try:
+        _ensure_sessions()
+        r = _fm_session.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        items = d.get("data", {}).get("realtime", [])
+        results = []
+        for i, item in enumerate(items):
+            word = (item.get("word") or "").strip()
+            if word and len(word) >= 2:
+                results.append({"word": word, "rank": i, "source": "weibo"})
+        log.info("微博热搜: 获取 %d 个关键词", len(results))
+        return results
+    except Exception as e:
+        log.warning("微博热搜获取失败: %s", e)
+        return []
+
+
+def fetch_google_trends(geos: tuple[str, ...] = ("US", "CN")) -> list[dict]:
+    """
+    获取 Google Trends 每日热门搜索 (多地区)
+    返回: [{"word": "关键词", "rank": 0, "source": "google"}, ...]
+    """
+    results = []
+    seen: set[str] = set()
+    for geo in geos:
+        url = f"https://trends.google.com/trending/rss?geo={geo}"
+        try:
+            _ensure_sessions()
+            r = _gt_session.get(url, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            for i, item in enumerate(root.findall(".//item")):
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    word = title_el.text.strip()
+                    if word and word.lower() not in seen:
+                        seen.add(word.lower())
+                        results.append({
+                            "word": word,
+                            "rank": i,
+                            "source": f"google/{geo}",
+                        })
+        except Exception as e:
+            log.warning("Google Trends [%s] 获取失败: %s", geo, e)
+        time.sleep(0.3)
+    log.info("Google Trends: 获取 %d 个关键词", len(results))
+    return results
+
+
+def fetch_twitter_trending() -> list[dict]:
+    """
+    通过 getdaytrends.com 抓取 Twitter/X 当日热门话题
+    返回: [{"word": "关键词", "rank": 0, "source": "twitter"}, ...]
+    """
+    url = "https://getdaytrends.com/united-states/"
+    try:
+        _ensure_sessions()
+        r = _gt_session.get(url, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html",
+        })
+        r.raise_for_status()
+        # 提取趋势链接中的话题文本
+        matches = re.findall(
+            r'href="/united-states/trend/[^"]*">([^<]+)</a>', r.text
+        )
+        results = []
+        seen: set[str] = set()
+        for i, word in enumerate(matches):
+            word = word.strip().lstrip("#")
+            if word and len(word) >= 2 and word.lower() not in seen:
+                seen.add(word.lower())
+                results.append({"word": word, "rank": i, "source": "twitter"})
+        log.info("Twitter Trending: 获取 %d 个关键词", len(results))
+        return results
+    except Exception as e:
+        log.warning("Twitter Trending 获取失败: %s", e)
+        return []
+
+
+def fetch_all_hotspots(cfg: dict) -> list[dict]:
+    """
+    汇总所有热点关键词, 带 15 分钟缓存
+    返回: [{"word": ..., "rank": ..., "source": ...}, ...]
+    """
+    global _hotspot_cache
+    now = time.time()
+    if now - _hotspot_cache["ts"] < HOTSPOT_CACHE_TTL and _hotspot_cache["keywords"]:
+        log.info("使用缓存热点: %d 个关键词", len(_hotspot_cache["keywords"]))
+        return _hotspot_cache["keywords"]
+
+    hotspot_cfg = cfg.get("hotspot", {})
+    if not hotspot_cfg.get("enabled", True):
+        return []
+
+    all_kw: list[dict] = []
+
+    # 微博热搜
+    if hotspot_cfg.get("weibo", True):
+        all_kw.extend(fetch_weibo_hot())
+
+    # Google Trends
+    if hotspot_cfg.get("google", True):
+        geos = tuple(hotspot_cfg.get("google_geos", ["US", "CN"]))
+        all_kw.extend(fetch_google_trends(geos))
+
+    # Twitter/X
+    if hotspot_cfg.get("twitter", True):
+        all_kw.extend(fetch_twitter_trending())
+
+    log.info("热点汇总: 共 %d 个关键词 (微博/Google/Twitter)", len(all_kw))
+    _hotspot_cache = {"ts": now, "keywords": all_kw}
+    return all_kw
+
+
+def _normalize(text: str) -> str:
+    """统一小写, 去除多余空格和特殊符号, 用于模糊匹配"""
+    text = text.lower().strip()
+    text = re.sub(r"[_\-./·・\s]+", " ", text)
+    return text
+
+
+def hotspot_match(token: dict, hotspots: list[dict],
+                  detail: dict | None = None) -> tuple[float, list[str]]:
+    """
+    计算代币与热点关键词的匹配分数
+
+    匹配字段: name, shortName, descr(detail)
+    匹配逻辑:
+      - 完全包含 (热点关键词 ⊂ 代币字段): 权重高
+      - 越短的热点词要求越精确 (≤3字符需完全匹配 name/shortName)
+      - 热点排名靠前的权重更高
+
+    返回: (总分, [匹配到的关键词列表])
+    """
+    # 构建待匹配文本
+    name = _normalize(token.get("name", ""))
+    short = _normalize(token.get("shortName", ""))
+    desc = ""
+    if detail:
+        desc = _normalize(detail.get("descr", "") or "")
+
+    score = 0.0
+    matched: list[str] = []
+    seen_words: set[str] = set()
+
+    for h in hotspots:
+        word = h["word"]
+        word_lower = _normalize(word)
+        if word_lower in seen_words:
+            continue
+
+        # 短关键词 (≤3字符) 要求精确匹配 name 或 shortName
+        if len(word_lower) <= 3:
+            if word_lower != name and word_lower != short:
+                continue
+        else:
+            # 长关键词: 检查子串包含
+            found = False
+            if word_lower in name or word_lower in short:
+                found = True
+            elif desc and word_lower in desc:
+                found = True
+            # 反向匹配: name/short 包含在热点词中 (如代币名 "张雪" 匹配热点 "张雪机车")
+            if not found and len(name) >= 2:
+                if name in word_lower or short in word_lower:
+                    found = True
+            if not found:
+                continue
+
+        seen_words.add(word_lower)
+        # 排名权重: rank=0 → 1.0, rank=49 → 0.5
+        rank_weight = max(0.5, 1.0 - h["rank"] * 0.01)
+        # 来源权重: 微博略高 (中文 meme 币与中文热点相关性更强)
+        source_weight = {"weibo": 1.2, "twitter": 1.0}.get(
+            h["source"].split("/")[0], 0.9
+        )
+        score += rank_weight * source_weight
+        matched.append(f"{word}({h['source']})")
+
+    return score, matched
 # ===================================================================
 def _build_session(proxy_cfg: dict | None = None,
                    extra_headers: dict | None = None) -> requests.Session:
@@ -439,26 +641,18 @@ def gt_ohlcv_hourly(pool_address: str, limit: int = 72) -> list[list]:
         return []
 
 
-def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
-    """从 OHLCV 中提取发币后前 2 小时内的最高价 (USD)
+def calc_all_time_high(candles: list[list]) -> float | None:
+    """从 OHLCV 中提取历史最高价 (USD)
     candles: [[ts, o, h, l, c, vol], ...] 最新在前
     """
     if not candles:
         return None
-    cutoff = create_ts_sec + 2 * 3600
     max_high = 0.0
-    found = False
     for c in candles:
-        ts = int(c[0])
-        if ts > cutoff:
-            continue
-        if ts < create_ts_sec - 3600:
-            continue
         high = float(c[2])
         if high > max_high:
             max_high = high
-        found = True
-    return max_high if found else None
+    return max_high if max_high > 0 else None
 
 
 # ===================================================================
@@ -474,7 +668,7 @@ def stage1_initial(tokens: list[dict], cfg: dict,
       - 未推送过
     """
     now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
+    min_age_ms = cfg.get("min_age_hours", 4) * 3600 * 1000
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
     max_price = cfg.get("max_price_current", 0.00003)
     min_holders = cfg.get("min_holders", 150)
@@ -568,9 +762,9 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
                  max_check: int = 15) -> list[tuple[dict, dict]]:
     """
     K线筛（GeckoTerminal OHLCV）:
-      - 前 2 小时最高价 ≤ max_price_first_2h
+      - 历史最高价 ≤ max_price_ath
     """
-    max_2h = cfg.get("max_price_first_2h", 0.00002)
+    max_ath = cfg.get("max_price_ath", 0.00003)
     results: list[tuple[dict, dict]] = []
 
     for i, (tk, detail) in enumerate(candidates):
@@ -578,7 +772,6 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
             break
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
-        create_ts_sec = int(tk.get("createDate", 0)) // 1000
 
         if i > 0:
             time.sleep(3)
@@ -595,16 +788,16 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
             log.debug("跳过 %s: 无 K 线数据", name)
             continue
 
-        high_2h = calc_first_2h_max(candles, create_ts_sec)
-        if high_2h is None:
-            log.debug("跳过 %s: 无法确定前 2h 最高价", name)
+        high_ath = calc_all_time_high(candles)
+        if high_ath is None:
+            log.debug("跳过 %s: 无法确定历史最高价", name)
             continue
 
-        log.info("  %s: 前2h最高 $%.10f (阈值 $%.10f)", name, high_2h, max_2h)
-        if high_2h > max_2h:
+        log.info("  %s: 历史最高 $%.10f (阈值 $%.10f)", name, high_ath, max_ath)
+        if high_ath > max_ath:
             continue
 
-        tk["_high_2h"] = high_2h
+        tk["_high_ath"] = high_ath
         results.append((tk, detail))
 
     log.info("K线筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
@@ -649,13 +842,16 @@ def format_message(infos: list[dict]) -> str:
         lines.append(f"<b>#{i} {info['name']} ({info['short']})</b>")
         lines.append(f"📄 合约: <code>{info['address']}</code>")
         lines.append(f"💰 当前价: ${info['price_usd']:.10f}")
-        lines.append(f"📈 前2h最高: ${info['high_2h']:.10f}")
+        lines.append(f"📈 历史最高: ${info['high_ath']:.10f}")
         lines.append(f"👥 持币人数: {info['holders']}")
         lines.append(f"🔗 社交媒体: {info['social_count']} 个")
         social_links = info.get("social_links", [])
         if social_links:
             lines.append(format_social_html(social_links))
         lines.append(f"🕐 创建: {info['create_time']}")
+        hotspot_matched = info.get("hotspot_matched", [])
+        if hotspot_matched:
+            lines.append(f"🔥 热点匹配: {', '.join(hotspot_matched)}")
         lines.append(f"📝 {info['desc']}")
         a = info["address"]
         lines.append(
@@ -737,6 +933,9 @@ def scan_once(cfg: dict) -> None:
         return
     log.info("初筛: 通过 %d 个候选", len(s1))
 
+    # 2.5) 获取热点关键词 (用于后续加分排序)
+    hotspots = fetch_all_hotspots(cfg)
+
     # 3) 详情筛
     s2 = stage2_detail(s1, cfg, max_check=max_push * 8)
     if not s2:
@@ -753,6 +952,18 @@ def scan_once(cfg: dict) -> None:
         conn.close()
         return
 
+    # 4.5) 热点加分排序: 匹配热点的代币优先推送
+    if hotspots:
+        for tk, detail in s3:
+            score, matched = hotspot_match(tk, hotspots, detail)
+            tk["_hotspot_score"] = score
+            tk["_hotspot_matched"] = matched
+            if matched:
+                log.info("  热点匹配 %s: %.2f 分, 关键词: %s",
+                         tk.get("name", ""), score, ", ".join(matched))
+        # 热点分高的排前面, 同分按原顺序
+        s3.sort(key=lambda x: x[0].get("_hotspot_score", 0), reverse=True)
+
     # 5) 组装推送
     to_push = s3[:max_push]
     infos = []
@@ -765,12 +976,14 @@ def scan_once(cfg: dict) -> None:
             "short": tk.get("shortName", ""),
             "address": addr,
             "price_usd": tk.get("_price_usd", 0),
-            "high_2h": tk.get("_high_2h", 0),
+            "high_ath": tk.get("_high_ath", 0),
             "holders": tk.get("_holders", 0),
             "social_count": tk.get("_social_count", 0),
             "social_links": extract_social_links(detail),
             "create_time": create_dt.strftime("%Y-%m-%d %H:%M UTC"),
             "desc": truncate_desc(detail),
+            "hotspot_score": tk.get("_hotspot_score", 0),
+            "hotspot_matched": tk.get("_hotspot_matched", []),
         })
 
     msg = format_message(infos)
@@ -806,11 +1019,11 @@ def main():
             # 热更新 session (代理等)
             _fm_session, _gt_session = _init_sessions(cfg.get("proxy"))
             log.info(
-                "筛选: 年龄 %d~%dh | 当前价<$%s | 前2h价<$%s | 总量=%s | 持币>%d | 社交>%d",
-                cfg.get("min_age_hours", 2),
+                "筛选: 年龄 %d~%dh | 当前价<$%s | 历史最高<$%s | 总量=%s | 持币>%d | 社交>%d",
+                cfg.get("min_age_hours", 4),
                 cfg.get("max_age_hours", 72),
                 cfg.get("max_price_current", 0.00003),
-                cfg.get("max_price_first_2h", 0.00002),
+                cfg.get("max_price_ath", 0.00003),
                 cfg.get("required_total_supply", 1_000_000_000),
                 cfg.get("min_holders", 150),
                 cfg.get("min_social_links", 1),
