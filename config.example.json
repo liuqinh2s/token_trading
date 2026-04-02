@@ -2,40 +2,37 @@
     "telegram_bot_token": "YOUR_TOKEN",
     "telegram_chat_id": "YOUR_CHAT_ID",
     "scan_interval_minutes": 15,
-    "max_push_count": 3,
-    "min_age_hours": 2,
-    "max_age_hours": 72,
-    "max_price_current": 0.00002,
-    "max_price_ath": 0.00014,
-    "max_price_2h": 0.00004,
-    "required_total_supply": 1000000000,
-    "min_holders": 150,
-    "min_social_links": 1,
-    "scan_rpc_url": "",
-    "proxy": {
-        "enabled": false,
-        "http": "http://127.0.0.1:1234",
-        "https": "http://127.0.0.1:1234"
-    },
-    "hotspot": {
-        "enabled": true,
-        "weibo": true,
-        "google": true,
-        "google_geos": [
-            "US",
-            "CN"
-        ],
-        "twitter": true
-    },
-    "trading": {
-        "enabled": false,
-        "rpc_url": "https://bsc.publicnode.com",
-        "slippage_pct": 12,
-        "buy_fraction": 0.1,
-        "min_buy_usd": 10,
-        "max_buy_usd": 100,
-        "tp_trigger_pct": 100,
-        "expire_hours": 72,
-        "monitor_interval_sec": 60
-    }
+  "max_push_count": 3,
+  "min_age_hours": 4,
+  "max_age_hours": 72,
+  "max_price_current": 0.00003,
+  "max_price_ath": 0.00003,
+  "max_price_first_2h": 0.00003,
+  "required_total_supply": 1000000000,
+  "min_holders": 90,
+  "min_social_links": 1,
+  "scan_rpc_url": "",
+  "proxy": {
+      "enabled": true,
+      "http": "http://127.0.0.1:7890",
+      "https": "http://127.0.0.1:7890"
+  },
+  "hotspot": {
+      "enabled": true,
+      "weibo": true,
+      "google": true,
+      "google_geos": ["US", "CN"],
+      "twitter": true
+  },
+  "trading": {
+      "enabled": false,
+      "rpc_url": "https://bsc.publicnode.com",
+      "slippage_pct": 12,
+      "buy_fraction": 0.1,
+      "min_buy_usd": 10,
+      "max_buy_usd": 100,
+      "tp_trigger_pct": 100,
+      "expire_hours": 72,
+      "monitor_interval_sec": 60
+  }
 }
