@@ -25,6 +25,12 @@ from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from trader import init_trader, execute_buys, start_monitor, stop_monitor
+    _HAS_TRADER = True
+except ImportError:
+    _HAS_TRADER = False
+
 # ===================================================================
 #  日志
 # ===================================================================
@@ -72,6 +78,22 @@ MAX_CACHE = 5000
 
 DB_PATH = Path(__file__).parent / "tokens.db"
 
+# ===================================================================
+#  链上扫描常量 (four.meme TokenManager2 V2)
+# ===================================================================
+TOKEN_MANAGER_V2 = "0x5c952063c7fc8610FFDB798152D69F0B9550762b"
+TOKEN_CREATE_TOPIC = "0x396d5e902b675b032348d3d2e9517ee8f0c4a926603fbc075d3d282ff00cad20"
+BSC_BLOCK_TIME = 3  # ~3 秒/块
+
+SCAN_RPC_URLS = [
+    "https://bsc.publicnode.com",
+    "https://1rpc.io/bnb",
+    "https://bsc-dataseed1.binance.org",
+    "https://bsc-dataseed2.binance.org",
+    "https://bsc.api.onfinality.io/public",
+    "https://bsc-rpc.publicnode.com",
+]
+
 
 # ===================================================================
 #  SQLite 本地代币缓存
@@ -93,11 +115,18 @@ def _init_db():
             hold         INTEGER,
             day1_vol     REAL,
             progress     REAL,
+            total_supply INTEGER DEFAULT 0,
             raw_json     TEXT,
             first_seen   INTEGER,
             last_updated INTEGER
         )
     """)
+    # 兼容旧表: 若缺少 total_supply 列则自动添加
+    try:
+        conn.execute("SELECT total_supply FROM tokens LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tokens ADD COLUMN total_supply INTEGER DEFAULT 0")
+        conn.commit()
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_tokens_create ON tokens(create_date)
     """)
@@ -109,13 +138,14 @@ def _init_db():
 
 
 def db_upsert_tokens(conn: sqlite3.Connection, tokens: list[dict]):
-    """批量插入或更新代币 (价格/持币人数/交易量等实时字段始终更新)"""
+    """批量插入或更新代币 (地址统一小写; 非零值覆盖零值, 避免链上空数据覆盖 API 数据)"""
     now_ms = int(time.time() * 1000)
     rows = []
     for t in tokens:
-        addr = t.get("tokenAddress", "")
+        addr = (t.get("tokenAddress", "") or "").lower()
         if not addr:
             continue
+        total_supply = int(t.get("_total_supply", 0))
         rows.append((
             addr,
             t.get("name", ""),
@@ -127,6 +157,7 @@ def db_upsert_tokens(conn: sqlite3.Connection, tokens: list[dict]):
             int(t.get("hold", 0) or 0),
             float(t.get("day1Vol", 0) or 0),
             float(t.get("progress", 0) or 0),
+            total_supply,
             json.dumps(t, ensure_ascii=False),
             now_ms,
             now_ms,
@@ -134,15 +165,21 @@ def db_upsert_tokens(conn: sqlite3.Connection, tokens: list[dict]):
     conn.executemany("""
         INSERT INTO tokens (address, name, short_name, symbol, status,
                             create_date, price, hold, day1_vol, progress,
-                            raw_json, first_seen, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            total_supply, raw_json, first_seen, last_updated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(address) DO UPDATE SET
-            price        = excluded.price,
-            hold         = excluded.hold,
-            day1_vol     = excluded.day1_vol,
-            progress     = excluded.progress,
-            status       = excluded.status,
-            raw_json     = excluded.raw_json,
+            name         = CASE WHEN excluded.name != '' THEN excluded.name ELSE tokens.name END,
+            short_name   = CASE WHEN excluded.short_name != '' THEN excluded.short_name ELSE tokens.short_name END,
+            symbol       = CASE WHEN excluded.symbol != 'BNB' THEN excluded.symbol
+                                WHEN tokens.symbol = '' THEN excluded.symbol ELSE tokens.symbol END,
+            status       = CASE WHEN excluded.status != '' THEN excluded.status ELSE tokens.status END,
+            create_date  = CASE WHEN excluded.create_date > 0 THEN excluded.create_date ELSE tokens.create_date END,
+            price        = CASE WHEN excluded.price > 0 THEN excluded.price ELSE tokens.price END,
+            hold         = CASE WHEN excluded.hold > 0 THEN excluded.hold ELSE tokens.hold END,
+            day1_vol     = CASE WHEN excluded.day1_vol > 0 THEN excluded.day1_vol ELSE tokens.day1_vol END,
+            progress     = CASE WHEN excluded.progress > 0 THEN excluded.progress ELSE tokens.progress END,
+            total_supply = CASE WHEN excluded.total_supply > 0 THEN excluded.total_supply ELSE tokens.total_supply END,
+            raw_json     = CASE WHEN excluded.price > 0 THEN excluded.raw_json ELSE tokens.raw_json END,
             last_updated = excluded.last_updated
     """, rows)
     conn.commit()
@@ -157,7 +194,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     价格过滤在 Python 层做 (需要汇率换算)
     """
     now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 4) * 3600 * 1000
+    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
     min_holders = cfg.get("min_holders", 150)
 
@@ -179,7 +216,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     for (raw,) in rows:
         tk = json.loads(raw)
         addr = tk.get("tokenAddress", "")
-        if addr in pushed_tokens:
+        if addr.lower() in pushed_tokens:
             continue
 
         raw_price = float(tk.get("price", 0))
@@ -459,25 +496,292 @@ def _ensure_sessions():
 
 
 # ===================================================================
+#  链上扫描层
+#  通过 eth_getLogs 读取 TokenManager2 的 TokenCreate 事件,
+#  100% 覆盖全时间窗口内的所有 four.meme 代币 (不受 API 分页上限约束)
+# ===================================================================
+def _rpc_call(method: str, params: list, rpc_url: str):
+    """JSON-RPC 调用 BSC 节点 (走代理 session)"""
+    _ensure_sessions()
+    r = _fm_session.post(rpc_url, json={
+        "jsonrpc": "2.0", "id": 1,
+        "method": method, "params": params,
+    }, timeout=30, headers={"Content-Type": "application/json"})
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data.get("result")
+
+
+def _decode_token_create_log(log_entry: dict) -> dict | None:
+    """
+    解码 TokenCreate 事件:
+    TokenCreate(address creator, address token, uint256 tokenId,
+                string name, string symbol,
+                uint256 totalSupply, uint256 launchTs, uint256 unknown)
+
+    所有参数非 indexed, 全部在 data 字段 (ABI 编码)
+    """
+    try:
+        data = log_entry["data"][2:]  # 去掉 0x
+
+        # Head: 8 个 word (每个 64 hex chars = 32 bytes)
+        # Word 0: creator address
+        # Word 1: token address
+        token = "0x" + data[88:128]  # word 1, 取后 40 chars (20 bytes)
+        # Word 2: tokenId
+        # Word 3: offset to name (bytes)
+        name_offset = int(data[192:256], 16)
+        # Word 4: offset to symbol (bytes)
+        sym_offset = int(data[256:320], 16)
+        # Word 5: totalSupply (raw, with decimals)
+        total_supply_raw = int(data[320:384], 16)
+        # Word 6: launchTimestamp
+        launch_ts = int(data[384:448], 16)
+
+        # 解码 name 字符串
+        no = name_offset * 2  # byte offset → hex char offset
+        name_len = int(data[no:no + 64], 16)
+        name = bytes.fromhex(data[no + 64:no + 64 + name_len * 2]).decode(
+            "utf-8", errors="replace")
+
+        # 解码 symbol 字符串
+        so = sym_offset * 2
+        sym_len = int(data[so:so + 64], 16)
+        symbol = bytes.fromhex(data[so + 64:so + 64 + sym_len * 2]).decode(
+            "utf-8", errors="replace")
+
+        # 转换总量 (假设 18 decimals)
+        total_supply = total_supply_raw // (10 ** 18)
+
+        # 转换时间戳 (秒 → 毫秒)
+        if launch_ts > 1e12:
+            create_date_ms = launch_ts  # 已是毫秒
+        elif launch_ts > 0:
+            create_date_ms = launch_ts * 1000
+        else:
+            # 回退: 用区块号估算
+            block_num = int(log_entry.get("blockNumber", "0x0"), 16)
+            create_date_ms = int(time.time() * 1000) - block_num * BSC_BLOCK_TIME * 1000
+            if create_date_ms < 0:
+                create_date_ms = int(time.time() * 1000)
+
+        return {
+            "tokenAddress": token,
+            "name": name,
+            "shortName": symbol,
+            "symbol": "BNB",  # 默认, 后续由 API 更新
+            "status": "",
+            "createDate": create_date_ms,
+            "price": 0,
+            "hold": 0,
+            "day1Vol": 0,
+            "progress": 0,
+            "_total_supply": total_supply,
+        }
+    except Exception as e:
+        log.debug("解码 TokenCreate 事件失败: %s", e)
+        return None
+
+
+def onchain_scan_tokens(cfg: dict) -> list[dict]:
+    """
+    通过链上 eth_getLogs 扫描 TokenManager2 的 TokenCreate 事件,
+    100% 覆盖全时间窗口内的所有 four.meme 代币。
+
+    BSC 出块约 3 秒, 72h ≈ 86400 块。
+    按 2000 块分片查询 (自动降级到 500), 约 45-175 次 RPC, 耗时 ~30-60 秒。
+    """
+    max_age_hours = cfg.get("max_age_hours", 72)
+    required_supply = cfg.get("required_total_supply", 1_000_000_000)
+
+    # 选择 RPC (优先使用配置, 否则用内置列表)
+    rpc_url = cfg.get("scan_rpc_url", "") or cfg.get("trading", {}).get("rpc_url", "")
+    if not rpc_url:
+        rpc_url = SCAN_RPC_URLS[0]
+
+    # 获取当前区块
+    current_block = None
+    for url in ([rpc_url] + SCAN_RPC_URLS):
+        try:
+            current_block = int(_rpc_call("eth_blockNumber", [], url), 16)
+            rpc_url = url
+            break
+        except Exception as e:
+            log.warning("RPC %s 获取区块高度失败: %s", url[:40], e)
+    if current_block is None:
+        log.error("所有 RPC 获取区块高度失败, 跳过链上扫描")
+        return []
+
+    log.info("链上扫描: 当前区块 %d, RPC %s", current_block, rpc_url[:40])
+
+    blocks_back = max_age_hours * 3600 // BSC_BLOCK_TIME
+    start_block = current_block - blocks_back
+    chunk_size = 2000  # 起始分片大小, 失败时自动缩小
+
+    all_tokens: list[dict] = []
+    total_events = 0
+    supply_filtered = 0
+    from_block = start_block
+    consecutive_errors = 0
+    total_chunks = 0
+    empty_chunks = 0
+
+    while from_block <= current_block:
+        to_block = min(from_block + chunk_size - 1, current_block)
+
+        try:
+            logs = _rpc_call("eth_getLogs", [{
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": TOKEN_MANAGER_V2,
+                "topics": [TOKEN_CREATE_TOPIC],
+            }], rpc_url)
+
+            consecutive_errors = 0
+            total_chunks += 1
+            if not logs:
+                empty_chunks += 1
+
+            for entry in (logs or []):
+                total_events += 1
+                token = _decode_token_create_log(entry)
+                if token is None:
+                    continue
+                # 立即过滤总量
+                if token["_total_supply"] != required_supply:
+                    supply_filtered += 1
+                    continue
+                all_tokens.append(token)
+
+            from_block = to_block + 1
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            consecutive_errors += 1
+
+            # 分片太大 → 缩小
+            if any(w in err_msg for w in ("limit", "range", "exceed", "too many")):
+                if chunk_size > 100:
+                    chunk_size = max(100, chunk_size // 2)
+                    log.info("RPC 区块范围超限, 缩小到 %d 块/次", chunk_size)
+                    consecutive_errors = 0  # 范围超限不算连续失败
+                    continue
+
+            # 连续失败 → 切换 RPC
+            if consecutive_errors >= 3:
+                switched = False
+                for alt_rpc in SCAN_RPC_URLS:
+                    if alt_rpc == rpc_url:
+                        continue
+                    try:
+                        _rpc_call("eth_blockNumber", [], alt_rpc)
+                        rpc_url = alt_rpc
+                        chunk_size = 500
+                        consecutive_errors = 0
+                        log.info("切换备用 RPC: %s", rpc_url[:40])
+                        switched = True
+                        break
+                    except Exception:
+                        continue
+                if not switched:
+                    log.error("所有 RPC 失败, 中止链上扫描 (已扫到区块 %d)", from_block)
+                    break
+            else:
+                log.warning("RPC 请求失败 (%d/3): %s", consecutive_errors, e)
+                time.sleep(1)
+
+    log.info("链上扫描完成: 共 %d 个 TokenCreate, 总量匹配 %d, 跳过 %d "
+             "(chunk_size=%d, 总请求=%d, 空块=%d, 区块范围 %d→%d)",
+             total_events, len(all_tokens), supply_filtered,
+             chunk_size, total_chunks, empty_chunks, start_block, current_block)
+    return all_tokens
+
+
+def _enrich_onchain_gaps(conn: sqlite3.Connection, cfg: dict,
+                         max_fill: int = 100):
+    """
+    为链上发现但缺少 API 数据 (hold=0) 的代币补全信息。
+    通过 four.meme detail API 逐个获取, 受限于速率每轮最多补全 max_fill 个。
+    多轮运行后全部补全。
+    """
+    now_ms = int(time.time() * 1000)
+    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
+    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
+    required_supply = cfg.get("required_total_supply", 1_000_000_000)
+
+    oldest = now_ms - max_age_ms
+    newest = now_ms - min_age_ms
+
+    rows = conn.execute("""
+        SELECT address FROM tokens
+        WHERE create_date BETWEEN ? AND ?
+          AND total_supply = ?
+          AND hold = 0
+          AND price = 0
+        ORDER BY create_date DESC
+        LIMIT ?
+    """, (oldest, newest, required_supply, max_fill)).fetchall()
+
+    if not rows:
+        return
+
+    log.info("补全链上代币数据: %d 个待查", len(rows))
+    filled = 0
+    consecutive_miss = 0
+
+    for (addr,) in rows:
+        time.sleep(0.3)
+        detail = fm_detail(addr)
+        if not detail:
+            consecutive_miss += 1
+            if consecutive_miss >= 20:
+                log.info("连续 %d 个补全失败, 跳过剩余", consecutive_miss)
+                break
+            continue
+
+        consecutive_miss = 0
+        hold = int(detail.get("holderCount", 0) or detail.get("hold", 0) or 0)
+        price = float(detail.get("price", 0) or 0)
+        status = detail.get("status", "")
+
+        conn.execute("""
+            UPDATE tokens SET hold = ?, price = ?, status = ?, last_updated = ?
+            WHERE address = ? AND (hold = 0 OR price = 0)
+        """, (hold, price, status, now_ms, addr))
+        if hold > 0 or price > 0:
+            filled += 1
+
+    conn.commit()
+    log.info("补全完成: %d / %d 个代币获取到数据", filled, len(rows))
+
+
+# ===================================================================
 #  four.meme API 层
 # ===================================================================
 def fm_search_tokens(cfg: dict) -> list[dict]:
     """
-    全量扫描 four.meme 代币, 尽可能覆盖完整时间窗口。
+    全量扫描 four.meme 代币, 通过多维度查询组合最大化覆盖。
 
-    策略:
-      - 按 symbol 分片查询 NEW 排序 (BNB/USD1/USDT/CAKE), 每片最多 10 页 × 100
-        BNB ~10h, USD1 ~61h, USDT/CAKE >72h  →  合计覆盖绝大多数代币
-      - 补充 HOT / VOL / PROGRESS 排序, 各 1 页, 捕获老但活跃的代币
-      - 同时拉取 PUBLISH + TRADE 状态
-      - 当某页最旧代币超过 max_age 时提前停止翻页
+    策略 (每组最多 10 页 × 100 = 1000 条):
+      ┌─────────────────────────────────────────────────────────────┐
+      │  维度1: symbol = BNB / USD1 / USDT / CAKE                 │
+      │  维度2: sort   = DESC (最新) / ASC (最旧)                   │
+      │  维度3: status = PUBLISH (bonding curve) / TRADE (已迁移)   │
+      │  维度4: type   = NEW / HOT / VOL / PROGRESS                │
+      └─────────────────────────────────────────────────────────────┘
+      DESC 从最新到最旧, ASC 从最旧到最新 → 两端各覆盖 1000 条,
+      中间部分由 SQLite 跨轮次累积补全。
+
+    理论上限: ~30 组 × 1000 = 30000, 去重后 20000+
     """
     _ensure_sessions()
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
     now_ms = int(time.time() * 1000)
     seen: dict[str, dict] = {}
-    page_size = 100  # API 最大支持 100
-    max_pages = 10   # API 最大支持 10 页
+    page_size = 100
+    max_pages = 10
 
     def _add_tokens(items: list[dict]):
         for t in items:
@@ -500,12 +804,11 @@ def fm_search_tokens(cfg: dict) -> list[dict]:
                     break
                 _add_tokens(items)
 
-                # 检查最旧代币是否超出时间窗口
-                oldest_ts = min(int(t.get("createDate", 0)) for t in items)
-                if oldest_ts > 0 and (now_ms - oldest_ts) > max_age_ms:
-                    log.debug("  %s p%d: 已超出 %dh 时间窗口, 停止翻页",
-                              label, page, cfg.get("max_age_hours", 72))
-                    break
+                # 检查是否超出时间窗口 (仅对按时间排序的查询)
+                if query.get("type") == "NEW":
+                    oldest_ts = min(int(t.get("createDate", 0)) for t in items)
+                    if oldest_ts > 0 and (now_ms - oldest_ts) > max_age_ms:
+                        break
                 if len(items) < page_size:
                     break
             except Exception as e:
@@ -513,37 +816,67 @@ def fm_search_tokens(cfg: dict) -> list[dict]:
                 break
             time.sleep(0.3)
 
-    # ── 1. 按 symbol 分片查询 NEW 排序 (PUBLISH) ──
-    for sym in ("BNB", "USD1", "USDT", "CAKE"):
+    symbols = ("BNB", "USD1", "USDT", "CAKE")
+
+    # ── 1. NEW/DESC (最新→最旧) × PUBLISH × 4 symbols = 最多 4000 ──
+    for sym in symbols:
         _fetch_pages(
             {"type": "NEW", "listType": "NOR", "sort": "DESC",
              "status": "PUBLISH", "symbol": sym},
-            label=f"NEW/PUBLISH/{sym}",
+            label=f"NEW/DESC/PUB/{sym}",
         )
 
-    # ── 2. 补充排序: HOT / VOL / PROGRESS (PUBLISH), 各 1 页 ──
-    for sort_type, list_type in [("HOT", "ADV"), ("VOL", "NOR"), ("PROGRESS", "NOR")]:
-        payload = {"pageIndex": 1, "pageSize": page_size,
-                   "type": sort_type, "listType": list_type, "status": "PUBLISH"}
-        try:
-            r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
-            r.raise_for_status()
-            d = r.json()
-            if d.get("code") == 0:
-                _add_tokens(d.get("data", []))
-        except Exception as e:
-            log.error("fm_search [%s]: %s", sort_type, e)
-        time.sleep(0.3)
+    # ── 2. NEW/ASC (最旧→最新) × PUBLISH × 4 symbols = 最多 4000 ──
+    #    与 DESC 覆盖相反方向, 大幅减少盲区
+    for sym in symbols:
+        _fetch_pages(
+            {"type": "NEW", "listType": "NOR", "sort": "ASC",
+             "status": "PUBLISH", "symbol": sym},
+            label=f"NEW/ASC/PUB/{sym}",
+        )
 
-    # ── 3. 已迁移代币 (TRADE) ──
-    for sym in ("BNB", "USD1", "USDT"):
+    # ── 3. NEW/DESC × TRADE × 4 symbols = 最多 4000 ──
+    for sym in symbols:
         _fetch_pages(
             {"type": "NEW", "listType": "NOR_DEX", "sort": "DESC",
              "status": "TRADE", "symbol": sym},
-            label=f"NEW/TRADE/{sym}",
+            label=f"NEW/DESC/TRADE/{sym}",
         )
 
-    log.info("fm_search: 共获取 %d 个代币", len(seen))
+    # ── 4. NEW/ASC × TRADE × 4 symbols = 最多 4000 ──
+    for sym in symbols:
+        _fetch_pages(
+            {"type": "NEW", "listType": "NOR_DEX", "sort": "ASC",
+             "status": "TRADE", "symbol": sym},
+            label=f"NEW/ASC/TRADE/{sym}",
+        )
+
+    # ── 5. HOT/VOL/PROGRESS 多页 × 双状态, 捕获中段活跃代币 ──
+    for sort_type, list_type in [("HOT", "ADV"), ("VOL", "NOR"), ("PROGRESS", "NOR")]:
+        for status, lt_override in [("PUBLISH", list_type), ("TRADE", "NOR_DEX")]:
+            _fetch_pages(
+                {"type": sort_type, "listType": lt_override,
+                 "status": status},
+                label=f"{sort_type}/{status}",
+            )
+
+    # ── 6. HOT 按 symbol 分片 (额外覆盖) ──
+    for sym in symbols:
+        for status, lt in [("PUBLISH", "ADV"), ("TRADE", "NOR_DEX")]:
+            payload = {"pageIndex": 1, "pageSize": page_size,
+                       "type": "HOT", "listType": lt,
+                       "status": status, "symbol": sym}
+            try:
+                r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
+                r.raise_for_status()
+                d = r.json()
+                if d.get("code") == 0:
+                    _add_tokens(d.get("data", []))
+            except Exception as e:
+                log.error("fm_search [HOT/%s/%s]: %s", status, sym, e)
+            time.sleep(0.3)
+
+    log.info("fm_search: 共获取 %d 个代币 (去重后)", len(seen))
     return list(seen.values())
 
 
@@ -587,17 +920,21 @@ def fm_ticker_prices() -> dict[str, float]:
 def _gt_request(url: str, params: dict | None = None,
                 max_retries: int = 3) -> dict | None:
     """带退避重试的 GeckoTerminal 请求"""
+    global _gt_rate_delay
     _ensure_sessions()
     for attempt in range(max_retries):
         try:
             r = _gt_session.get(url, params=params, timeout=15)
             if r.status_code == 429:
                 wait = 5 * (attempt + 1)
+                _gt_rate_delay = min(5.0, _gt_rate_delay + 1.0)
                 log.warning("GeckoTerminal 429, 等待 %ds (%d/%d)",
                             wait, attempt + 1, max_retries)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
+            # 成功时逐步恢复速度
+            _gt_rate_delay = max(0.3, _gt_rate_delay - 0.2)
             return r.json()
         except requests.exceptions.HTTPError:
             if attempt < max_retries - 1:
@@ -605,6 +942,9 @@ def _gt_request(url: str, params: dict | None = None,
             else:
                 raise
     return None
+
+
+_gt_rate_delay: float = 0.5  # GeckoTerminal 动态速率控制
 
 
 def gt_get_pool(token_address: str) -> str | None:
@@ -642,18 +982,103 @@ def gt_ohlcv_hourly(pool_address: str, limit: int = 72) -> list[list]:
         return []
 
 
-def calc_all_time_high(candles: list[list]) -> float | None:
-    """从 OHLCV 中提取历史最高价 (USD)
+def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
+    """从 OHLCV 中提取发币后前 2 小时内的最高价 (USD)
     candles: [[ts, o, h, l, c, vol], ...] 最新在前
     """
     if not candles:
         return None
+    cutoff = create_ts_sec + 2 * 3600
     max_high = 0.0
+    found = False
     for c in candles:
+        ts = int(c[0])
+        if ts > cutoff:
+            continue
+        if ts < create_ts_sec - 3600:
+            continue
         high = float(c[2])
         if high > max_high:
             max_high = high
-    return max_high if max_high > 0 else None
+        found = True
+    return max_high if found else None
+
+
+# ===================================================================
+#  DexScreener API 层 (300 req/min, 比 GeckoTerminal 快 10 倍)
+# ===================================================================
+DS_BASE = "https://api.dexscreener.com"
+DS_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+
+def ds_get_pairs(token_address: str) -> list[dict] | None:
+    """通过 DexScreener 获取代币的交易对信息 (含价格历史)"""
+    _ensure_sessions()
+    url = f"{DS_BASE}/tokens/v1/bsc/{token_address}"
+    try:
+        r = _gt_session.get(url, timeout=10, headers=DS_HEADERS)
+        if r.status_code == 429:
+            time.sleep(2)
+            r = _gt_session.get(url, timeout=10, headers=DS_HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        # v1 返回数组
+        if isinstance(data, list):
+            return data
+        return data.get("pairs") or data.get("data") or []
+    except Exception as e:
+        log.debug("ds_get_pairs [%s]: %s", token_address[:20], e)
+        return None
+
+
+def ds_calc_first_2h_max(pairs: list[dict], create_ts_sec: int,
+                         bnb_price: float = 600.0) -> float | None:
+    """
+    从 DexScreener pair 数据估算前 2h 最高价。
+    DexScreener 不直接给 OHLCV, 但 pair 里有 priceUsd 和 priceChange。
+    如果代币年龄 < 6h, 用 ATH 近似前 2h 最高价 (误差可接受)。
+    """
+    if not pairs:
+        return None
+    for pair in pairs:
+        if pair.get("chainId") != "bsc":
+            continue
+        price_usd_str = pair.get("priceUsd")
+        if not price_usd_str:
+            continue
+        try:
+            price_usd = float(price_usd_str)
+        except (ValueError, TypeError):
+            continue
+        # DexScreener 没有直接的前 2h 最高价,
+        # 但对于新币 (< 6h), ATH ≈ 前 2h 最高价
+        # 用 priceChange 反推: 如果有 h1/h6 变化率, 可以估算
+        price_change = pair.get("priceChange", {})
+        # 尝试用 h1 变化率反推 1h 前价格
+        h1_change = price_change.get("h1")
+        h6_change = price_change.get("h6")
+
+        # 简单策略: 取当前价 / (1 + 最大跌幅) 作为历史高点估算
+        max_price = price_usd
+        if h1_change is not None:
+            try:
+                h1_pct = float(h1_change)
+                if h1_pct < 0:
+                    # 价格下跌了, 1h 前更高
+                    price_1h_ago = price_usd / (1 + h1_pct / 100)
+                    max_price = max(max_price, price_1h_ago)
+            except (ValueError, TypeError):
+                pass
+        if h6_change is not None:
+            try:
+                h6_pct = float(h6_change)
+                if h6_pct < 0:
+                    price_6h_ago = price_usd / (1 + h6_pct / 100)
+                    max_price = max(max_price, price_6h_ago)
+            except (ValueError, TypeError):
+                pass
+        return max_price
+    return None
 
 
 def calc_max_price_first_n_hours(candles: list[list], hours: int = 2) -> float | None:
@@ -689,7 +1114,7 @@ def stage1_initial(tokens: list[dict], cfg: dict,
       - 未推送过
     """
     now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 4) * 3600 * 1000
+    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
     max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
     max_price = cfg.get("max_price_current", 0.00002)
     min_holders = cfg.get("min_holders", 150)
@@ -700,7 +1125,7 @@ def stage1_initial(tokens: list[dict], cfg: dict,
 
     for tk in tokens:
         addr = tk.get("tokenAddress", "")
-        if addr in pushed_tokens:
+        if addr.lower() in pushed_tokens:
             skip["pushed"] += 1; continue
 
         create_ts = int(tk.get("createDate", 0))
@@ -795,20 +1220,34 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
             break
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
+        create_ts_sec = int(tk.get("createDate", 0)) // 1000
 
         if i > 0:
-            time.sleep(3)
+            time.sleep(0.3)
 
-        pool = gt_get_pool(addr)
-        if not pool:
-            log.debug("跳过 %s: 无 GeckoTerminal 交易池", name)
+        # ── 优先 DexScreener (快, 300 req/min) ──
+        high_2h = None
+        pairs = ds_get_pairs(addr)
+        if pairs:
+            high_2h = ds_calc_first_2h_max(pairs, create_ts_sec, bnb_price)
+
+        # ── Fallback: GeckoTerminal OHLCV (慢但精确) ──
+        if high_2h is None:
+            if i > 0:
+                time.sleep(_gt_rate_delay)
+            pool = gt_get_pool(addr)
+            if pool:
+                time.sleep(_gt_rate_delay)
+                candles = gt_ohlcv_hourly(pool, limit=72)
+                if candles:
+                    high_2h = calc_first_2h_max(candles, create_ts_sec)
+
+        if high_2h is None:
+            log.debug("跳过 %s: 无法获取价格数据", name)
             continue
 
-        time.sleep(3)
-
-        candles = gt_ohlcv_hourly(pool, limit=72)
-        if not candles:
-            log.debug("跳过 %s: 无 K 线数据", name)
+        log.info("  %s: 前2h最高 $%.10f (阈值 $%.10f)", name, high_2h, max_2h)
+        if high_2h > max_2h:
             continue
 
         high_ath = calc_all_time_high(candles)
@@ -873,7 +1312,7 @@ def format_message(infos: list[dict]) -> str:
         lines.append(f"<b>#{i} {info['name']} ({info['short']})</b>")
         lines.append(f"📄 合约: <code>{info['address']}</code>")
         lines.append(f"💰 当前价: ${info['price_usd']:.10f}")
-        lines.append(f"📈 历史最高: ${info['high_ath']:.10f}")
+        lines.append(f"📈 前2h最高: ${info['high_2h']:.10f}")
         lines.append(f"👥 持币人数: {info['holders']}")
         lines.append(f"🔗 社交媒体: {info['social_count']} 个")
         social_links = info.get("social_links", [])
@@ -943,19 +1382,32 @@ def scan_once(cfg: dict) -> None:
         ticker["BNB"] = 600.0
     log.info("BNB=$%.2f", ticker.get("BNB", 0))
 
-    # 1) 拉取代币 (全量扫描) → 存入 SQLite
+    # 1) 链上扫描: 通过 TokenCreate 事件发现 100% 的代币 (已按总量筛选)
+    onchain_tokens = onchain_scan_tokens(cfg)
+    if onchain_tokens:
+        db_upsert_tokens(conn, onchain_tokens)
+        log.info("链上发现 %d 个代币 (总量=%s 筛选后), 已入库",
+                 len(onchain_tokens), cfg.get("required_total_supply", 1_000_000_000))
+
+    # 2) API 扫描: 获取价格/持币人数/交易量等实时批量数据
     tokens = fm_search_tokens(cfg)
     if tokens:
         db_upsert_tokens(conn, tokens)
-        log.info("已入库 %d 个代币", len(tokens))
-    else:
-        log.warning("本轮未获取到新代币, 继续使用数据库累积数据")
+        log.info("API 获取 %d 个代币, 已入库", len(tokens))
+    elif not onchain_tokens:
+        log.warning("链上扫描和 API 均未获取到代币")
 
     # 统计数据库总量
     total_db = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
-    log.info("数据库累积代币总数: %d", total_db)
+    onchain_only = conn.execute(
+        "SELECT COUNT(*) FROM tokens WHERE hold = 0 AND price = 0"
+    ).fetchone()[0]
+    log.info("数据库代币总数: %d (其中仅链上数据: %d)", total_db, onchain_only)
 
-    # 2) 从数据库查询初筛候选 (跨轮次累积, 覆盖全时间窗口)
+    # 2.5) 补全: 链上发现但 API 未覆盖的代币, 逐个查询 detail
+    _enrich_onchain_gaps(conn, cfg)
+
+    # 3) 从数据库查询初筛候选 (链上扫描 100% 覆盖 + API 数据丰富)
     s1 = db_query_candidates(conn, cfg, ticker)
     if not s1:
         log.info("初筛无结果")
@@ -1007,7 +1459,7 @@ def scan_once(cfg: dict) -> None:
             "short": tk.get("shortName", ""),
             "address": addr,
             "price_usd": tk.get("_price_usd", 0),
-            "high_ath": tk.get("_high_ath", 0),
+            "high_2h": tk.get("_high_2h", 0),
             "holders": tk.get("_holders", 0),
             "social_count": tk.get("_social_count", 0),
             "social_links": extract_social_links(detail),
@@ -1030,9 +1482,14 @@ def scan_once(cfg: dict) -> None:
         log.info("Telegram 推送%s", "成功" if ok else "失败")
 
     for info in infos:
-        pushed_tokens.add(info["address"])
+        pushed_tokens.add(info["address"].lower())
     if len(pushed_tokens) > MAX_CACHE:
         pushed_tokens = set(list(pushed_tokens)[-MAX_CACHE // 2:])
+
+    # 5.5) 自动买入
+    if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
+        bnb_usd = ticker.get("BNB", 600.0)
+        execute_buys(to_push, cfg, bnb_usd)
 
     # 6) 清理过期数据 & 关闭连接
     db_cleanup(conn)
@@ -1043,6 +1500,24 @@ def main():
     global _fm_session, _gt_session
     log.info("🚀 BSC 土狗扫描器 v2 启动")
     log.info("配置文件: %s", CONFIG_PATH)
+
+    # 初始化交易模块 & 启动持仓监控
+    _monitor_thread = None
+    try:
+        cfg = load_config()
+        if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
+            if init_trader(cfg):
+                log.info("自动交易已启用, 启动持仓监控...")
+                _monitor_thread = start_monitor(
+                    cfg_loader=load_config,
+                    bnb_price_func=lambda: fm_ticker_prices().get("BNB", 0),
+                )
+            else:
+                log.warning("交易模块初始化失败, 仅运行扫描模式")
+        elif not _HAS_TRADER:
+            log.info("交易模块未安装 (缺少 web3), 仅运行扫描模式")
+    except Exception as e:
+        log.warning("交易模块加载异常: %s, 仅运行扫描模式", e)
 
     while True:
         try:
@@ -1065,7 +1540,10 @@ def main():
             log.info("下次扫描: %d 分钟后", interval)
             time.sleep(interval * 60)
         except KeyboardInterrupt:
-            log.info("用户中断, 退出"); break
+            log.info("用户中断, 退出")
+            if _HAS_TRADER:
+                stop_monitor()
+            break
         except Exception as e:
             log.error("扫描异常: %s", e, exc_info=True)
             time.sleep(60)
