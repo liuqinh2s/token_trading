@@ -202,7 +202,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     newest = now_ms - min_age_ms
 
     rows = conn.execute("""
-        SELECT raw_json FROM tokens
+        SELECT raw_json, hold FROM tokens
         WHERE create_date BETWEEN ? AND ?
           AND hold >= ?
         ORDER BY day1_vol DESC
@@ -213,7 +213,7 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
     bnb_price = ticker.get("BNB", 600.0)
     results = []
 
-    for (raw,) in rows:
+    for raw, db_hold in rows:
         tk = json.loads(raw)
         addr = tk.get("tokenAddress", "")
         if addr.lower() in pushed_tokens:
@@ -229,15 +229,20 @@ def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
             continue
 
         tk["_price_usd"] = price_usd
-        tk["_holders"] = int(tk.get("hold", 0) or 0)
+        # 优先使用数据库列值 (可能被 _enrich_onchain_gaps 更新过)
+        tk["_holders"] = db_hold if db_hold > 0 else int(tk.get("hold", 0) or 0)
         results.append(tk)
 
     results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
+    log.info("初筛: 通过 %d 个候选 (共 %d 条) | 条件: 年龄%d~%dh 价格≤$%.8f 持币≥%d",
+             len(results), len(rows),
+             cfg.get("min_age_hours", 2), cfg.get("max_age_hours", 72),
+             max_price, min_holders)
     return results
 
 
 def db_cleanup(conn: sqlite3.Connection, max_age_hours: int = 168):
-    """清理超过 max_age_hours 的旧记录 (默认 7 天)"""
+    """清理超过 max_age_hours 的旧记录"""
     cutoff = int(time.time() * 1000) - max_age_hours * 3600 * 1000
     deleted = conn.execute("DELETE FROM tokens WHERE create_date < ?", (cutoff,)).rowcount
     conn.commit()
@@ -982,6 +987,15 @@ def gt_ohlcv_hourly(pool_address: str, limit: int = 72) -> list[list]:
         return []
 
 
+def calc_all_time_high(candles: list[list]) -> float | None:
+    """从 OHLCV 中提取历史最高价 (USD)
+    candles: [[ts, o, h, l, c, vol], ...] 最新在前
+    """
+    if not candles:
+        return None
+    return max(float(c[2]) for c in candles)
+
+
 def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
     """从 OHLCV 中提取发币后前 2 小时内的最高价 (USD)
     candles: [[ts, o, h, l, c, vol], ...] 最新在前
@@ -1151,8 +1165,9 @@ def stage1_initial(tokens: list[dict], cfg: dict,
         results.append(tk)
 
     results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
-    log.info("初筛: 通过=%d | 跳过: 已推=%d 年龄=%d 价格=%d 持币=%d",
-             len(results), skip["pushed"], skip["age"], skip["price"], skip["holders"])
+    log.info("初筛: 通过=%d | 跳过: 已推=%d 年龄=%d 价格=%d 持币=%d | 条件: 年龄%d~%dh 价格≤$%.8f 持币≥%d",
+             len(results), skip["pushed"], skip["age"], skip["price"], skip["holders"],
+             cfg.get("min_age_hours", 2), cfg.get("max_age_hours", 72), max_price, min_holders)
     return results
 
 
@@ -1165,6 +1180,7 @@ def stage2_detail(candidates: list[dict], cfg: dict,
     """
     required_supply = cfg.get("required_total_supply", 1_000_000_000)
     min_links = cfg.get("min_social_links", 1)
+    min_holders = cfg.get("min_holders", 150)
     results: list[tuple[dict, dict]] = []
 
     for i, tk in enumerate(candidates):
@@ -1176,6 +1192,14 @@ def stage2_detail(candidates: list[dict], cfg: dict,
         detail = fm_detail(addr)
         if not detail:
             continue
+
+        # 持币人数 (实时二次验证, 初筛用的是数据库缓存值)
+        real_hold = int(detail.get("holderCount", 0) or detail.get("hold", 0) or 0)
+        if real_hold < min_holders:
+            log.debug("跳过 %s: 实时持币 %d < %d",
+                      detail.get("name", addr), real_hold, min_holders)
+            continue
+        tk["_holders"] = real_hold
 
         # 总量
         try:
@@ -1200,12 +1224,13 @@ def stage2_detail(candidates: list[dict], cfg: dict,
         tk["_social_count"] = link_count
         results.append((tk, detail))
 
-    log.info("详情筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
+    log.info("详情筛: 检查 %d, 通过 %d | 条件: 总量=%s 社交≥%d 持币≥%d",
+             min(len(candidates), max_check), len(results), required_supply, min_links, min_holders)
     return results
 
 
 def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
-                 max_check: int = 15) -> list[tuple[dict, dict]]:
+                 max_check: int = 15, bnb_price: float = 600.0) -> list[tuple[dict, dict]]:
     """
     K线筛（GeckoTerminal OHLCV）:
       - 历史最高价 ≤ max_price_ath
@@ -1227,19 +1252,21 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
 
         # ── 优先 DexScreener (快, 300 req/min) ──
         high_2h = None
+        candles = None
         pairs = ds_get_pairs(addr)
         if pairs:
             high_2h = ds_calc_first_2h_max(pairs, create_ts_sec, bnb_price)
 
-        # ── Fallback: GeckoTerminal OHLCV (慢但精确) ──
-        if high_2h is None:
+        # ── Fallback / 补充: GeckoTerminal OHLCV (慢但精确) ──
+        # high_2h 未获取时用作 fallback; 已获取时仍需 candles 做 ATH 检查
+        if high_2h is None or candles is None:
             if i > 0:
                 time.sleep(_gt_rate_delay)
             pool = gt_get_pool(addr)
             if pool:
                 time.sleep(_gt_rate_delay)
                 candles = gt_ohlcv_hourly(pool, limit=72)
-                if candles:
+                if candles and high_2h is None:
                     high_2h = calc_first_2h_max(candles, create_ts_sec)
 
         if high_2h is None:
@@ -1250,7 +1277,7 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
         if high_2h > max_2h:
             continue
 
-        high_ath = calc_all_time_high(candles)
+        high_ath = calc_all_time_high(candles) if candles else None
         if high_ath is None:
             log.debug("跳过 %s: 无法确定历史最高价", name)
             continue
@@ -1260,7 +1287,7 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
             continue
 
         # 前2小时最高价检查
-        high_2h = calc_max_price_first_n_hours(candles, hours=2)
+        high_2h = calc_max_price_first_n_hours(candles, hours=2) if candles else high_2h
         if high_2h is not None and high_2h > max_2h:
             log.info("  %s: 前2h最高 $%.10f > 阈值 $%.10f, 跳过",
                      name, high_2h, max_2h)
@@ -1270,7 +1297,8 @@ def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
         tk["_high_2h"] = high_2h
         results.append((tk, detail))
 
-    log.info("K线筛: 检查 %d, 通过 %d", min(len(candidates), max_check), len(results))
+    log.info("K线筛: 检查 %d, 通过 %d | 条件: ATH≤$%.8f 前2h≤$%.8f",
+             min(len(candidates), max_check), len(results), max_ath, max_2h)
     return results
 
 
@@ -1411,10 +1439,9 @@ def scan_once(cfg: dict) -> None:
     s1 = db_query_candidates(conn, cfg, ticker)
     if not s1:
         log.info("初筛无结果")
-        db_cleanup(conn)
+        db_cleanup(conn, cfg.get("max_age_hours", 72))
         conn.close()
         return
-    log.info("初筛: 通过 %d 个候选", len(s1))
 
     # 2.5) 获取热点关键词 (用于后续加分排序)
     hotspots = fetch_all_hotspots(cfg)
@@ -1423,15 +1450,15 @@ def scan_once(cfg: dict) -> None:
     s2 = stage2_detail(s1, cfg, max_check=max_push * 8)
     if not s2:
         log.info("详情筛无结果")
-        db_cleanup(conn)
+        db_cleanup(conn, cfg.get("max_age_hours", 72))
         conn.close()
         return
 
     # 4) K线筛
-    s3 = stage3_kline(s2, cfg, max_check=max_push * 5)
+    s3 = stage3_kline(s2, cfg, max_check=max_push * 5, bnb_price=ticker.get("BNB", 600.0))
     if not s3:
         log.info("K线筛无结果")
-        db_cleanup(conn)
+        db_cleanup(conn, cfg.get("max_age_hours", 72))
         conn.close()
         return
 
@@ -1492,7 +1519,7 @@ def scan_once(cfg: dict) -> None:
         execute_buys(to_push, cfg, bnb_usd)
 
     # 6) 清理过期数据 & 关闭连接
-    db_cleanup(conn)
+    db_cleanup(conn, cfg.get("max_age_hours", 72))
     conn.close()
 
 
