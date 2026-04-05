@@ -1,13 +1,11 @@
 """
-BSC 土狗扫盘程序 - four.meme 新币扫描器 v2
-数据源: four.meme API (代币发现/详情) + GeckoTerminal API (K线数据)
+BSC Token Scanner - four.meme 新币扫描器 v3
+数据源: four.meme API (代币发现/详情) + DexScreener (主要价格) + GeckoTerminal (备选K线)
 
-筛选条件：
-1. 代币总量 = 10亿, 发行时间 > 4小时 且 < 3天
-2. 历史最高价 ≤ 0.00014 USD, 前2小时最高价 ≤ 0.00004 USD, 当前价 ≤ 0.00002 USD
-3. 持币地址数 ≥ 150
-4. 关联社交媒体 ≥ 1
-5. 有对应热点新闻
+三级筛选管线:
+  Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、持币地址粗筛 — 仅用 search API 批量数据
+  Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段 — detail API
+  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.00002(>1h)、价在最高价30%~90% — DexScreener+GT
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ import time
 import logging
 import re
 import sys
-import sqlite3
 import xml.etree.ElementTree as ET
 import requests
 from requests.adapters import HTTPAdapter
@@ -63,6 +60,8 @@ FM_SEARCH = "https://four.meme/meme-api/v1/public/token/search"
 FM_DETAIL = "https://four.meme/meme-api/v1/private/token/get/v2"
 FM_TICKER = "https://four.meme/meme-api/v1/public/ticker"
 GT_BASE = "https://api.geckoterminal.com/api/v2"
+DS_BASE = "https://api.dexscreener.com"
+BSCSCAN_API = "https://api.bscscan.com/api"
 
 FM_HEADERS = {
     "Content-Type": "application/json",
@@ -72,387 +71,30 @@ FM_HEADERS = {
     "Referer": "https://four.meme/",
 }
 GT_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+DS_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+# 筛选阈值 (与新项目同步)
+MAX_AGE_HOURS = 72
+TOTAL_SUPPLY = 1_000_000_000           # 10亿
+MAX_CURRENT_PRICE_OLD = 0.00002        # 币龄 > 1h 当前价格上限 (USD)
+MAX_CURRENT_PRICE_YOUNG = 0.000004     # 币龄 ≤ 1h 当前价格上限 (USD)
+MAX_HIGH_PRICE = 0.00004               # 历史最高价上限 (USD)
+MAX_EARLY_HIGH_PRICE = 0.00002         # 前2小时最高价上限 (USD, 币龄>1h时检查)
+PRICE_RATIO_LOW = 0.3                  # 当前价 ≥ 最高价 * 30%
+PRICE_RATIO_HIGH = 0.9                 # 当前价 ≤ 最高价 * 90%
+HOLDERS_THRESHOLD_OLD = 60             # 币龄 > 1h 时持币地址数阈值
+HOLDERS_THRESHOLD_YOUNG = 30           # 币龄 ≤ 1h 时持币地址数阈值
+MIN_SOCIAL_COUNT = 1                   # 最少关联社交媒体数
 
 pushed_tokens: set[str] = set()
 MAX_CACHE = 5000
 
-DB_PATH = Path(__file__).parent / "tokens.db"
-
-# ===================================================================
-#  链上扫描常量 (four.meme TokenManager2 V2)
-# ===================================================================
-TOKEN_MANAGER_V2 = "0x5c952063c7fc8610FFDB798152D69F0B9550762b"
-TOKEN_CREATE_TOPIC = "0x396d5e902b675b032348d3d2e9517ee8f0c4a926603fbc075d3d282ff00cad20"
-BSC_BLOCK_TIME = 3  # ~3 秒/块
-
-SCAN_RPC_URLS = [
-    "https://bsc.publicnode.com",
-    "https://1rpc.io/bnb",
-    "https://bsc-dataseed1.binance.org",
-    "https://bsc-dataseed2.binance.org",
-    "https://bsc.api.onfinality.io/public",
-    "https://bsc-rpc.publicnode.com",
-]
+# GeckoTerminal 动态速率控制
+_gt_rate_delay: float = 2.0
 
 
 # ===================================================================
-#  SQLite 本地代币缓存
-#  跨轮次累积代币, 解决 API 分页上限 (10页×100) 无法覆盖全时间窗口的问题
-#  每 15 分钟扫一次, 每次覆盖最新 ~5h, 运行数小时后即实现全量覆盖
-# ===================================================================
-def _init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tokens (
-            address      TEXT PRIMARY KEY,
-            name         TEXT,
-            short_name   TEXT,
-            symbol       TEXT,
-            status       TEXT,
-            create_date  INTEGER,
-            price        REAL,
-            hold         INTEGER,
-            day1_vol     REAL,
-            progress     REAL,
-            total_supply INTEGER DEFAULT 0,
-            raw_json     TEXT,
-            first_seen   INTEGER,
-            last_updated INTEGER
-        )
-    """)
-    # 兼容旧表: 若缺少 total_supply 列则自动添加
-    try:
-        conn.execute("SELECT total_supply FROM tokens LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE tokens ADD COLUMN total_supply INTEGER DEFAULT 0")
-        conn.commit()
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_tokens_create ON tokens(create_date)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_tokens_hold ON tokens(hold)
-    """)
-    conn.commit()
-    return conn
-
-
-def db_upsert_tokens(conn: sqlite3.Connection, tokens: list[dict]):
-    """批量插入或更新代币 (地址统一小写; 非零值覆盖零值, 避免链上空数据覆盖 API 数据)"""
-    now_ms = int(time.time() * 1000)
-    rows = []
-    for t in tokens:
-        addr = (t.get("tokenAddress", "") or "").lower()
-        if not addr:
-            continue
-        total_supply = int(t.get("_total_supply", 0))
-        rows.append((
-            addr,
-            t.get("name", ""),
-            t.get("shortName", ""),
-            t.get("symbol", "BNB"),
-            t.get("status", ""),
-            int(t.get("createDate", 0)),
-            float(t.get("price", 0)),
-            int(t.get("hold", 0) or 0),
-            float(t.get("day1Vol", 0) or 0),
-            float(t.get("progress", 0) or 0),
-            total_supply,
-            json.dumps(t, ensure_ascii=False),
-            now_ms,
-            now_ms,
-        ))
-    conn.executemany("""
-        INSERT INTO tokens (address, name, short_name, symbol, status,
-                            create_date, price, hold, day1_vol, progress,
-                            total_supply, raw_json, first_seen, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(address) DO UPDATE SET
-            name         = CASE WHEN excluded.name != '' THEN excluded.name ELSE tokens.name END,
-            short_name   = CASE WHEN excluded.short_name != '' THEN excluded.short_name ELSE tokens.short_name END,
-            symbol       = CASE WHEN excluded.symbol != 'BNB' THEN excluded.symbol
-                                WHEN tokens.symbol = '' THEN excluded.symbol ELSE tokens.symbol END,
-            status       = CASE WHEN excluded.status != '' THEN excluded.status ELSE tokens.status END,
-            create_date  = CASE WHEN excluded.create_date > 0 THEN excluded.create_date ELSE tokens.create_date END,
-            price        = CASE WHEN excluded.price > 0 THEN excluded.price ELSE tokens.price END,
-            hold         = CASE WHEN excluded.hold > 0 THEN excluded.hold ELSE tokens.hold END,
-            day1_vol     = CASE WHEN excluded.day1_vol > 0 THEN excluded.day1_vol ELSE tokens.day1_vol END,
-            progress     = CASE WHEN excluded.progress > 0 THEN excluded.progress ELSE tokens.progress END,
-            total_supply = CASE WHEN excluded.total_supply > 0 THEN excluded.total_supply ELSE tokens.total_supply END,
-            raw_json     = CASE WHEN excluded.price > 0 THEN excluded.raw_json ELSE tokens.raw_json END,
-            last_updated = excluded.last_updated
-    """, rows)
-    conn.commit()
-
-
-def db_query_candidates(conn: sqlite3.Connection, cfg: dict,
-                        ticker: dict[str, float]) -> list[dict]:
-    """
-    从本地数据库中查询符合初筛条件的代币:
-      - 发行时间在 [min_age, max_age] 范围内
-      - 持币人数 ≥ min_holders
-    价格过滤在 Python 层做 (需要汇率换算)
-    """
-    now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
-    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
-    min_holders = cfg.get("min_holders", 150)
-
-    oldest = now_ms - max_age_ms
-    newest = now_ms - min_age_ms
-
-    rows = conn.execute("""
-        SELECT raw_json, hold FROM tokens
-        WHERE create_date BETWEEN ? AND ?
-          AND hold >= ?
-        ORDER BY day1_vol DESC
-    """, (oldest, newest, min_holders)).fetchall()
-
-    # 解析 JSON, 应用价格过滤
-    max_price = cfg.get("max_price_current", 0.00002)
-    bnb_price = ticker.get("BNB", 600.0)
-    results = []
-
-    for raw, db_hold in rows:
-        tk = json.loads(raw)
-        addr = tk.get("tokenAddress", "")
-        if addr.lower() in pushed_tokens:
-            continue
-
-        raw_price = float(tk.get("price", 0))
-        base = tk.get("symbol", "BNB").upper()
-        if base == "USDT":
-            price_usd = raw_price
-        else:
-            price_usd = raw_price * ticker.get(base, bnb_price)
-        if price_usd <= 0 or price_usd > max_price:
-            continue
-
-        tk["_price_usd"] = price_usd
-        # 优先使用数据库列值 (可能被 _enrich_onchain_gaps 更新过)
-        tk["_holders"] = db_hold if db_hold > 0 else int(tk.get("hold", 0) or 0)
-        results.append(tk)
-
-    results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
-    log.info("初筛: 通过 %d 个候选 (共 %d 条) | 条件: 年龄%d~%dh 价格≤$%.8f 持币≥%d",
-             len(results), len(rows),
-             cfg.get("min_age_hours", 2), cfg.get("max_age_hours", 72),
-             max_price, min_holders)
-    return results
-
-
-def db_cleanup(conn: sqlite3.Connection, max_age_hours: int = 168):
-    """清理超过 max_age_hours 的旧记录"""
-    cutoff = int(time.time() * 1000) - max_age_hours * 3600 * 1000
-    deleted = conn.execute("DELETE FROM tokens WHERE create_date < ?", (cutoff,)).rowcount
-    conn.commit()
-    if deleted > 0:
-        log.info("db_cleanup: 清理 %d 条过期记录", deleted)
-
-
-# ===================================================================
-#  热点数据层
-#  从微博热搜 / Google Trends / Twitter(X) 抓取实时热点关键词,
-#  用于与代币名称/描述做交叉匹配 (加分项, 匹配的代币优先推送)
-# ===================================================================
-_hotspot_cache: dict = {"ts": 0, "keywords": []}
-HOTSPOT_CACHE_TTL = 900  # 缓存 15 分钟
-
-
-def fetch_weibo_hot() -> list[dict]:
-    """
-    获取微博实时热搜 Top50
-    返回: [{"word": "关键词", "rank": 0, "source": "weibo"}, ...]
-    """
-    url = "https://weibo.com/ajax/side/hotSearch"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://weibo.com/",
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json",
-    }
-    try:
-        _ensure_sessions()
-        r = _fm_session.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        items = d.get("data", {}).get("realtime", [])
-        results = []
-        for i, item in enumerate(items):
-            word = (item.get("word") or "").strip()
-            if word and len(word) >= 2:
-                results.append({"word": word, "rank": i, "source": "weibo"})
-        log.info("微博热搜: 获取 %d 个关键词", len(results))
-        return results
-    except Exception as e:
-        log.warning("微博热搜获取失败: %s", e)
-        return []
-
-
-def fetch_google_trends(geos: tuple[str, ...] = ("US", "CN")) -> list[dict]:
-    """
-    获取 Google Trends 每日热门搜索 (多地区)
-    返回: [{"word": "关键词", "rank": 0, "source": "google"}, ...]
-    """
-    results = []
-    seen: set[str] = set()
-    for geo in geos:
-        url = f"https://trends.google.com/trending/rss?geo={geo}"
-        try:
-            _ensure_sessions()
-            r = _gt_session.get(url, timeout=10)
-            r.raise_for_status()
-            root = ET.fromstring(r.text)
-            for i, item in enumerate(root.findall(".//item")):
-                title_el = item.find("title")
-                if title_el is not None and title_el.text:
-                    word = title_el.text.strip()
-                    if word and word.lower() not in seen:
-                        seen.add(word.lower())
-                        results.append({
-                            "word": word,
-                            "rank": i,
-                            "source": f"google/{geo}",
-                        })
-        except Exception as e:
-            log.warning("Google Trends [%s] 获取失败: %s", geo, e)
-        time.sleep(0.3)
-    log.info("Google Trends: 获取 %d 个关键词", len(results))
-    return results
-
-
-def fetch_twitter_trending() -> list[dict]:
-    """
-    通过 getdaytrends.com 抓取 Twitter/X 当日热门话题
-    返回: [{"word": "关键词", "rank": 0, "source": "twitter"}, ...]
-    """
-    url = "https://getdaytrends.com/united-states/"
-    try:
-        _ensure_sessions()
-        r = _gt_session.get(url, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html",
-        })
-        r.raise_for_status()
-        # 提取趋势链接中的话题文本
-        matches = re.findall(
-            r'href="/united-states/trend/[^"]*">([^<]+)</a>', r.text
-        )
-        results = []
-        seen: set[str] = set()
-        for i, word in enumerate(matches):
-            word = word.strip().lstrip("#")
-            if word and len(word) >= 2 and word.lower() not in seen:
-                seen.add(word.lower())
-                results.append({"word": word, "rank": i, "source": "twitter"})
-        log.info("Twitter Trending: 获取 %d 个关键词", len(results))
-        return results
-    except Exception as e:
-        log.warning("Twitter Trending 获取失败: %s", e)
-        return []
-
-
-def fetch_all_hotspots(cfg: dict) -> list[dict]:
-    """
-    汇总所有热点关键词, 带 15 分钟缓存
-    返回: [{"word": ..., "rank": ..., "source": ...}, ...]
-    """
-    global _hotspot_cache
-    now = time.time()
-    if now - _hotspot_cache["ts"] < HOTSPOT_CACHE_TTL and _hotspot_cache["keywords"]:
-        log.info("使用缓存热点: %d 个关键词", len(_hotspot_cache["keywords"]))
-        return _hotspot_cache["keywords"]
-
-    hotspot_cfg = cfg.get("hotspot", {})
-    if not hotspot_cfg.get("enabled", True):
-        return []
-
-    all_kw: list[dict] = []
-
-    # 微博热搜
-    if hotspot_cfg.get("weibo", True):
-        all_kw.extend(fetch_weibo_hot())
-
-    # Google Trends
-    if hotspot_cfg.get("google", True):
-        geos = tuple(hotspot_cfg.get("google_geos", ["US", "CN"]))
-        all_kw.extend(fetch_google_trends(geos))
-
-    # Twitter/X
-    if hotspot_cfg.get("twitter", True):
-        all_kw.extend(fetch_twitter_trending())
-
-    log.info("热点汇总: 共 %d 个关键词 (微博/Google/Twitter)", len(all_kw))
-    _hotspot_cache = {"ts": now, "keywords": all_kw}
-    return all_kw
-
-
-def _normalize(text: str) -> str:
-    """统一小写, 去除多余空格和特殊符号, 用于模糊匹配"""
-    text = text.lower().strip()
-    text = re.sub(r"[_\-./·・\s]+", " ", text)
-    return text
-
-
-def hotspot_match(token: dict, hotspots: list[dict],
-                  detail: dict | None = None) -> tuple[float, list[str]]:
-    """
-    计算代币与热点关键词的匹配分数
-
-    匹配字段: name, shortName, descr(detail)
-    匹配逻辑:
-      - 完全包含 (热点关键词 ⊂ 代币字段): 权重高
-      - 越短的热点词要求越精确 (≤3字符需完全匹配 name/shortName)
-      - 热点排名靠前的权重更高
-
-    返回: (总分, [匹配到的关键词列表])
-    """
-    # 构建待匹配文本
-    name = _normalize(token.get("name", ""))
-    short = _normalize(token.get("shortName", ""))
-    desc = ""
-    if detail:
-        desc = _normalize(detail.get("descr", "") or "")
-
-    score = 0.0
-    matched: list[str] = []
-    seen_words: set[str] = set()
-
-    for h in hotspots:
-        word = h["word"]
-        word_lower = _normalize(word)
-        if word_lower in seen_words:
-            continue
-
-        # 短关键词 (≤3字符) 要求精确匹配 name 或 shortName
-        if len(word_lower) <= 3:
-            if word_lower != name and word_lower != short:
-                continue
-        else:
-            # 长关键词: 检查子串包含
-            found = False
-            if word_lower in name or word_lower in short:
-                found = True
-            elif desc and word_lower in desc:
-                found = True
-            # 反向匹配: name/short 包含在热点词中 (如代币名 "张雪" 匹配热点 "张雪机车")
-            if not found and len(name) >= 2:
-                if name in word_lower or short in word_lower:
-                    found = True
-            if not found:
-                continue
-
-        seen_words.add(word_lower)
-        # 排名权重: rank=0 → 1.0, rank=49 → 0.5
-        rank_weight = max(0.5, 1.0 - h["rank"] * 0.01)
-        # 来源权重: 微博略高 (中文 meme 币与中文热点相关性更强)
-        source_weight = {"weibo": 1.2, "twitter": 1.0}.get(
-            h["source"].split("/")[0], 0.9
-        )
-        score += rank_weight * source_weight
-        matched.append(f"{word}({h['source']})")
-
-    return score, matched
+#  HTTP Session
 # ===================================================================
 def _build_session(proxy_cfg: dict | None = None,
                    extra_headers: dict | None = None) -> requests.Session:
@@ -477,14 +119,6 @@ def _build_session(proxy_cfg: dict | None = None,
     return session
 
 
-def _init_sessions(proxy_cfg: dict | None = None):
-    """初始化 four.meme 和 GeckoTerminal 两个 session"""
-    fm = _build_session(proxy_cfg, FM_HEADERS)
-    gt = _build_session(proxy_cfg, GT_HEADERS)
-    return fm, gt
-
-
-# 全局 Session
 _fm_session: requests.Session = None  # type: ignore
 _gt_session: requests.Session = None  # type: ignore
 
@@ -497,269 +131,141 @@ def _ensure_sessions():
             proxy = cfg.get("proxy")
         except Exception:
             proxy = None
-        _fm_session, _gt_session = _init_sessions(proxy)
+        _fm_session = _build_session(proxy, FM_HEADERS)
+        _gt_session = _build_session(proxy, GT_HEADERS)
 
 
 # ===================================================================
-#  链上扫描层
-#  通过 eth_getLogs 读取 TokenManager2 的 TokenCreate 事件,
-#  100% 覆盖全时间窗口内的所有 four.meme 代币 (不受 API 分页上限约束)
+#  热点数据层
 # ===================================================================
-def _rpc_call(method: str, params: list, rpc_url: str):
-    """JSON-RPC 调用 BSC 节点 (走代理 session)"""
+_hotspot_cache: dict = {"ts": 0, "keywords": []}
+HOTSPOT_CACHE_TTL = 900  # 15 分钟
+
+
+def _normalize(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[_\-./·・\s]+", " ", text)
+    return text
+
+
+def fetch_weibo_hot() -> list[dict]:
     _ensure_sessions()
-    r = _fm_session.post(rpc_url, json={
-        "jsonrpc": "2.0", "id": 1,
-        "method": method, "params": params,
-    }, timeout=30, headers={"Content-Type": "application/json"})
-    r.raise_for_status()
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
-    return data.get("result")
-
-
-def _decode_token_create_log(log_entry: dict) -> dict | None:
-    """
-    解码 TokenCreate 事件:
-    TokenCreate(address creator, address token, uint256 tokenId,
-                string name, string symbol,
-                uint256 totalSupply, uint256 launchTs, uint256 unknown)
-
-    所有参数非 indexed, 全部在 data 字段 (ABI 编码)
-    """
     try:
-        data = log_entry["data"][2:]  # 去掉 0x
-
-        # Head: 8 个 word (每个 64 hex chars = 32 bytes)
-        # Word 0: creator address
-        # Word 1: token address
-        token = "0x" + data[88:128]  # word 1, 取后 40 chars (20 bytes)
-        # Word 2: tokenId
-        # Word 3: offset to name (bytes)
-        name_offset = int(data[192:256], 16)
-        # Word 4: offset to symbol (bytes)
-        sym_offset = int(data[256:320], 16)
-        # Word 5: totalSupply (raw, with decimals)
-        total_supply_raw = int(data[320:384], 16)
-        # Word 6: launchTimestamp
-        launch_ts = int(data[384:448], 16)
-
-        # 解码 name 字符串
-        no = name_offset * 2  # byte offset → hex char offset
-        name_len = int(data[no:no + 64], 16)
-        name = bytes.fromhex(data[no + 64:no + 64 + name_len * 2]).decode(
-            "utf-8", errors="replace")
-
-        # 解码 symbol 字符串
-        so = sym_offset * 2
-        sym_len = int(data[so:so + 64], 16)
-        symbol = bytes.fromhex(data[so + 64:so + 64 + sym_len * 2]).decode(
-            "utf-8", errors="replace")
-
-        # 转换总量 (假设 18 decimals)
-        total_supply = total_supply_raw // (10 ** 18)
-
-        # 转换时间戳 (秒 → 毫秒)
-        if launch_ts > 1e12:
-            create_date_ms = launch_ts  # 已是毫秒
-        elif launch_ts > 0:
-            create_date_ms = launch_ts * 1000
-        else:
-            # 回退: 用区块号估算
-            block_num = int(log_entry.get("blockNumber", "0x0"), 16)
-            create_date_ms = int(time.time() * 1000) - block_num * BSC_BLOCK_TIME * 1000
-            if create_date_ms < 0:
-                create_date_ms = int(time.time() * 1000)
-
-        return {
-            "tokenAddress": token,
-            "name": name,
-            "shortName": symbol,
-            "symbol": "BNB",  # 默认, 后续由 API 更新
-            "status": "",
-            "createDate": create_date_ms,
-            "price": 0,
-            "hold": 0,
-            "day1Vol": 0,
-            "progress": 0,
-            "_total_supply": total_supply,
-        }
+        r = _fm_session.get("https://weibo.com/ajax/side/hotSearch", headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://weibo.com/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json",
+        }, timeout=10)
+        r.raise_for_status()
+        items = r.json().get("data", {}).get("realtime", [])
+        results = [{"word": item["word"].strip(), "rank": i, "source": "weibo"}
+                   for i, item in enumerate(items)
+                   if (item.get("word") or "").strip() and len(item["word"].strip()) >= 2]
+        log.info("微博热搜: %d 个关键词", len(results))
+        return results
     except Exception as e:
-        log.debug("解码 TokenCreate 事件失败: %s", e)
-        return None
-
-
-def onchain_scan_tokens(cfg: dict) -> list[dict]:
-    """
-    通过链上 eth_getLogs 扫描 TokenManager2 的 TokenCreate 事件,
-    100% 覆盖全时间窗口内的所有 four.meme 代币。
-
-    BSC 出块约 3 秒, 72h ≈ 86400 块。
-    按 2000 块分片查询 (自动降级到 500), 约 45-175 次 RPC, 耗时 ~30-60 秒。
-    """
-    max_age_hours = cfg.get("max_age_hours", 72)
-    required_supply = cfg.get("required_total_supply", 1_000_000_000)
-
-    # 选择 RPC (优先使用配置, 否则用内置列表)
-    rpc_url = cfg.get("scan_rpc_url", "") or cfg.get("trading", {}).get("rpc_url", "")
-    if not rpc_url:
-        rpc_url = SCAN_RPC_URLS[0]
-
-    # 获取当前区块
-    current_block = None
-    for url in ([rpc_url] + SCAN_RPC_URLS):
-        try:
-            current_block = int(_rpc_call("eth_blockNumber", [], url), 16)
-            rpc_url = url
-            break
-        except Exception as e:
-            log.warning("RPC %s 获取区块高度失败: %s", url[:40], e)
-    if current_block is None:
-        log.error("所有 RPC 获取区块高度失败, 跳过链上扫描")
+        log.warning("微博热搜获取失败: %s", e)
         return []
 
-    log.info("链上扫描: 当前区块 %d, RPC %s", current_block, rpc_url[:40])
 
-    blocks_back = max_age_hours * 3600 // BSC_BLOCK_TIME
-    start_block = current_block - blocks_back
-    chunk_size = 2000  # 起始分片大小, 失败时自动缩小
-
-    all_tokens: list[dict] = []
-    total_events = 0
-    supply_filtered = 0
-    from_block = start_block
-    consecutive_errors = 0
-    total_chunks = 0
-    empty_chunks = 0
-
-    while from_block <= current_block:
-        to_block = min(from_block + chunk_size - 1, current_block)
-
+def fetch_google_trends(geos: tuple[str, ...] = ("US", "CN")) -> list[dict]:
+    _ensure_sessions()
+    results, seen = [], set()
+    for geo in geos:
         try:
-            logs = _rpc_call("eth_getLogs", [{
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "address": TOKEN_MANAGER_V2,
-                "topics": [TOKEN_CREATE_TOPIC],
-            }], rpc_url)
-
-            consecutive_errors = 0
-            total_chunks += 1
-            if not logs:
-                empty_chunks += 1
-
-            for entry in (logs or []):
-                total_events += 1
-                token = _decode_token_create_log(entry)
-                if token is None:
-                    continue
-                # 立即过滤总量
-                if token["_total_supply"] != required_supply:
-                    supply_filtered += 1
-                    continue
-                all_tokens.append(token)
-
-            from_block = to_block + 1
-
+            r = _gt_session.get(f"https://trends.google.com/trending/rss?geo={geo}", timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            for i, item in enumerate(root.findall(".//item")):
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    word = title_el.text.strip()
+                    if word and word.lower() not in seen:
+                        seen.add(word.lower())
+                        results.append({"word": word, "rank": i, "source": f"google/{geo}"})
         except Exception as e:
-            err_msg = str(e).lower()
-            consecutive_errors += 1
-
-            # 分片太大 → 缩小
-            if any(w in err_msg for w in ("limit", "range", "exceed", "too many")):
-                if chunk_size > 100:
-                    chunk_size = max(100, chunk_size // 2)
-                    log.info("RPC 区块范围超限, 缩小到 %d 块/次", chunk_size)
-                    consecutive_errors = 0  # 范围超限不算连续失败
-                    continue
-
-            # 连续失败 → 切换 RPC
-            if consecutive_errors >= 3:
-                switched = False
-                for alt_rpc in SCAN_RPC_URLS:
-                    if alt_rpc == rpc_url:
-                        continue
-                    try:
-                        _rpc_call("eth_blockNumber", [], alt_rpc)
-                        rpc_url = alt_rpc
-                        chunk_size = 500
-                        consecutive_errors = 0
-                        log.info("切换备用 RPC: %s", rpc_url[:40])
-                        switched = True
-                        break
-                    except Exception:
-                        continue
-                if not switched:
-                    log.error("所有 RPC 失败, 中止链上扫描 (已扫到区块 %d)", from_block)
-                    break
-            else:
-                log.warning("RPC 请求失败 (%d/3): %s", consecutive_errors, e)
-                time.sleep(1)
-
-    log.info("链上扫描完成: 共 %d 个 TokenCreate, 总量匹配 %d, 跳过 %d "
-             "(chunk_size=%d, 总请求=%d, 空块=%d, 区块范围 %d→%d)",
-             total_events, len(all_tokens), supply_filtered,
-             chunk_size, total_chunks, empty_chunks, start_block, current_block)
-    return all_tokens
-
-
-def _enrich_onchain_gaps(conn: sqlite3.Connection, cfg: dict,
-                         max_fill: int = 100):
-    """
-    为链上发现但缺少 API 数据 (hold=0) 的代币补全信息。
-    通过 four.meme detail API 逐个获取, 受限于速率每轮最多补全 max_fill 个。
-    多轮运行后全部补全。
-    """
-    now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
-    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
-    required_supply = cfg.get("required_total_supply", 1_000_000_000)
-
-    oldest = now_ms - max_age_ms
-    newest = now_ms - min_age_ms
-
-    rows = conn.execute("""
-        SELECT address FROM tokens
-        WHERE create_date BETWEEN ? AND ?
-          AND total_supply = ?
-          AND hold = 0
-          AND price = 0
-        ORDER BY create_date DESC
-        LIMIT ?
-    """, (oldest, newest, required_supply, max_fill)).fetchall()
-
-    if not rows:
-        return
-
-    log.info("补全链上代币数据: %d 个待查", len(rows))
-    filled = 0
-    consecutive_miss = 0
-
-    for (addr,) in rows:
+            log.warning("Google Trends [%s] 获取失败: %s", geo, e)
         time.sleep(0.3)
-        detail = fm_detail(addr)
-        if not detail:
-            consecutive_miss += 1
-            if consecutive_miss >= 20:
-                log.info("连续 %d 个补全失败, 跳过剩余", consecutive_miss)
-                break
+    log.info("Google Trends: %d 个关键词", len(results))
+    return results
+
+
+def fetch_twitter_trending() -> list[dict]:
+    _ensure_sessions()
+    try:
+        r = _gt_session.get("https://getdaytrends.com/united-states/", timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html",
+        })
+        r.raise_for_status()
+        matches = re.findall(r'href="/united-states/trend/[^"]*">([^<]+)</a>', r.text)
+        results, seen = [], set()
+        for i, word in enumerate(matches):
+            word = word.strip().lstrip("#")
+            if word and len(word) >= 2 and word.lower() not in seen:
+                seen.add(word.lower())
+                results.append({"word": word, "rank": i, "source": "twitter"})
+        log.info("Twitter Trending: %d 个关键词", len(results))
+        return results
+    except Exception as e:
+        log.warning("Twitter Trending 获取失败: %s", e)
+        return []
+
+
+def fetch_all_hotspots(cfg: dict) -> list[dict]:
+    global _hotspot_cache
+    now = time.time()
+    if now - _hotspot_cache["ts"] < HOTSPOT_CACHE_TTL and _hotspot_cache["keywords"]:
+        log.info("使用缓存热点: %d 个关键词", len(_hotspot_cache["keywords"]))
+        return _hotspot_cache["keywords"]
+
+    hotspot_cfg = cfg.get("hotspot", {})
+    if not hotspot_cfg.get("enabled", True):
+        return []
+
+    all_kw: list[dict] = []
+    if hotspot_cfg.get("weibo", True):
+        all_kw.extend(fetch_weibo_hot())
+    if hotspot_cfg.get("google", True):
+        geos = tuple(hotspot_cfg.get("google_geos", ["US", "CN"]))
+        all_kw.extend(fetch_google_trends(geos))
+    if hotspot_cfg.get("twitter", True):
+        all_kw.extend(fetch_twitter_trending())
+
+    log.info("热点汇总: %d 个关键词", len(all_kw))
+    _hotspot_cache = {"ts": now, "keywords": all_kw}
+    return all_kw
+
+
+def hotspot_match(token: dict, hotspots: list[dict],
+                  descr: str = "") -> tuple[float, list[str], bool]:
+    """返回 (score, matched_keywords, is_hot)"""
+    name = _normalize(token.get("name", ""))
+    short = _normalize(token.get("shortName", ""))
+    desc = _normalize(descr)
+    score, matched, seen_words = 0.0, [], set()
+
+    for h in hotspots:
+        wl = _normalize(h["word"])
+        if wl in seen_words:
             continue
+        if len(wl) <= 3:
+            if wl != name and wl != short:
+                continue
+        else:
+            found = wl in name or wl in short or (desc and wl in desc)
+            if not found and len(name) >= 2:
+                found = name in wl or short in wl
+            if not found:
+                continue
+        seen_words.add(wl)
+        rank_w = max(0.5, 1.0 - h["rank"] * 0.01)
+        src_w = {"weibo": 1.2, "twitter": 1.0}.get(h["source"].split("/")[0], 0.9)
+        score += rank_w * src_w
+        matched.append(f"{h['word']}({h['source']})")
 
-        consecutive_miss = 0
-        hold = int(detail.get("holderCount", 0) or detail.get("hold", 0) or 0)
-        price = float(detail.get("price", 0) or 0)
-        status = detail.get("status", "")
-
-        conn.execute("""
-            UPDATE tokens SET hold = ?, price = ?, status = ?, last_updated = ?
-            WHERE address = ? AND (hold = 0 OR price = 0)
-        """, (hold, price, status, now_ms, addr))
-        if hold > 0 or price > 0:
-            filled += 1
-
-    conn.commit()
-    log.info("补全完成: %d / %d 个代币获取到数据", filled, len(rows))
+    return score, matched, len(matched) > 0
 
 
 # ===================================================================
@@ -767,35 +273,17 @@ def _enrich_onchain_gaps(conn: sqlite3.Connection, cfg: dict,
 # ===================================================================
 def fm_search_tokens(cfg: dict) -> list[dict]:
     """
-    全量扫描 four.meme 代币, 通过多维度查询组合最大化覆盖。
-
-    策略 (每组最多 10 页 × 100 = 1000 条):
-      ┌─────────────────────────────────────────────────────────────┐
-      │  维度1: symbol = BNB / USD1 / USDT / CAKE                 │
-      │  维度2: sort   = DESC (最新) / ASC (最旧)                   │
-      │  维度3: status = PUBLISH (bonding curve) / TRADE (已迁移)   │
-      │  维度4: type   = NEW / HOT / VOL / PROGRESS                │
-      └─────────────────────────────────────────────────────────────┘
-      DESC 从最新到最旧, ASC 从最旧到最新 → 两端各覆盖 1000 条,
-      中间部分由 SQLite 跨轮次累积补全。
-
-    理论上限: ~30 组 × 1000 = 30000, 去重后 20000+
+    全量扫描 four.meme 代币, 多维度查询组合最大化覆盖。
+    维度: symbol × sort × status × type
     """
     _ensure_sessions()
-    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
+    max_age_ms = cfg.get("max_age_hours", MAX_AGE_HOURS) * 3600 * 1000
     now_ms = int(time.time() * 1000)
     seen: dict[str, dict] = {}
     page_size = 100
     max_pages = 10
 
-    def _add_tokens(items: list[dict]):
-        for t in items:
-            addr = t.get("tokenAddress", "")
-            if addr and addr not in seen:
-                seen[addr] = t
-
     def _fetch_pages(query: dict, label: str):
-        """逐页拉取, 超出时间窗口时提前停止"""
         for page in range(1, max_pages + 1):
             payload = {"pageIndex": page, "pageSize": page_size, **query}
             try:
@@ -807,9 +295,10 @@ def fm_search_tokens(cfg: dict) -> list[dict]:
                 items = d.get("data", [])
                 if not items:
                     break
-                _add_tokens(items)
-
-                # 检查是否超出时间窗口 (仅对按时间排序的查询)
+                for t in items:
+                    addr = (t.get("tokenAddress") or "").lower()
+                    if addr and addr not in seen:
+                        seen[addr] = t
                 if query.get("type") == "NEW":
                     oldest_ts = min(int(t.get("createDate", 0)) for t in items)
                     if oldest_ts > 0 and (now_ms - oldest_ts) > max_age_ms:
@@ -823,63 +312,25 @@ def fm_search_tokens(cfg: dict) -> list[dict]:
 
     symbols = ("BNB", "USD1", "USDT", "CAKE")
 
-    # ── 1. NEW/DESC (最新→最旧) × PUBLISH × 4 symbols = 最多 4000 ──
+    # NEW × DESC/ASC × PUBLISH/TRADE × 4 symbols
     for sym in symbols:
-        _fetch_pages(
-            {"type": "NEW", "listType": "NOR", "sort": "DESC",
-             "status": "PUBLISH", "symbol": sym},
-            label=f"NEW/DESC/PUB/{sym}",
-        )
-
-    # ── 2. NEW/ASC (最旧→最新) × PUBLISH × 4 symbols = 最多 4000 ──
-    #    与 DESC 覆盖相反方向, 大幅减少盲区
+        _fetch_pages({"type": "NEW", "listType": "NOR", "sort": "DESC",
+                      "status": "PUBLISH", "symbol": sym}, f"NEW/DESC/PUB/{sym}")
     for sym in symbols:
-        _fetch_pages(
-            {"type": "NEW", "listType": "NOR", "sort": "ASC",
-             "status": "PUBLISH", "symbol": sym},
-            label=f"NEW/ASC/PUB/{sym}",
-        )
-
-    # ── 3. NEW/DESC × TRADE × 4 symbols = 最多 4000 ──
+        _fetch_pages({"type": "NEW", "listType": "NOR", "sort": "ASC",
+                      "status": "PUBLISH", "symbol": sym}, f"NEW/ASC/PUB/{sym}")
     for sym in symbols:
-        _fetch_pages(
-            {"type": "NEW", "listType": "NOR_DEX", "sort": "DESC",
-             "status": "TRADE", "symbol": sym},
-            label=f"NEW/DESC/TRADE/{sym}",
-        )
-
-    # ── 4. NEW/ASC × TRADE × 4 symbols = 最多 4000 ──
+        _fetch_pages({"type": "NEW", "listType": "NOR_DEX", "sort": "DESC",
+                      "status": "TRADE", "symbol": sym}, f"NEW/DESC/TRADE/{sym}")
     for sym in symbols:
-        _fetch_pages(
-            {"type": "NEW", "listType": "NOR_DEX", "sort": "ASC",
-             "status": "TRADE", "symbol": sym},
-            label=f"NEW/ASC/TRADE/{sym}",
-        )
+        _fetch_pages({"type": "NEW", "listType": "NOR_DEX", "sort": "ASC",
+                      "status": "TRADE", "symbol": sym}, f"NEW/ASC/TRADE/{sym}")
 
-    # ── 5. HOT/VOL/PROGRESS 多页 × 双状态, 捕获中段活跃代币 ──
+    # HOT/VOL/PROGRESS × 双状态
     for sort_type, list_type in [("HOT", "ADV"), ("VOL", "NOR"), ("PROGRESS", "NOR")]:
-        for status, lt_override in [("PUBLISH", list_type), ("TRADE", "NOR_DEX")]:
-            _fetch_pages(
-                {"type": sort_type, "listType": lt_override,
-                 "status": status},
-                label=f"{sort_type}/{status}",
-            )
-
-    # ── 6. HOT 按 symbol 分片 (额外覆盖) ──
-    for sym in symbols:
-        for status, lt in [("PUBLISH", "ADV"), ("TRADE", "NOR_DEX")]:
-            payload = {"pageIndex": 1, "pageSize": page_size,
-                       "type": "HOT", "listType": lt,
-                       "status": status, "symbol": sym}
-            try:
-                r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
-                r.raise_for_status()
-                d = r.json()
-                if d.get("code") == 0:
-                    _add_tokens(d.get("data", []))
-            except Exception as e:
-                log.error("fm_search [HOT/%s/%s]: %s", status, sym, e)
-            time.sleep(0.3)
+        for status, lt in [("PUBLISH", list_type), ("TRADE", "NOR_DEX")]:
+            _fetch_pages({"type": sort_type, "listType": lt, "status": status},
+                         f"{sort_type}/{status}")
 
     log.info("fm_search: 共获取 %d 个代币 (去重后)", len(seen))
     return list(seen.values())
@@ -891,14 +342,33 @@ def fm_detail(address: str) -> dict | None:
         r = _fm_session.get(FM_DETAIL, params={"address": address}, timeout=20)
         r.raise_for_status()
         d = r.json()
-        return d.get("data") if d.get("code") == 0 else None
+        if d.get("code") != 0 or not d.get("data"):
+            return None
+        raw = d["data"]
+        tp = raw.get("tokenPrice", {})
+        social_links = {}
+        if raw.get("twitterUrl"):
+            social_links["twitter"] = raw["twitterUrl"]
+        if raw.get("telegramUrl"):
+            social_links["telegram"] = raw["telegramUrl"]
+        if raw.get("webUrl"):
+            social_links["website"] = raw["webUrl"]
+        return {
+            "holders": int(tp.get("holderCount", 0) or 0),
+            "price": float(tp.get("price", 0) or 0),
+            "totalSupply": int(raw.get("totalAmount", 0) or 0),
+            "socialCount": len(social_links),
+            "socialLinks": social_links,
+            "descr": raw.get("descr", ""),
+            "name": raw.get("name", ""),
+            "shortName": raw.get("shortName", ""),
+        }
     except Exception as e:
-        log.error("fm_detail [%s]: %s", address[:20], e)
+        log.debug("fm_detail [%s]: %s", address[:20], e)
         return None
 
 
 def fm_ticker_prices() -> dict[str, float]:
-    """返回 {BASE_SYMBOL: usdt_price}"""
     _ensure_sessions()
     prices: dict[str, float] = {}
     try:
@@ -920,113 +390,31 @@ def fm_ticker_prices() -> dict[str, float]:
 
 
 # ===================================================================
-#  GeckoTerminal API 层
+#  BSCScan API — 链上真实持仓地址数
 # ===================================================================
-def _gt_request(url: str, params: dict | None = None,
-                max_retries: int = 3) -> dict | None:
-    """带退避重试的 GeckoTerminal 请求"""
-    global _gt_rate_delay
+def bscscan_holder_count(token_address: str, api_key: str) -> int | None:
+    """通过 BSCScan API 获取链上真实持仓地址数"""
+    if not api_key:
+        return None
     _ensure_sessions()
-    for attempt in range(max_retries):
-        try:
-            r = _gt_session.get(url, params=params, timeout=15)
-            if r.status_code == 429:
-                wait = 5 * (attempt + 1)
-                _gt_rate_delay = min(5.0, _gt_rate_delay + 1.0)
-                log.warning("GeckoTerminal 429, 等待 %ds (%d/%d)",
-                            wait, attempt + 1, max_retries)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            # 成功时逐步恢复速度
-            _gt_rate_delay = max(0.3, _gt_rate_delay - 0.2)
-            return r.json()
-        except requests.exceptions.HTTPError:
-            if attempt < max_retries - 1:
-                time.sleep(3)
-            else:
-                raise
+    try:
+        r = _gt_session.get(BSCSCAN_API, params={
+            "module": "token", "action": "tokenholdercount",
+            "contractaddress": token_address, "apikey": api_key,
+        }, timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") == "1" and d.get("result"):
+            return int(d["result"])
+    except Exception:
+        pass
     return None
 
 
-_gt_rate_delay: float = 0.5  # GeckoTerminal 动态速率控制
-
-
-def gt_get_pool(token_address: str) -> str | None:
-    """查询代币在 BSC 上的首个交易池地址"""
-    try:
-        data = _gt_request(f"{GT_BASE}/networks/bsc/tokens/{token_address}")
-        if not data:
-            return None
-        pools = (data.get("data", {})
-                 .get("relationships", {})
-                 .get("top_pools", {})
-                 .get("data", []))
-        if pools:
-            return pools[0]["id"].replace("bsc_", "")
-        return None
-    except Exception as e:
-        log.error("gt_get_pool [%s]: %s", token_address[:20], e)
-        return None
-
-
-def gt_ohlcv_hourly(pool_address: str, limit: int = 72) -> list[list]:
-    """获取小时级 OHLCV: [[ts, o, h, l, c, vol], ...] 最新在前"""
-    try:
-        data = _gt_request(
-            f"{GT_BASE}/networks/bsc/pools/{pool_address}/ohlcv/hour",
-            params={"aggregate": 1, "limit": limit},
-        )
-        if not data:
-            return []
-        return (data.get("data", {})
-                .get("attributes", {})
-                .get("ohlcv_list", []))
-    except Exception as e:
-        log.error("gt_ohlcv [%s]: %s", pool_address[:20], e)
-        return []
-
-
-def calc_all_time_high(candles: list[list]) -> float | None:
-    """从 OHLCV 中提取历史最高价 (USD)
-    candles: [[ts, o, h, l, c, vol], ...] 最新在前
-    """
-    if not candles:
-        return None
-    return max(float(c[2]) for c in candles)
-
-
-def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
-    """从 OHLCV 中提取发币后前 2 小时内的最高价 (USD)
-    candles: [[ts, o, h, l, c, vol], ...] 最新在前
-    """
-    if not candles:
-        return None
-    cutoff = create_ts_sec + 2 * 3600
-    max_high = 0.0
-    found = False
-    for c in candles:
-        ts = int(c[0])
-        if ts > cutoff:
-            continue
-        if ts < create_ts_sec - 3600:
-            continue
-        high = float(c[2])
-        if high > max_high:
-            max_high = high
-        found = True
-    return max_high if found else None
-
-
 # ===================================================================
-#  DexScreener API 层 (300 req/min, 比 GeckoTerminal 快 10 倍)
+#  DexScreener API (主要价格源, ~300 req/min)
 # ===================================================================
-DS_BASE = "https://api.dexscreener.com"
-DS_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-
-
 def ds_get_pairs(token_address: str) -> list[dict] | None:
-    """通过 DexScreener 获取代币的交易对信息 (含价格历史)"""
     _ensure_sessions()
     url = f"{DS_BASE}/tokens/v1/bsc/{token_address}"
     try:
@@ -1036,7 +424,6 @@ def ds_get_pairs(token_address: str) -> list[dict] | None:
             r = _gt_session.get(url, timeout=10, headers=DS_HEADERS)
         r.raise_for_status()
         data = r.json()
-        # v1 返回数组
         if isinstance(data, list):
             return data
         return data.get("pairs") or data.get("data") or []
@@ -1045,320 +432,331 @@ def ds_get_pairs(token_address: str) -> list[dict] | None:
         return None
 
 
-def ds_calc_first_2h_max(pairs: list[dict], create_ts_sec: int,
-                         bnb_price: float = 600.0) -> float | None:
-    """
-    从 DexScreener pair 数据估算前 2h 最高价。
-    DexScreener 不直接给 OHLCV, 但 pair 里有 priceUsd 和 priceChange。
-    如果代币年龄 < 6h, 用 ATH 近似前 2h 最高价 (误差可接受)。
-    """
+def ds_extract_prices(pairs: list[dict]) -> dict | None:
+    """从 DexScreener pair 数据提取价格信息, 用 priceChange 反推历史高点"""
     if not pairs:
         return None
     for pair in pairs:
-        if pair.get("chainId") != "bsc":
+        if pair.get("chainId") and pair["chainId"] != "bsc":
             continue
-        price_usd_str = pair.get("priceUsd")
-        if not price_usd_str:
+        price_usd = float(pair.get("priceUsd") or 0)
+        if not price_usd:
             continue
-        try:
-            price_usd = float(price_usd_str)
-        except (ValueError, TypeError):
-            continue
-        # DexScreener 没有直接的前 2h 最高价,
-        # 但对于新币 (< 6h), ATH ≈ 前 2h 最高价
-        # 用 priceChange 反推: 如果有 h1/h6 变化率, 可以估算
-        price_change = pair.get("priceChange", {})
-        # 尝试用 h1 变化率反推 1h 前价格
-        h1_change = price_change.get("h1")
-        h6_change = price_change.get("h6")
-
-        # 简单策略: 取当前价 / (1 + 最大跌幅) 作为历史高点估算
         max_price = price_usd
-        if h1_change is not None:
-            try:
-                h1_pct = float(h1_change)
-                if h1_pct < 0:
-                    # 价格下跌了, 1h 前更高
-                    price_1h_ago = price_usd / (1 + h1_pct / 100)
-                    max_price = max(max_price, price_1h_ago)
-            except (ValueError, TypeError):
-                pass
-        if h6_change is not None:
-            try:
-                h6_pct = float(h6_change)
-                if h6_pct < 0:
-                    price_6h_ago = price_usd / (1 + h6_pct / 100)
-                    max_price = max(max_price, price_6h_ago)
-            except (ValueError, TypeError):
-                pass
-        return max_price
+        pc = pair.get("priceChange", {})
+        for key in ("m5", "h1", "h6", "h24"):
+            if pc.get(key) is not None:
+                try:
+                    pct = float(pc[key])
+                    if pct < 0:
+                        max_price = max(max_price, price_usd / (1 + pct / 100))
+                except (ValueError, TypeError):
+                    pass
+        return {"ath": max_price, "high2h": max_price, "currentPrice": price_usd,
+                "name": (pair.get("baseToken") or {}).get("name"),
+                "symbol": (pair.get("baseToken") or {}).get("symbol")}
     return None
 
 
-def calc_max_price_first_n_hours(candles: list[list], hours: int = 2) -> float | None:
-    """从 OHLCV 中提取前 N 小时内的最高价 (USD)
-    candles: [[ts, o, h, l, c, vol], ...] 最新在前
-    利用最旧蜡烛的时间戳作为起始时间
-    """
+# ===================================================================
+#  GeckoTerminal API (备选K线, ~30 req/min)
+# ===================================================================
+def _gt_request(url: str, max_retries: int = 3) -> dict | None:
+    global _gt_rate_delay
+    _ensure_sessions()
+    for attempt in range(max_retries):
+        try:
+            r = _gt_session.get(url, timeout=15)
+            if r.status_code == 429:
+                wait = 5 * (attempt + 1)
+                _gt_rate_delay = min(5.0, _gt_rate_delay + 1.0)
+                log.warning("GT 429, 等待 %ds (%d/%d)", wait, attempt + 1, max_retries)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            _gt_rate_delay = max(0.5, _gt_rate_delay - 0.2)
+            return r.json()
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(3)
+    return None
+
+
+def gt_ohlcv_direct(token_address: str, limit: int = 72) -> list[list]:
+    """直接用 tokenAddress 当 poolAddress 拿 K线"""
+    url = f"{GT_BASE}/networks/bsc/pools/{token_address}/ohlcv/hour?aggregate=1&limit={limit}"
+    data = _gt_request(url)
+    if not data:
+        return []
+    return (data.get("data", {}).get("attributes", {}).get("ohlcv_list", []))
+
+
+def calc_all_time_high(candles: list[list]) -> float | None:
     if not candles:
         return None
-    # 找到最早的时间戳（即代币上线附近的时间）
-    oldest_ts = min(int(c[0]) for c in candles)
-    cutoff_ts = oldest_ts + hours * 3600  # 前 N 小时的截止时间戳
-    max_high = 0.0
+    return max(float(c[2]) for c in candles)
+
+
+def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
+    if not candles:
+        return None
+    cutoff = create_ts_sec + 2 * 3600
+    max_high, found = 0.0, False
     for c in candles:
         ts = int(c[0])
-        if ts <= cutoff_ts:
-            high = float(c[2])
-            if high > max_high:
-                max_high = high
-    return max_high if max_high > 0 else None
+        if ts > cutoff or ts < create_ts_sec - 3600:
+            continue
+        high = float(c[2])
+        if high > max_high:
+            max_high = high
+        found = True
+    return max_high if found else None
 
 
 # ===================================================================
 #  三级筛选管线
 # ===================================================================
-def stage1_initial(tokens: list[dict], cfg: dict,
-                   ticker: dict[str, float]) -> list[dict]:
+def stage1_prefilter(tokens: list[dict], now_ms: int) -> list[dict]:
     """
-    初筛（列表数据, 零额外请求）:
-      - 发行时间: min_age_hours < age < max_age_hours
-      - 当前价 ≤ max_price_current
-      - 持币地址 ≥ min_holders
-      - 未推送过
+    Stage 1 初筛 — 仅用 search API 批量数据, 0 额外请求
+    条件: 币龄≤72h, 当前价≤MAX_CURRENT_PRICE_OLD, 持币地址粗筛(半阈值)
     """
-    now_ms = int(time.time() * 1000)
-    min_age_ms = cfg.get("min_age_hours", 2) * 3600 * 1000
-    max_age_ms = cfg.get("max_age_hours", 72) * 3600 * 1000
-    max_price = cfg.get("max_price_current", 0.00002)
-    min_holders = cfg.get("min_holders", 150)
-    bnb_price = ticker.get("BNB", 600.0)
+    max_age_ms = MAX_AGE_HOURS * 3600 * 1000
     results = []
-
-    skip = {"pushed": 0, "age": 0, "price": 0, "holders": 0}
-
-    for tk in tokens:
-        addr = tk.get("tokenAddress", "")
-        if addr.lower() in pushed_tokens:
-            skip["pushed"] += 1; continue
-
-        create_ts = int(tk.get("createDate", 0))
-        age = now_ms - create_ts
-        if create_ts <= 0 or age < min_age_ms or age > max_age_ms:
-            skip["age"] += 1; continue
-
-        raw_price = float(tk.get("price", 0))
-        base = tk.get("symbol", "BNB").upper()
-        if base == "USDT":
-            price_usd = raw_price
-        else:
-            price_usd = raw_price * ticker.get(base, bnb_price)
-        if price_usd <= 0 or price_usd > max_price:
-            skip["price"] += 1; continue
-
-        holders = int(tk.get("hold", 0) or 0)
-        if holders < min_holders:
-            skip["holders"] += 1; continue
-
-        tk["_price_usd"] = price_usd
-        tk["_holders"] = holders
-        results.append(tk)
-
-    results.sort(key=lambda x: float(x.get("day1Vol", 0) or 0), reverse=True)
-    log.info("初筛: 通过=%d | 跳过: 已推=%d 年龄=%d 价格=%d 持币=%d | 条件: 年龄%d~%dh 价格≤$%.8f 持币≥%d",
-             len(results), skip["pushed"], skip["age"], skip["price"], skip["holders"],
-             cfg.get("min_age_hours", 2), cfg.get("max_age_hours", 72), max_price, min_holders)
+    for t in tokens:
+        create_date = int(t.get("createDate", 0) or 0)
+        if create_date <= 0:
+            continue
+        age_ms = now_ms - create_date
+        if age_ms <= 0 or age_ms > max_age_ms:
+            continue
+        price = float(t.get("price", 0) or 0)
+        if price > MAX_CURRENT_PRICE_OLD:
+            continue
+        hold = int(t.get("hold", 0) or 0)
+        age_hours = age_ms / (3600 * 1000)
+        min_hold = (HOLDERS_THRESHOLD_OLD * 0.5) if age_hours > 1 else (HOLDERS_THRESHOLD_YOUNG * 0.5)
+        if hold < min_hold:
+            continue
+        addr = (t.get("tokenAddress") or "").lower()
+        if addr in pushed_tokens:
+            continue
+        results.append(t)
+    log.info("Stage1 初筛: %d/%d 通过", len(results), len(tokens))
     return results
 
 
-def stage2_detail(candidates: list[dict], cfg: dict,
-                  max_check: int = 30) -> list[tuple[dict, dict]]:
+def stage2_detail(candidates: list[dict], now_ms: int,
+                  bscscan_key: str = "") -> list[dict]:
     """
-    详情筛（four.meme 详情请求）:
-      - 代币总量 = required_total_supply (10亿)
-      - 关联社交媒体 ≥ min_social_links
+    Stage 2 详情筛 — four.meme detail API, 每候选 1 请求
+    条件: 社交媒体≥1, 持币(>1h:≥60,≤1h:≥30), 总量=10亿, 当前价分段
     """
-    required_supply = cfg.get("required_total_supply", 1_000_000_000)
-    min_links = cfg.get("min_social_links", 1)
-    min_holders = cfg.get("min_holders", 150)
-    results: list[tuple[dict, dict]] = []
-
-    for i, tk in enumerate(candidates):
-        if i >= max_check:
-            break
-        addr = tk.get("tokenAddress", "")
+    results = []
+    for i, t in enumerate(candidates):
+        addr = t.get("tokenAddress", "")
         if i > 0:
-            time.sleep(0.5)
+            time.sleep(0.3)
         detail = fm_detail(addr)
         if not detail:
             continue
 
-        # 持币人数 (实时二次验证, 初筛用的是数据库缓存值)
-        real_hold = int(detail.get("holderCount", 0) or detail.get("hold", 0) or 0)
-        if real_hold < min_holders:
-            log.debug("跳过 %s: 实时持币 %d < %d",
-                      detail.get("name", addr), real_hold, min_holders)
-            continue
-        tk["_holders"] = real_hold
+        # BSCScan 链上持仓覆盖 (更准确)
+        onchain_holders = bscscan_holder_count(addr, bscscan_key)
+        if onchain_holders is not None and onchain_holders > 0:
+            detail["holders"] = onchain_holders
 
-        # 总量
-        try:
-            supply = int(float(detail.get("totalAmount", 0)))
-        except (ValueError, TypeError):
-            supply = 0
-        if supply != required_supply:
-            log.debug("跳过 %s: 总量 %s != %s",
-                      detail.get("name", addr), supply, required_supply)
-            continue
+        create_date = int(t.get("createDate", 0) or 0)
+        age_hours = (now_ms - create_date) / (3600 * 1000)
 
-        # 社交媒体
-        link_count = sum(
-            1 for k in ("twitterUrl", "telegramUrl", "webUrl")
-            if (detail.get(k) or "").strip()
-        )
-        if link_count < min_links:
-            log.debug("跳过 %s: 社交媒体 %d < %d",
-                      detail.get("name", addr), link_count, min_links)
+        # 社交媒体 ≥ 1
+        if detail["socialCount"] < MIN_SOCIAL_COUNT:
+            continue
+        # 持币地址数 (按币龄区分)
+        if age_hours > 1 and detail["holders"] < HOLDERS_THRESHOLD_OLD:
+            continue
+        if age_hours <= 1 and detail["holders"] < HOLDERS_THRESHOLD_YOUNG:
+            continue
+        # 总量 = 10亿
+        if detail["totalSupply"] != TOTAL_SUPPLY:
+            continue
+        # 当前价: 币龄≤1h → ≤0.000004, 币龄>1h → ≤0.00002
+        max_price = MAX_CURRENT_PRICE_OLD if age_hours > 1 else MAX_CURRENT_PRICE_YOUNG
+        if detail["price"] > max_price:
             continue
 
-        tk["_social_count"] = link_count
-        results.append((tk, detail))
+        results.append({"token": t, "detail": detail, "ageHours": age_hours})
 
-    log.info("详情筛: 检查 %d, 通过 %d | 条件: 总量=%s 社交≥%d 持币≥%d",
-             min(len(candidates), max_check), len(results), required_supply, min_links, min_holders)
+        if i % 10 == 9:
+            log.info("  Stage2: %d/%d 已检查, 通过 %d", i + 1, len(candidates), len(results))
+
+    log.info("Stage2 详情筛: %d/%d 通过", len(results), len(candidates))
     return results
 
 
-def stage3_kline(candidates: list[tuple[dict, dict]], cfg: dict,
-                 max_check: int = 15, bnb_price: float = 600.0) -> list[tuple[dict, dict]]:
+def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
     """
-    K线筛（GeckoTerminal OHLCV）:
-      - 历史最高价 ≤ max_price_ath
-      - 前2小时最高价 ≤ max_price_2h
+    Stage 3 K线筛 — 两阶段: DS快筛(现价) → GT精筛(K线)
+    条件: ATH≤$0.00004, 前2h最高(>1h)≤$0.00002, 现价/ATH在30%~90%
     """
-    max_ath = cfg.get("max_price_ath", 0.00014)
-    max_2h = cfg.get("max_price_2h", 0.00004)
-    results: list[tuple[dict, dict]] = []
+    global _gt_rate_delay
 
-    for i, (tk, detail) in enumerate(candidates):
-        if i >= max_check:
-            break
-        addr = tk.get("tokenAddress", "")
-        name = tk.get("name", addr[:16])
-        create_ts_sec = int(tk.get("createDate", 0)) // 1000
-
-        if i > 0:
-            time.sleep(0.3)
-
-        # ── 优先 DexScreener (快, 300 req/min) ──
-        high_2h = None
-        candles = None
+    # Phase A: DexScreener 批量获取现价, 快速淘汰
+    ds_data: dict[str, dict] = {}
+    for cand in candidates:
+        addr = cand["token"]["tokenAddress"]
         pairs = ds_get_pairs(addr)
-        if pairs:
-            high_2h = ds_calc_first_2h_max(pairs, create_ts_sec, bnb_price)
+        ds_info = ds_extract_prices(pairs) if pairs else None
+        ds_data[addr] = ds_info or {}
+        time.sleep(0.2)
 
-        # ── Fallback / 补充: GeckoTerminal OHLCV (慢但精确) ──
-        # high_2h 未获取时用作 fallback; 已获取时仍需 candles 做 ATH 检查
-        if high_2h is None or candles is None:
-            if i > 0:
-                time.sleep(_gt_rate_delay)
-            pool = gt_get_pool(addr)
-            if pool:
-                time.sleep(_gt_rate_delay)
-                candles = gt_ohlcv_hourly(pool, limit=72)
-                if candles and high_2h is None:
-                    high_2h = calc_first_2h_max(candles, create_ts_sec)
+    ds_filtered = []
+    for cand in candidates:
+        addr = cand["token"]["tokenAddress"]
+        name = cand["token"].get("name", addr[:16])
+        ds = ds_data.get(addr, {})
+        ds_price = ds.get("currentPrice")
+        if ds_price:
+            max_cur = MAX_CURRENT_PRICE_OLD if cand["ageHours"] > 1 else MAX_CURRENT_PRICE_YOUNG
+            if ds_price > max_cur:
+                log.info("  Stage3-A: %s — DS现价 %.2e > %.2e, 淘汰", name, ds_price, max_cur)
+                continue
+        ds_filtered.append(cand)
 
-        if high_2h is None:
-            log.debug("跳过 %s: 无法获取价格数据", name)
+    log.info("Stage3-A: DS快筛 %d/%d 通过", len(ds_filtered), len(candidates))
+
+    # Phase B: GeckoTerminal K线精筛
+    results = []
+    for i, cand in enumerate(ds_filtered):
+        t = cand["token"]
+        detail = cand["detail"]
+        age_hours = cand["ageHours"]
+        addr = t["tokenAddress"]
+        name = t.get("name", addr[:16])
+        create_ts_sec = int(t.get("createDate", 0)) // 1000
+        ds = ds_data.get(addr, {})
+        ds_current = ds.get("currentPrice")
+        ds_name = ds.get("name")
+        ds_symbol = ds.get("symbol")
+
+        # GT K线
+        if i > 0:
+            time.sleep(_gt_rate_delay)
+        candles = gt_ohlcv_direct(addr, 72)
+
+        ath, high2h, gt_current = None, None, None
+        if candles:
+            high2h = calc_first_2h_max(candles, create_ts_sec)
+            ath = calc_all_time_high(candles)
+            latest = max(candles, key=lambda c: int(c[0]))
+            gt_current = float(latest[4])
+
+        current_price = ds_current or gt_current
+
+        if ath is None and high2h is None:
+            log.info("  Stage3-B: %s — 无K线数据, 跳过", name)
+            continue
+        if ath is None:
+            ath = high2h
+
+        log.info("  Stage3-B: %s — ATH %.2e, 2h高 %.2e, 现价 %.2e",
+                 name, ath or 0, high2h or 0, current_price or 0)
+
+        # ATH 检查
+        if ath > MAX_HIGH_PRICE:
+            log.info("  Stage3-B: %s — ATH %.2e > %.2e, 跳过", name, ath, MAX_HIGH_PRICE)
             continue
 
-        log.info("  %s: 前2h最高 $%.10f (阈值 $%.10f)", name, high_2h, max_2h)
-        if high_2h > max_2h:
+        # 币龄≤1h 时 ATH 也不能超过 YOUNG 阈值
+        if age_hours <= 1 and ath > MAX_CURRENT_PRICE_YOUNG:
+            log.info("  Stage3-B: %s — 币龄≤1h, ATH %.2e > %.2e, 跳过",
+                     name, ath, MAX_CURRENT_PRICE_YOUNG)
             continue
 
-        high_ath = calc_all_time_high(candles) if candles else None
-        if high_ath is None:
-            log.debug("跳过 %s: 无法确定历史最高价", name)
+        # 现价检查
+        if current_price:
+            max_cur = MAX_CURRENT_PRICE_OLD if age_hours > 1 else MAX_CURRENT_PRICE_YOUNG
+            if current_price > max_cur:
+                log.info("  Stage3-B: %s — 现价 %.2e > %.2e, 跳过", name, current_price, max_cur)
+                continue
+
+        # 前2h最高价 (币龄>1h时检查)
+        if age_hours > 1 and high2h is not None and high2h > MAX_EARLY_HIGH_PRICE:
+            log.info("  Stage3-B: %s — 前2h最高 %.2e > %.2e, 跳过",
+                     name, high2h, MAX_EARLY_HIGH_PRICE)
             continue
 
-        log.info("  %s: 历史最高 $%.10f (阈值 $%.10f)", name, high_ath, max_ath)
-        if high_ath > max_ath:
-            continue
+        # 价格区间: 现价/ATH 在 30%~90% (币龄≥1h时检查)
+        if age_hours >= 1 and ath > 0 and current_price:
+            ratio = current_price / ath
+            if ratio < PRICE_RATIO_LOW or ratio > PRICE_RATIO_HIGH:
+                log.info("  Stage3-B: %s — 现/高 %.1f%% 不在 30%%~90%%, 跳过",
+                         name, ratio * 100)
+                continue
 
-        # 前2小时最高价检查
-        high_2h = calc_max_price_first_n_hours(candles, hours=2) if candles else high_2h
-        if high_2h is not None and high_2h > max_2h:
-            log.info("  %s: 前2h最高 $%.10f > 阈值 $%.10f, 跳过",
-                     name, high_2h, max_2h)
-            continue
+        # 热点匹配
+        score, matched, is_hot = hotspot_match(t, hotspots, detail.get("descr", ""))
 
-        tk["_high_ath"] = high_ath
-        tk["_high_2h"] = high_2h
-        results.append((tk, detail))
+        results.append({
+            "token": t, "detail": detail, "ageHours": age_hours,
+            "ath": ath, "high2h": high2h, "currentPrice": current_price,
+            "hotScore": score, "hotMatched": matched, "isHot": is_hot,
+            "dsName": ds_name, "dsSymbol": ds_symbol,
+        })
+        hot_tag = f" 🔥{','.join(matched)}" if is_hot else ""
+        log.info("  Stage3-B: ✓ %s — ATH %.2e, 2h高 %.2e, 现/高 %.1f%%%s",
+                 name, ath, high2h or 0,
+                 (current_price / ath * 100) if ath > 0 and current_price else 0,
+                 hot_tag)
 
-    log.info("K线筛: 检查 %d, 通过 %d | 条件: ATH≤$%.8f 前2h≤$%.8f",
-             min(len(candidates), max_check), len(results), max_ath, max_2h)
+    log.info("Stage3 K线筛: %d/%d 通过", len(results), len(ds_filtered))
     return results
-
-
-# ===================================================================
-#  社交链接 & 描述
-# ===================================================================
-def extract_social_links(detail: dict) -> list[dict]:
-    links: list[dict] = []
-    seen: set[str] = set()
-    for key, label in [("twitterUrl", "Twitter"),
-                       ("telegramUrl", "Telegram"),
-                       ("webUrl", "Website")]:
-        url = (detail.get(key) or "").strip()
-        if url and url not in seen:
-            links.append({"type": label, "url": url})
-            seen.add(url)
-    return links
-
-
-def truncate_desc(detail: dict, limit: int = 100) -> str:
-    desc = (detail.get("descr") or "").strip()
-    if not desc:
-        return "暂无介绍"
-    return desc[:limit - 3] + "..." if len(desc) > limit else desc
 
 
 # ===================================================================
 #  消息格式化 & 推送
 # ===================================================================
-def format_social_html(links: list[dict]) -> str:
-    return "\n".join(f"  • <a href='{l['url']}'>{l['type']}</a>" for l in links)
-
-
-def format_message(infos: list[dict]) -> str:
+def format_message(results: list[dict]) -> str:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"🔍 <b>BSC 土狗扫描报告</b>", f"⏰ {now_str}", ""]
+    lines = [f"🔍 <b>BSC Token Scanner 报告</b>", f"⏰ {now_str}", ""]
 
-    for i, info in enumerate(infos, 1):
-        lines.append(f"<b>#{i} {info['name']} ({info['short']})</b>")
-        lines.append(f"📄 合约: <code>{info['address']}</code>")
-        lines.append(f"💰 当前价: ${info['price_usd']:.10f}")
-        lines.append(f"📈 前2h最高: ${info['high_2h']:.10f}")
-        lines.append(f"👥 持币人数: {info['holders']}")
-        lines.append(f"🔗 社交媒体: {info['social_count']} 个")
-        social_links = info.get("social_links", [])
-        if social_links:
-            lines.append(format_social_html(social_links))
-        lines.append(f"🕐 创建: {info['create_time']}")
-        hotspot_matched = info.get("hotspot_matched", [])
-        if hotspot_matched:
-            lines.append(f"🔥 热点匹配: {', '.join(hotspot_matched)}")
-        lines.append(f"📝 {info['desc']}")
-        a = info["address"]
+    for i, item in enumerate(results, 1):
+        t = item["token"]
+        detail = item["detail"]
+        addr = t.get("tokenAddress", "")
+        name = t.get("name", "Unknown")
+        short = t.get("shortName", "")
+        price = item.get("currentPrice") or detail.get("price", 0)
+        holders = detail.get("holders", 0)
+
+        lines.append(f"<b>#{i} {name} ({short})</b>")
+        lines.append(f"📄 合约: <code>{addr}</code>")
+        lines.append(f"💰 当前价: ${price:.10f}")
+        if item.get("ath"):
+            lines.append(f"📈 历史最高: ${item['ath']:.10f}")
+        if item.get("high2h"):
+            lines.append(f"📊 前2h最高: ${item['high2h']:.10f}")
+        if item.get("ath") and price:
+            lines.append(f"📉 现/高: {price / item['ath'] * 100:.1f}%")
+        lines.append(f"👥 持币: {holders}")
+        lines.append(f"🔗 社交: {detail.get('socialCount', 0)} 个")
+        social = detail.get("socialLinks", {})
+        for stype, url in social.items():
+            lines.append(f"  • <a href='{url}'>{stype}</a>")
+        lines.append(f"🕐 币龄: {item['ageHours']:.1f}h")
+        if item.get("isHot"):
+            lines.append(f"🔥 热点: {', '.join(item['hotMatched'])}")
+        desc = (detail.get("descr") or "").strip()
+        if desc:
+            lines.append(f"📝 {desc[:100]}{'...' if len(desc) > 100 else ''}")
         lines.append(
-            f"🌐 <a href='https://four.meme/token/{a}'>four.meme</a>"
-            f" | <a href='https://bscscan.com/token/{a}'>BscScan</a>"
+            f"🌐 <a href='https://four.meme/token/{addr}'>four.meme</a>"
+            f" | <a href='https://bscscan.com/token/{addr}'>BscScan</a>"
+            f" | <a href='https://dexscreener.com/bsc/{addr}'>DexScreener</a>"
         )
         lines.append("")
 
-    lines.append("—— four.meme 土狗扫描器 v2 ——")
+    lines.append("—— BSC Token Scanner v3 ——")
     return "\n".join(lines)
 
 
@@ -1372,20 +770,14 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
             timeout=15,
         )
         r.raise_for_status()
-        result = r.json()
-        if result.get("ok"):
-            return True
-        log.warning("Telegram: %s", result.get("description"))
-        return False
+        return r.json().get("ok", False)
     except Exception as e:
         log.error("Telegram: %s", e)
         return False
 
 
 def print_console(msg: str) -> None:
-    out = msg.replace("<b>", "").replace("</b>", "")
-    out = out.replace("<code>", "").replace("</code>", "")
-    out = re.sub(r"<a href='[^']*'>", "", out).replace("</a>", "")
+    out = re.sub(r"<[^>]+>", "", msg)
     print("\n" + "=" * 60)
     print(out)
     print("=" * 60 + "\n")
@@ -1399,10 +791,10 @@ def scan_once(cfg: dict) -> None:
     log.info("=" * 50)
     log.info("开始扫描")
     log.info("=" * 50)
-    max_push = cfg.get("max_push_count", 3)
+    max_push = cfg.get("max_push_count", 100)
+    bscscan_key = cfg.get("bscscan_api_key", "")
 
-    # 0) 初始化数据库 & 行情
-    conn = _init_db()
+    # 行情
     ticker = fm_ticker_prices()
     bnb = ticker.get("BNB", 0)
     if bnb <= 0:
@@ -1410,94 +802,47 @@ def scan_once(cfg: dict) -> None:
         ticker["BNB"] = 600.0
     log.info("BNB=$%.2f", ticker.get("BNB", 0))
 
-    # 1) 链上扫描: 通过 TokenCreate 事件发现 100% 的代币 (已按总量筛选)
-    onchain_tokens = onchain_scan_tokens(cfg)
-    if onchain_tokens:
-        db_upsert_tokens(conn, onchain_tokens)
-        log.info("链上发现 %d 个代币 (总量=%s 筛选后), 已入库",
-                 len(onchain_tokens), cfg.get("required_total_supply", 1_000_000_000))
+    now_ms = int(time.time() * 1000)
 
-    # 2) API 扫描: 获取价格/持币人数/交易量等实时批量数据
-    tokens = fm_search_tokens(cfg)
-    if tokens:
-        db_upsert_tokens(conn, tokens)
-        log.info("API 获取 %d 个代币, 已入库", len(tokens))
-    elif not onchain_tokens:
-        log.warning("链上扫描和 API 均未获取到代币")
+    # Step 1: 获取代币列表
+    log.info("从 four.meme API 获取代币列表...")
+    api_tokens = fm_search_tokens(cfg)
+    log.info("获取 %d 个代币", len(api_tokens))
 
-    # 统计数据库总量
-    total_db = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
-    onchain_only = conn.execute(
-        "SELECT COUNT(*) FROM tokens WHERE hold = 0 AND price = 0"
-    ).fetchone()[0]
-    log.info("数据库代币总数: %d (其中仅链上数据: %d)", total_db, onchain_only)
-
-    # 2.5) 补全: 链上发现但 API 未覆盖的代币, 逐个查询 detail
-    _enrich_onchain_gaps(conn, cfg)
-
-    # 3) 从数据库查询初筛候选 (链上扫描 100% 覆盖 + API 数据丰富)
-    s1 = db_query_candidates(conn, cfg, ticker)
+    # Stage 1: 初筛
+    log.info("Stage1 条件: 币龄≤%dh, 当前价≤$%s, 持币≥(>1h:%d, ≤1h:%d)×0.5",
+             MAX_AGE_HOURS, MAX_CURRENT_PRICE_OLD,
+             HOLDERS_THRESHOLD_OLD, HOLDERS_THRESHOLD_YOUNG)
+    s1 = stage1_prefilter(api_tokens, now_ms)
     if not s1:
         log.info("初筛无结果")
-        db_cleanup(conn, cfg.get("max_age_hours", 72))
-        conn.close()
         return
 
-    # 2.5) 获取热点关键词 (用于后续加分排序)
+    # Stage 2 + 热点并行
+    log.info("Stage2 条件: 社交≥%d, 持币(>1h:≥%d, ≤1h:≥%d), 总量=%s, 当前价分段",
+             MIN_SOCIAL_COUNT, HOLDERS_THRESHOLD_OLD, HOLDERS_THRESHOLD_YOUNG, TOTAL_SUPPLY)
     hotspots = fetch_all_hotspots(cfg)
-
-    # 3) 详情筛
-    s2 = stage2_detail(s1, cfg, max_check=max_push * 8)
+    s2 = stage2_detail(s1, now_ms, bscscan_key)
     if not s2:
         log.info("详情筛无结果")
-        db_cleanup(conn, cfg.get("max_age_hours", 72))
-        conn.close()
         return
 
-    # 4) K线筛
-    s3 = stage3_kline(s2, cfg, max_check=max_push * 5, bnb_price=ticker.get("BNB", 600.0))
+    # Stage 3: K线筛
+    log.info("Stage3 条件: ATH≤$%s, 前2h最高(>1h)≤$%s, 现/高在%.0f%%~%.0f%%",
+             MAX_HIGH_PRICE, MAX_EARLY_HIGH_PRICE,
+             PRICE_RATIO_LOW * 100, PRICE_RATIO_HIGH * 100)
+    s3 = stage3_kline(s2, hotspots)
     if not s3:
         log.info("K线筛无结果")
-        db_cleanup(conn, cfg.get("max_age_hours", 72))
-        conn.close()
         return
 
-    # 4.5) 热点加分排序: 匹配热点的代币优先推送
-    if hotspots:
-        for tk, detail in s3:
-            score, matched = hotspot_match(tk, hotspots, detail)
-            tk["_hotspot_score"] = score
-            tk["_hotspot_matched"] = matched
-            if matched:
-                log.info("  热点匹配 %s: %.2f 分, 关键词: %s",
-                         tk.get("name", ""), score, ", ".join(matched))
-        # 热点分高的排前面, 同分按原顺序
-        s3.sort(key=lambda x: x[0].get("_hotspot_score", 0), reverse=True)
+    # 按持币数降序排列
+    s3.sort(key=lambda x: x["detail"]["holders"], reverse=True)
+    filtered = s3[:max_push]
 
-    # 5) 组装推送
-    to_push = s3[:max_push]
-    infos = []
-    for tk, detail in to_push:
-        addr = tk["tokenAddress"]
-        create_ts = int(tk.get("createDate", 0))
-        create_dt = datetime.fromtimestamp(create_ts / 1000, tz=timezone.utc)
-        infos.append({
-            "name": tk.get("name", "Unknown"),
-            "short": tk.get("shortName", ""),
-            "address": addr,
-            "price_usd": tk.get("_price_usd", 0),
-            "high_2h": tk.get("_high_2h", 0),
-            "holders": tk.get("_holders", 0),
-            "social_count": tk.get("_social_count", 0),
-            "social_links": extract_social_links(detail),
-            "create_time": create_dt.strftime("%Y-%m-%d %H:%M UTC"),
-            "desc": truncate_desc(detail),
-            "hotspot_score": tk.get("_hotspot_score", 0),
-            "hotspot_matched": tk.get("_hotspot_matched", []),
-        })
-
-    msg = format_message(infos)
-    log.info("推送 %d 个代币", len(infos))
+    # 推送
+    msg = format_message(filtered)
+    log.info("筛选通过 %d 个代币", len(filtered))
 
     bot_token = cfg.get("telegram_bot_token", "")
     chat_id = cfg.get("telegram_chat_id", "")
@@ -1508,34 +853,30 @@ def scan_once(cfg: dict) -> None:
         ok = send_telegram(bot_token, chat_id, msg)
         log.info("Telegram 推送%s", "成功" if ok else "失败")
 
-    for info in infos:
-        pushed_tokens.add(info["address"].lower())
+    for item in filtered:
+        pushed_tokens.add(item["token"]["tokenAddress"].lower())
     if len(pushed_tokens) > MAX_CACHE:
         pushed_tokens = set(list(pushed_tokens)[-MAX_CACHE // 2:])
 
-    # 5.5) 自动买入
+    # 自动买入
     if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
         bnb_usd = ticker.get("BNB", 600.0)
-        execute_buys(to_push, cfg, bnb_usd)
-
-    # 6) 清理过期数据 & 关闭连接
-    db_cleanup(conn, cfg.get("max_age_hours", 72))
-    conn.close()
+        to_buy = [(item["token"], item["detail"]) for item in filtered]
+        execute_buys(to_buy, cfg, bnb_usd)
 
 
 def main():
     global _fm_session, _gt_session
-    log.info("🚀 BSC 土狗扫描器 v2 启动")
+    log.info("🚀 BSC Token Scanner v3 启动")
     log.info("配置文件: %s", CONFIG_PATH)
 
-    # 初始化交易模块 & 启动持仓监控
-    _monitor_thread = None
+    # 初始化交易模块
     try:
         cfg = load_config()
         if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
             if init_trader(cfg):
                 log.info("自动交易已启用, 启动持仓监控...")
-                _monitor_thread = start_monitor(
+                start_monitor(
                     cfg_loader=load_config,
                     bnb_price_func=lambda: fm_ticker_prices().get("BNB", 0),
                 )
@@ -1549,19 +890,8 @@ def main():
     while True:
         try:
             cfg = load_config()
-            # 热更新 session (代理等)
-            _fm_session, _gt_session = _init_sessions(cfg.get("proxy"))
-            log.info(
-                "筛选: 年龄 %d~%dh | 当前价<$%s | 历史最高<$%s | 前2h最高<$%s | 总量=%s | 持币>%d | 社交>%d",
-                cfg.get("min_age_hours", 4),
-                cfg.get("max_age_hours", 72),
-                cfg.get("max_price_current", 0.00002),
-                cfg.get("max_price_ath", 0.00014),
-                cfg.get("max_price_2h", 0.00004),
-                cfg.get("required_total_supply", 1_000_000_000),
-                cfg.get("min_holders", 150),
-                cfg.get("min_social_links", 1),
-            )
+            _fm_session = _build_session(cfg.get("proxy"), FM_HEADERS)
+            _gt_session = _build_session(cfg.get("proxy"), GT_HEADERS)
             scan_once(cfg)
             interval = cfg.get("scan_interval_minutes", 15)
             log.info("下次扫描: %d 分钟后", interval)
