@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from trader import init_trader, execute_buys, start_monitor, stop_monitor
+    from trader import (init_trader, execute_buys, start_monitor, stop_monitor,
+                        _sync_positions_from_wallet)
     _HAS_TRADER = True
 except ImportError:
     _HAS_TRADER = False
@@ -801,6 +802,14 @@ def scan_once(cfg: dict) -> None:
         log.warning("BNB 价格获取失败, 使用默认 600")
         ticker["BNB"] = 600.0
     log.info("BNB=$%.2f", ticker.get("BNB", 0))
+
+    # 每次扫描前重新同步持仓 (处理手动平仓等情况)
+    if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
+        try:
+            bnb_usd = ticker.get("BNB", 600.0)
+            _sync_positions_from_wallet(bnb_usd)
+        except Exception as e:
+            log.warning("扫描前持仓同步失败: %s", e)
 
     now_ms = int(time.time() * 1000)
 
