@@ -1400,25 +1400,43 @@ SKIP_TOKENS = {
 
 def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
     """
-    扫描钱包中所有 BEP-20 代币, 返回价值 > $1 的代币列表 (排除 BNB/USDT 等稳定币)
-    通过 BSCScan tokentx API 获取历史交互过的代币, 再逐个查余额和价格
+    扫描钱包中所有 BEP-20 代币, 返回价值 > $1 的持仓列表 (排除 BNB/USDT 等稳定币)
+
+    代币地址来源 (多源合并):
+      1. 数据库历史持仓记录 (OPEN + CLOSED)
+      2. BSCScan tokentx API (有 key 时)
+    然后逐个查链上余额 + 询价, 筛选价值 > $1 的
     """
     if not _w3 or not _wallet_address:
         return []
 
     import requests as req
 
-    # 通过 BSCScan 获取钱包交互过的所有代币地址
     token_addrs: set[str] = set()
+
+    # 来源 1: 数据库历史持仓
     try:
-        # 尝试用 BSCScan API (无 key 也能用, 但限流更严)
+        conn = sqlite3.connect(str(DB_PATH))
+        _init_positions_db(conn)
+        rows = conn.execute("SELECT DISTINCT token_address FROM positions").fetchall()
+        for (addr,) in rows:
+            addr_lower = (addr or "").lower()
+            if addr_lower and addr_lower not in SKIP_TOKENS:
+                token_addrs.add(addr_lower)
+        conn.close()
+        if token_addrs:
+            log.info("持仓同步: 从数据库获取 %d 个历史代币地址", len(token_addrs))
+    except Exception as e:
+        log.debug("读取数据库历史持仓失败: %s", e)
+
+    # 来源 2: BSCScan tokentx API
+    try:
         cfg_path = Path(__file__).parent / "config.json"
         api_key = ""
         if cfg_path.exists():
             with open(cfg_path, "r") as f:
                 api_key = json.load(f).get("bscscan_api_key", "")
 
-        url = "https://api.bscscan.com/api"
         params = {
             "module": "account", "action": "tokentx",
             "address": _wallet_address, "startblock": 0, "endblock": 99999999,
@@ -1427,24 +1445,28 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
         if api_key:
             params["apikey"] = api_key
 
-        r = req.get(url, params=params, timeout=15)
+        r = req.get("https://api.bscscan.com/api", params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
+        bscscan_count = 0
         if data.get("status") == "1":
             for tx in data.get("result", []):
                 addr = (tx.get("contractAddress") or "").lower()
                 if addr and addr not in SKIP_TOKENS:
                     token_addrs.add(addr)
+                    bscscan_count += 1
+        if bscscan_count > 0:
+            log.info("持仓同步: 从 BSCScan 补充 %d 个代币地址", bscscan_count)
     except Exception as e:
-        log.warning("BSCScan tokentx 查询失败: %s", e)
+        log.debug("BSCScan tokentx 查询失败: %s", e)
 
     if not token_addrs:
-        log.info("钱包扫描: 未发现历史代币交互记录")
+        log.info("持仓同步: 无历史代币记录, 跳过")
         return []
 
-    log.info("钱包扫描: 发现 %d 个历史交互代币, 检查余额...", len(token_addrs))
+    log.info("持仓同步: 共 %d 个候选代币, 逐个检查链上余额...", len(token_addrs))
 
-    # 逐个查余额和价格
+    # 逐个查链上余额和价格
     holdings = []
     for addr in token_addrs:
         try:
@@ -1465,7 +1487,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
             if value_usd < 1.0:
                 continue
 
-            # 尝试获取代币名称
+            # 获取代币名称
             try:
                 name_abi = [{"name": "name", "type": "function", "stateMutability": "view",
                              "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
@@ -1485,40 +1507,44 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
                 "value_usd": value_usd,
                 "venue": venue if venue != "UNKNOWN" else "PANCAKE",
             })
-            log.info("  持有 %s: %.2f 个, 单价 $%.10f, 价值 $%.2f [%s]",
+            log.info("  发现持仓 %s: %.2f 个, $%.10f/个, 价值 $%.2f [%s]",
                      token_name, token_amount, price_usd, value_usd, venue)
 
         except Exception as e:
-            log.debug("钱包扫描 [%s]: %s", addr[:16], e)
+            log.debug("检查代币余额 [%s]: %s", addr[:16], e)
 
         time.sleep(0.3)
 
-    log.info("钱包扫描: 发现 %d 个价值 > $1 的代币", len(holdings))
+    log.info("持仓同步: 发现 %d 个价值 > $1 的链上持仓", len(holdings))
     return holdings
 
 
 def _sync_positions_from_wallet(bnb_price_usd: float):
     """
     启动时同步: 以链上钱包实际持仓为准
-    1. 扫描钱包中价值 > $1 的代币
+    1. 扫描钱包中价值 > $1 的代币 (排除 BNB/USDT 等)
     2. 数据库中没有 OPEN 记录的 → 新建 (用当前价作为买入价)
     3. 数据库中有 OPEN 记录但链上余额为 0 的 → 关闭
     """
+    log.info("========== 启动持仓同步 ==========")
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
 
-    # 先关闭所有旧的 OPEN 持仓 (以链上为准)
     old_positions = get_open_positions(conn)
     wallet_tokens = _scan_wallet_tokens(bnb_price_usd)
     wallet_addrs = {h["address"].lower() for h in wallet_tokens}
 
     # 关闭链上已无余额的持仓
+    closed = 0
     for pos in old_positions:
         if pos["token_address"].lower() not in wallet_addrs:
-            log.info("同步: 关闭无余额持仓 %s", pos["token_name"] or pos["token_address"][:16])
+            log.info("同步: 关闭无余额持仓 %s (链上已无价值>$1的余额)",
+                     pos["token_name"] or pos["token_address"][:16])
             close_position(conn, pos["id"], 0, "", "SYNC_NO_BALANCE", pos["buy_price_usd"])
+            closed += 1
 
     # 为链上有余额但数据库无记录的代币创建持仓
+    created = 0
     for h in wallet_tokens:
         addr = h["address"]
         if not has_open_position(conn, addr):
@@ -1543,13 +1569,14 @@ def _sync_positions_from_wallet(bnb_price_usd: float):
             ))
             log.info("同步: 新建持仓 %s, 当前价 $%.10f, 价值 $%.2f",
                      h["name"], h["price_usd"], h["value_usd"])
+            created += 1
         else:
-            # 已有记录, 更新余额和价格
-            log.info("同步: 已有持仓 %s, 跳过", h["name"])
+            log.info("同步: 已有持仓记录 %s, 保留", h["name"])
 
     conn.commit()
     conn.close()
-    log.info("钱包同步完成: %d 个活跃持仓", len(wallet_tokens))
+    log.info("持仓同步完成: %d 个活跃持仓 (新建 %d, 关闭 %d)",
+             len(wallet_tokens), created, closed)
 
 
 # ===================================================================
