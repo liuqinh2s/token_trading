@@ -977,7 +977,7 @@ def record_buy(conn: sqlite3.Connection, token_address: str, token_name: str,
              buy_bnb, buy_tx, buy_time, max_price_usd, current_price, status, venue)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
     """, (
-        token_address,
+        token_address.lower(),
         token_name,
         decimals,
         buy_result["buy_price_usd"],
@@ -1005,8 +1005,8 @@ def get_open_positions(conn: sqlite3.Connection) -> list[dict]:
 def has_open_position(conn: sqlite3.Connection, token_address: str) -> bool:
     """检查是否已有该代币的持仓"""
     row = conn.execute(
-        "SELECT 1 FROM positions WHERE token_address = ? AND status = 'OPEN' LIMIT 1",
-        (token_address,)
+        "SELECT 1 FROM positions WHERE LOWER(token_address) = ? AND status = 'OPEN' LIMIT 1",
+        (token_address.lower(),)
     ).fetchone()
     return row is not None
 
@@ -1348,6 +1348,22 @@ def monitor_positions(cfg_loader, bnb_price_func):
                     else:
                         sell_result = sell_token(addr, slippage_pct=slippage, token_name=name)
                     if sell_result:
+                        # 验证链上余额确认代币确实被卖出
+                        try:
+                            token_cs = Web3.to_checksum_address(addr)
+                            token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+                            remaining = token_contract.functions.balanceOf(_wallet_address).call()
+                            if remaining > 0:
+                                decimals = token_contract.functions.decimals().call()
+                                remaining_amount = remaining / (10 ** decimals)
+                                remaining_value = remaining_amount * current_price
+                                if remaining_value > 0.5:
+                                    log.warning("卖出后仍有余额 %s: %.4f 个 (价值 $%.2f), 不关闭持仓",
+                                                name, remaining_amount, remaining_value)
+                                    continue
+                        except Exception as e_check:
+                            log.debug("卖出后余额检查异常 %s: %s", name, e_check)
+
                         close_position(conn, pos["id"], current_price,
                                        sell_result["tx_hash"], reason, buy_price)
                         pnl = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
@@ -1440,7 +1456,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
         params = {
             "module": "account", "action": "tokentx",
             "address": _wallet_address, "startblock": 0, "endblock": 99999999,
-            "page": 1, "offset": 200, "sort": "desc",
+            "page": 1, "offset": 1000, "sort": "desc",
         }
         if api_key:
             params["apikey"] = api_key
@@ -1456,9 +1472,38 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
                     token_addrs.add(addr)
                     bscscan_count += 1
         if bscscan_count > 0:
-            log.info("持仓同步: 从 BSCScan 补充 %d 个代币地址", bscscan_count)
+            log.info("持仓同步: 从 BSCScan tokentx 补充 %d 个代币地址", bscscan_count)
     except Exception as e:
         log.debug("BSCScan tokentx 查询失败: %s", e)
+
+    # 来源 3: BSCScan addresstokenbalance API (直接获取所有持有代币)
+    try:
+        cfg_path = Path(__file__).parent / "config.json"
+        api_key = ""
+        if cfg_path.exists():
+            with open(cfg_path, "r") as f:
+                api_key = json.load(f).get("bscscan_api_key", "")
+
+        if api_key:
+            params3 = {
+                "module": "account", "action": "addresstokenbalance",
+                "address": _wallet_address, "page": 1, "offset": 100,
+                "apikey": api_key,
+            }
+            r3 = req.get("https://api.bscscan.com/api", params=params3, timeout=15)
+            r3.raise_for_status()
+            data3 = r3.json()
+            balance_count = 0
+            if data3.get("status") == "1":
+                for item in data3.get("result", []):
+                    addr = (item.get("TokenAddress") or "").lower()
+                    if addr and addr not in SKIP_TOKENS:
+                        token_addrs.add(addr)
+                        balance_count += 1
+            if balance_count > 0:
+                log.info("持仓同步: 从 BSCScan addresstokenbalance 补充 %d 个代币地址", balance_count)
+    except Exception as e:
+        log.debug("BSCScan addresstokenbalance 查询失败: %s", e)
 
     if not token_addrs:
         log.info("持仓同步: 无历史代币记录, 跳过")
