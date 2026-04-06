@@ -874,7 +874,14 @@ def main():
     try:
         cfg = load_config()
         if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
-            if init_trader(cfg):
+            # 先获取 BNB 价格, 用于钱包扫描
+            _ensure_sessions()
+            ticker = fm_ticker_prices()
+            bnb_usd = ticker.get("BNB", 600.0)
+            if bnb_usd <= 0:
+                bnb_usd = 600.0
+
+            if init_trader(cfg, bnb_price_usd=bnb_usd):
                 log.info("自动交易已启用, 启动持仓监控...")
                 start_monitor(
                     cfg_loader=load_config,

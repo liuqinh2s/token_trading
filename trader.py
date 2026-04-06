@@ -522,7 +522,12 @@ def fm_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0
         actual_received = balance_after - balance_before
         decimals = token_contract.functions.decimals().call()
 
-        buy_price_usd = buy_usdt / (actual_received / 10**decimals) if actual_received > 0 else 0
+        if actual_received <= 0:
+            log.error("bonding curve 买入异常: TX 成功但未收到代币 %s (TX: %s)",
+                      token_name or token_address[:16], tx_hash.hex())
+            return None
+
+        buy_price_usd = buy_usdt / (actual_received / 10**decimals)
 
         log.info("bonding curve 买入成功 %s: %.2f USDT (%.4f BNB) → %s 代币, 单价 $%.12f",
                  token_name or token_address[:16], buy_usdt, buy_bnb, actual_received, buy_price_usd)
@@ -838,7 +843,12 @@ def buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
         actual_received = balance_after - balance_before
         decimals = token_contract.functions.decimals().call()
 
-        buy_price_usd = buy_usdt / (actual_received / 10**decimals) if actual_received > 0 else 0
+        if actual_received <= 0:
+            log.error("买入异常: TX 成功但未收到代币 %s (TX: %s)",
+                      token_name or token_address[:16], tx_hash.hex())
+            return None
+
+        buy_price_usd = buy_usdt / (actual_received / 10**decimals)
 
         log.info("买入成功 %s: %.2f USDT → %s 代币, 单价 $%.12f",
                  token_name or token_address[:16], buy_usdt, actual_received, buy_price_usd)
@@ -1376,10 +1386,177 @@ def stop_monitor():
 
 
 # ===================================================================
+#  启动时钱包扫描 — 从链上同步真实持仓
+# ===================================================================
+SKIP_TOKENS = {
+    WBNB.lower(),
+    USDT.lower(),
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+    "0x55d398326f99059ff775485246999027b3197955",  # USDT
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+}
+
+
+def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
+    """
+    扫描钱包中所有 BEP-20 代币, 返回价值 > $1 的代币列表 (排除 BNB/USDT 等稳定币)
+    通过 BSCScan tokentx API 获取历史交互过的代币, 再逐个查余额和价格
+    """
+    if not _w3 or not _wallet_address:
+        return []
+
+    import requests as req
+
+    # 通过 BSCScan 获取钱包交互过的所有代币地址
+    token_addrs: set[str] = set()
+    try:
+        # 尝试用 BSCScan API (无 key 也能用, 但限流更严)
+        cfg_path = Path(__file__).parent / "config.json"
+        api_key = ""
+        if cfg_path.exists():
+            with open(cfg_path, "r") as f:
+                api_key = json.load(f).get("bscscan_api_key", "")
+
+        url = "https://api.bscscan.com/api"
+        params = {
+            "module": "account", "action": "tokentx",
+            "address": _wallet_address, "startblock": 0, "endblock": 99999999,
+            "page": 1, "offset": 200, "sort": "desc",
+        }
+        if api_key:
+            params["apikey"] = api_key
+
+        r = req.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "1":
+            for tx in data.get("result", []):
+                addr = (tx.get("contractAddress") or "").lower()
+                if addr and addr not in SKIP_TOKENS:
+                    token_addrs.add(addr)
+    except Exception as e:
+        log.warning("BSCScan tokentx 查询失败: %s", e)
+
+    if not token_addrs:
+        log.info("钱包扫描: 未发现历史代币交互记录")
+        return []
+
+    log.info("钱包扫描: 发现 %d 个历史交互代币, 检查余额...", len(token_addrs))
+
+    # 逐个查余额和价格
+    holdings = []
+    for addr in token_addrs:
+        try:
+            token_cs = Web3.to_checksum_address(addr)
+            contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+            balance = contract.functions.balanceOf(_wallet_address).call()
+            if balance <= 0:
+                continue
+            decimals = contract.functions.decimals().call()
+            token_amount = balance / (10 ** decimals)
+
+            # 获取 USD 价格
+            price_usd = get_token_price_usd_auto(addr, bnb_price_usd)
+            if price_usd is None or price_usd <= 0:
+                continue
+
+            value_usd = token_amount * price_usd
+            if value_usd < 1.0:
+                continue
+
+            # 尝试获取代币名称
+            try:
+                name_abi = [{"name": "name", "type": "function", "stateMutability": "view",
+                             "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
+                name_contract = _w3.eth.contract(address=token_cs, abi=name_abi)
+                token_name = name_contract.functions.name().call()
+            except Exception:
+                token_name = addr[:16]
+
+            venue = detect_venue(addr)
+
+            holdings.append({
+                "address": addr,
+                "name": token_name,
+                "decimals": decimals,
+                "balance": str(balance),
+                "price_usd": price_usd,
+                "value_usd": value_usd,
+                "venue": venue if venue != "UNKNOWN" else "PANCAKE",
+            })
+            log.info("  持有 %s: %.2f 个, 单价 $%.10f, 价值 $%.2f [%s]",
+                     token_name, token_amount, price_usd, value_usd, venue)
+
+        except Exception as e:
+            log.debug("钱包扫描 [%s]: %s", addr[:16], e)
+
+        time.sleep(0.3)
+
+    log.info("钱包扫描: 发现 %d 个价值 > $1 的代币", len(holdings))
+    return holdings
+
+
+def _sync_positions_from_wallet(bnb_price_usd: float):
+    """
+    启动时同步: 以链上钱包实际持仓为准
+    1. 扫描钱包中价值 > $1 的代币
+    2. 数据库中没有 OPEN 记录的 → 新建 (用当前价作为买入价)
+    3. 数据库中有 OPEN 记录但链上余额为 0 的 → 关闭
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    _init_positions_db(conn)
+
+    # 先关闭所有旧的 OPEN 持仓 (以链上为准)
+    old_positions = get_open_positions(conn)
+    wallet_tokens = _scan_wallet_tokens(bnb_price_usd)
+    wallet_addrs = {h["address"].lower() for h in wallet_tokens}
+
+    # 关闭链上已无余额的持仓
+    for pos in old_positions:
+        if pos["token_address"].lower() not in wallet_addrs:
+            log.info("同步: 关闭无余额持仓 %s", pos["token_name"] or pos["token_address"][:16])
+            close_position(conn, pos["id"], 0, "", "SYNC_NO_BALANCE", pos["buy_price_usd"])
+
+    # 为链上有余额但数据库无记录的代币创建持仓
+    for h in wallet_tokens:
+        addr = h["address"]
+        if not has_open_position(conn, addr):
+            now_ms = int(time.time() * 1000)
+            conn.execute("""
+                INSERT INTO positions
+                    (token_address, token_name, token_decimals, buy_price_usd, buy_amount,
+                     buy_bnb, buy_tx, buy_time, max_price_usd, current_price, status, venue)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+            """, (
+                addr,
+                h["name"],
+                h["decimals"],
+                h["price_usd"],       # 用当前价作为买入价
+                h["balance"],
+                0,                     # buy_bnb 未知
+                "wallet_sync",         # 标记为钱包同步
+                now_ms,
+                h["price_usd"],       # max_price = 当前价
+                h["price_usd"],
+                h["venue"],
+            ))
+            log.info("同步: 新建持仓 %s, 当前价 $%.10f, 价值 $%.2f",
+                     h["name"], h["price_usd"], h["value_usd"])
+        else:
+            # 已有记录, 更新余额和价格
+            log.info("同步: 已有持仓 %s, 跳过", h["name"])
+
+    conn.commit()
+    conn.close()
+    log.info("钱包同步完成: %d 个活跃持仓", len(wallet_tokens))
+
+
+# ===================================================================
 #  初始化
 # ===================================================================
-def init_trader(cfg: dict):
-    """初始化交易模块 (Web3 连接 + 钱包加载)"""
+def init_trader(cfg: dict, bnb_price_usd: float = 0):
+    """初始化交易模块 (Web3 连接 + 钱包加载 + 链上持仓同步)"""
     trading_cfg = cfg.get("trading", {})
     if not trading_cfg.get("enabled", False):
         log.info("自动交易未启用")
@@ -1392,6 +1569,11 @@ def init_trader(cfg: dict):
         balance_bnb = get_bnb_balance()
         balance_usdt = get_usdt_balance()
         log.info("钱包余额: %.4f BNB, %.2f USDT", balance_bnb, balance_usdt)
+
+        # 从链上同步真实持仓
+        if bnb_price_usd > 0:
+            _sync_positions_from_wallet(bnb_price_usd)
+
         return True
     except Exception as e:
         log.error("交易模块初始化失败: %s", e)
