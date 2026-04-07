@@ -3,7 +3,7 @@ BSC 自动交易模块 - PancakeSwap V2
 买入: 扫描筛选通过后自动买入
 卖出:
   1. 回撤止盈: 盈利超过100%, 当价格回撤到 (买入价+最高价)/2 时卖出
-  2. 超期清仓: 持仓超过3天且未盈利时卖出
+  2. 超期清仓: 持仓超过2天且未盈利时卖出
 """
 
 from __future__ import annotations
@@ -1050,7 +1050,7 @@ def check_sell_conditions(pos: dict, current_price: float,
 
     策略:
       1. 回撤止盈: 盈利超过100%, 价格回撤到 (buy_price + max_price) / 2
-      2. 超期清仓: 持仓超过3天且未盈利
+      2. 超期清仓: 持仓超过2天且未盈利
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
@@ -1072,7 +1072,7 @@ def check_sell_conditions(pos: dict, current_price: float,
             return True, f"TRAILING_TP (最高盈利 {max_profit_pct:.0f}%, 当前 {profit_pct:.0f}%)"
 
     # 策略2: 超期清仓
-    expire_hours = trading_cfg.get("expire_hours", 72)  # 默认3天
+    expire_hours = trading_cfg.get("expire_hours", 48)  # 默认2天
     hold_ms = int(time.time() * 1000) - pos["buy_time"]
     hold_hours = hold_ms / (3600 * 1000)
 
@@ -1332,8 +1332,14 @@ def monitor_positions(cfg_loader, bnb_price_func):
 
                 buy_price = pos["buy_price_usd"]
                 profit_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
-                log.info("  %s [%s]: 当前 $%.12f | 最高 $%.12f | 盈亏 %+.1f%%",
-                         name, venue, current_price, max_price, profit_pct)
+                hold_ms = int(time.time() * 1000) - pos["buy_time"]
+                hold_hours = hold_ms / (3600 * 1000)
+                hold_days = hold_hours / 24
+                expire_hours = trading_cfg.get("expire_hours", 48)
+                expire_tag = " ⚠️超期" if (hold_hours >= expire_hours and current_price <= buy_price) else ""
+                log.info("  %s [%s]: 当前 $%.12f | 买入 $%.12f | 最高 $%.12f | 盈亏 %+.1f%% | 持仓 %.1f天(%.0fh)%s",
+                         name, venue, current_price, buy_price, max_price, profit_pct,
+                         hold_days, hold_hours, expire_tag)
 
                 # 检查卖出条件
                 pos_updated = {**pos, "max_price_usd": max_price}

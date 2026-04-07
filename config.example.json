@@ -30,7 +30,7 @@
         "min_buy_usd": 5,
         "max_buy_usd": 100,
         "tp_trigger_pct": 100,
-        "expire_hours": 72,
+        "expire_hours": 48,
         "monitor_interval_sec": 60
     }
 }

@@ -96,7 +96,7 @@ python3 scanner.py
 | `trading.min_buy_usd` | 最小买入金额 (USD) | 5 |
 | `trading.max_buy_usd` | 最大买入金额 (USD) | 100 |
 | `trading.tp_trigger_pct` | 止盈触发盈利百分比 | 100 |
-| `trading.expire_hours` | 超期清仓时间 (小时) | 72 |
+| `trading.expire_hours` | 超期清仓时间 (小时) | 48 |
 | `trading.monitor_interval_sec` | 盯盘间隔 (秒) | 60 |
 
 筛选阈值定义在 `scanner.py` 顶部常量中：
@@ -138,7 +138,7 @@ python3 scanner.py
 持仓监控每分钟扫描一次价格：
 
 1. **回撤止盈**：盈利超过 100%（翻倍）后触发止盈追踪，当价格回撤到 `(买入价 + 记录最高价) / 2` 时自动卖出
-2. **超期清仓**：持仓超过 3 天（72h）且仍未盈利，自动卖出
+2. **超期清仓**：持仓超过 2 天（48h）且仍未盈利，自动卖出
 
 ### 安全提醒
 
