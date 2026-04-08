@@ -3,9 +3,9 @@ BSC Token Scanner - four.meme 新币扫描器 v3
 数据源: four.meme API (代币发现/详情) + DexScreener (主要价格) + GeckoTerminal (备选K线)
 
 三级筛选管线:
-  Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、持币地址粗筛 — 仅用 search API 批量数据
-  Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段 — detail API
-  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.00002(>1h)、价在最高价40%~90%、现价比底价高10%~100%(>1h,排除首根K线) — DexScreener+GT
+  Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、币龄<4h且价>$0.00001排除、持币地址粗筛 — 仅用 search API 批量数据
+  Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段、币龄<4h且价>$0.00001排除 — detail API
+  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.000023(>1h)、价在最高价40%~90%、现价比底价高10%~100%(>1h,排除首根K线) — DexScreener+GT
 """
 
 from __future__ import annotations
@@ -78,9 +78,10 @@ DS_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 MAX_AGE_HOURS = 72
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 MAX_CURRENT_PRICE_OLD = 0.00002        # 币龄 > 1h 当前价格上限 (USD)
-MAX_CURRENT_PRICE_YOUNG = 0.000004     # 币龄 ≤ 1h 当前价格上限 (USD)
+MAX_CURRENT_PRICE_YOUNG = 0.0000045    # 币龄 ≤ 1h 当前价格上限 (USD)
+MAX_PRICE_UNDER_4H = 0.00001           # 币龄 < 4h 当前价格上限 (USD)
 MAX_HIGH_PRICE = 0.00004               # 历史最高价上限 (USD)
-MAX_EARLY_HIGH_PRICE = 0.00002         # 前2小时最高价上限 (USD, 币龄>1h时检查)
+MAX_EARLY_HIGH_PRICE = 0.000023        # 前2小时最高价上限 (USD, 币龄>1h时检查)
 PRICE_RATIO_LOW = 0.4                  # 当前价 ≥ 最高价 * 40%
 PRICE_RATIO_HIGH = 0.9                 # 当前价 ≤ 最高价 * 90%
 FLOOR_RATIO_LOW = 0.1                  # 现价比底价高 ≥ 10% (币龄>1h, 排除首根K线)
@@ -542,7 +543,7 @@ def calc_floor_price(candles: list[list], create_ts_sec: int) -> float | None:
 def stage1_prefilter(tokens: list[dict], now_ms: int) -> list[dict]:
     """
     Stage 1 初筛 — 仅用 search API 批量数据, 0 额外请求
-    条件: 币龄≤72h, 当前价≤MAX_CURRENT_PRICE_OLD, 持币地址粗筛(半阈值)
+    条件: 币龄≤72h, 当前价≤MAX_CURRENT_PRICE_OLD, 币龄<4h且价>$0.00001排除, 持币地址粗筛(半阈值)
     """
     max_age_ms = MAX_AGE_HOURS * 3600 * 1000
     results = []
@@ -555,6 +556,9 @@ def stage1_prefilter(tokens: list[dict], now_ms: int) -> list[dict]:
             continue
         price = float(t.get("price", 0) or 0)
         if price > MAX_CURRENT_PRICE_OLD:
+            continue
+        # 币龄<4h 且 价格>0.00001 排除
+        if age_hours < 4 and price > MAX_PRICE_UNDER_4H:
             continue
         hold = int(t.get("hold", 0) or 0)
         age_hours = age_ms / (3600 * 1000)
@@ -573,7 +577,7 @@ def stage2_detail(candidates: list[dict], now_ms: int,
                   bscscan_key: str = "") -> list[dict]:
     """
     Stage 2 详情筛 — four.meme detail API, 每候选 1 请求
-    条件: 社交媒体≥1, 持币(>1h:≥60,≤1h:≥30), 总量=10亿, 当前价分段
+    条件: 社交媒体≥1, 持币(>1h:≥60,≤1h:≥30), 总量=10亿, 当前价分段, 币龄<4h且价>$0.00001排除
     """
     results = []
     for i, t in enumerate(candidates):
@@ -603,9 +607,12 @@ def stage2_detail(candidates: list[dict], now_ms: int,
         # 总量 = 10亿
         if detail["totalSupply"] != TOTAL_SUPPLY:
             continue
-        # 当前价: 币龄≤1h → ≤0.000004, 币龄>1h → ≤0.00002
+        # 当前价: 币龄≤1h → ≤0.0000045, 币龄>1h → ≤0.00002
         max_price = MAX_CURRENT_PRICE_OLD if age_hours > 1 else MAX_CURRENT_PRICE_YOUNG
         if detail["price"] > max_price:
+            continue
+        # 币龄<4h 且 价格>0.00001 排除
+        if age_hours < 4 and detail["price"] > MAX_PRICE_UNDER_4H:
             continue
 
         results.append({"token": t, "detail": detail, "ageHours": age_hours})
@@ -620,7 +627,7 @@ def stage2_detail(candidates: list[dict], now_ms: int,
 def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
     """
     Stage 3 K线筛 — 两阶段: DS快筛(现价) → GT精筛(K线)
-    条件: ATH≤$0.00004, 前2h最高(>1h)≤$0.00002, 现价/ATH在40%~90%,
+    条件: ATH≤$0.00004, 前2h最高(>1h)≤$0.000023, 现价/ATH在40%~90%,
           现价比底价高10%~100%(币龄>1h,排除首根K线)
     """
     global _gt_rate_delay
@@ -644,6 +651,10 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
             max_cur = MAX_CURRENT_PRICE_OLD if cand["ageHours"] > 1 else MAX_CURRENT_PRICE_YOUNG
             if ds_price > max_cur:
                 log.info("  Stage3-A: %s — DS现价 %.2e > %.2e, 淘汰", name, ds_price, max_cur)
+                continue
+            # 币龄<4h 且 价格>0.00001 排除
+            if cand["ageHours"] < 4 and ds_price > MAX_PRICE_UNDER_4H:
+                log.info("  Stage3-A: %s — 币龄<4h, DS现价 %.2e > %.2e, 淘汰", name, ds_price, MAX_PRICE_UNDER_4H)
                 continue
         ds_filtered.append(cand)
 
@@ -703,6 +714,10 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
             max_cur = MAX_CURRENT_PRICE_OLD if age_hours > 1 else MAX_CURRENT_PRICE_YOUNG
             if current_price > max_cur:
                 log.info("  Stage3-B: %s — 现价 %.2e > %.2e, 跳过", name, current_price, max_cur)
+                continue
+            # 币龄<4h 且 价格>0.00001 排除
+            if age_hours < 4 and current_price > MAX_PRICE_UNDER_4H:
+                log.info("  Stage3-B: %s — 币龄<4h, 现价 %.2e > %.2e, 跳过", name, current_price, MAX_PRICE_UNDER_4H)
                 continue
 
         # 前2h最高价 (币龄>1h时检查)
@@ -858,8 +873,8 @@ def scan_once(cfg: dict) -> None:
     log.info("获取 %d 个代币", len(api_tokens))
 
     # Stage 1: 初筛
-    log.info("Stage1 条件: 币龄≤%dh, 当前价≤$%s, 持币≥(>1h:%d, ≤1h:%d)×0.5",
-             MAX_AGE_HOURS, MAX_CURRENT_PRICE_OLD,
+    log.info("Stage1 条件: 币龄≤%dh, 当前价≤$%s, 币龄<4h且价>$%s排除, 持币≥(>1h:%d, ≤1h:%d)×0.5",
+             MAX_AGE_HOURS, MAX_CURRENT_PRICE_OLD, MAX_PRICE_UNDER_4H,
              HOLDERS_THRESHOLD_OLD, HOLDERS_THRESHOLD_YOUNG)
     s1 = stage1_prefilter(api_tokens, now_ms)
     if not s1:
@@ -867,8 +882,8 @@ def scan_once(cfg: dict) -> None:
         return
 
     # Stage 2 + 热点并行
-    log.info("Stage2 条件: 社交≥%d, 持币(>1h:≥%d, ≤1h:≥%d), 总量=%s, 当前价分段",
-             MIN_SOCIAL_COUNT, HOLDERS_THRESHOLD_OLD, HOLDERS_THRESHOLD_YOUNG, TOTAL_SUPPLY)
+    log.info("Stage2 条件: 社交≥%d, 持币(>1h:≥%d, ≤1h:≥%d), 总量=%s, 当前价分段, 币龄<4h且价>$%s排除",
+             MIN_SOCIAL_COUNT, HOLDERS_THRESHOLD_OLD, HOLDERS_THRESHOLD_YOUNG, TOTAL_SUPPLY, MAX_PRICE_UNDER_4H)
     hotspots = fetch_all_hotspots(cfg)
     s2 = stage2_detail(s1, now_ms, bscscan_key)
     if not s2:
