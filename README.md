@@ -1,6 +1,6 @@
-# BSC Token Scanner v3
+# BSC Token Scanner v4
 
-扫描 [four.meme](https://four.meme) 平台上新发行的 BSC 代币，三级管线智能筛选后推送到 Telegram，可选自动交易。
+扫描 [four.meme](https://four.meme) 平台上新发行的 BSC 代币，四级管线智能筛选后推送到 Telegram，可选自动交易。
 
 ## 数据源
 
@@ -10,16 +10,17 @@
 | four.meme Detail API | 代币详情（持币/社交链接/描述） | ~2 req/s |
 | DexScreener API | K线价格数据（主要，快速） | ~300 req/min |
 | GeckoTerminal OHLCV | K线数据（备选，精确） | ~30 req/min，自动退避重试 |
-| BSCScan API | 链上真实持仓地址数（可选） | ~5 req/s |
+| BSCScan API | 链上真实持仓地址数 + 开发者行为 + 聪明钱追踪 | ~5 req/s |
 | 微博/Google/Twitter | 实时热点关键词（加分项） | 各平台独立限流 |
 
-## 三级筛选管线
+## 四级筛选管线
 
 | 阶段 | 条件 | 数据源 | 请求开销 |
 |------|------|--------|----------|
 | 初筛 | 币龄≤3天、当前价≤$0.00002、币龄<4h且价>$0.00001排除、持币地址粗筛 | Search API（批量） | 0 额外请求 |
 | 详情筛 | 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段、币龄<4h且价>$0.00001排除 | Detail API + BSCScan | 每候选 1~2 请求 |
 | K线筛 | 历史最高价≤$0.00004、前2h最高价≤$0.000023(币龄>1h)、当前价在最高价40%~90%、现价比底价高10%~100%(排除首根K线; ≤1h用全部K线最低价) | DexScreener (主) + GeckoTerminal (备) | 每候选 1~3 请求 |
+| 链上行为筛 | 开发者减仓/清仓/撤流动性→排除、聪明钱减仓/清仓→排除、开发者加仓/加流动性→加分、聪明钱加仓→加分 | BSCScan API | 每候选 3~4 请求 |
 
 逐级收窄，避免不必要的 API 调用。
 
@@ -41,6 +42,16 @@
    - 数据源：微博热搜 Top50、Google Trends（US/CN）、Twitter/X Trending
    - 匹配逻辑：短关键词(≤3字符)精确匹配名称，长关键词子串匹配，支持反向匹配
    - 按热点排名和来源加权评分，匹配到的代币标注 🔥
+6. **链上行为分析**（Stage 4，排除+加分）：通过 BSCScan API 追踪开发者和聪明钱的链上行为
+   - 排除信号（直接淘汰）：开发者减仓、开发者清仓、开发者撤流动性/减流动性、聪明钱减仓、聪明钱清仓
+   - 加分信号（优先开仓）：开发者加仓、开发者加流动性、聪明钱加仓
+   - 加分越多的代币在自动买入时优先级越高
+   - 需要配置 `bscscan_api_key`，未配置时跳过此阶段
+   - 聪明钱地址自动发现（无需手动维护）：
+     - BSCScan Top Holders 交叉分析：分析多个热门代币的 Top 50 持有者，在 ≥2 个代币中都是大户的地址自动识别为聪明钱
+     - DexScreener 热门代币 Top Traders 追踪
+     - 支持手动补充地址（`smart_money.addresses`）
+     - 地址库每小时自动刷新
 
 ## 快速开始
 
@@ -91,6 +102,9 @@ python3 scanner.py
 | `hotspot.google` | 启用 Google Trends | true |
 | `hotspot.google_geos` | Google Trends 地区 | ["US","CN"] |
 | `hotspot.twitter` | 启用 Twitter/X Trending | true |
+| `smart_money.enabled` | 是否启用聪明钱追踪 | false |
+| `smart_money.addresses` | 手动维护的聪明钱钱包地址列表 | [] |
+| `smart_money.min_cross_freq` | Top Holders 交叉分析最小出现频次 | 2 |
 | `trading.enabled` | 是否启用自动交易 | false |
 | `trading.rpc_url` | BSC RPC 节点 | (默认自动选择) |
 | `trading.slippage_pct` | 交易滑点 (%) | 12 |

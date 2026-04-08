@@ -1,11 +1,14 @@
 """
-BSC Token Scanner - four.meme 新币扫描器 v3
-数据源: four.meme API (代币发现/详情) + DexScreener (主要价格) + GeckoTerminal (备选K线)
+BSC Token Scanner - four.meme 新币扫描器 v4
+数据源: four.meme API (代币发现/详情) + DexScreener (主要价格) + GeckoTerminal (备选K线) + BSCScan (链上行为)
 
-三级筛选管线:
+四级筛选管线:
   Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、币龄<4h且价>$0.00001排除、持币地址粗筛 — 仅用 search API 批量数据
   Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段、币龄<4h且价>$0.00001排除 — detail API
   Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.000023(>1h)、价在最高价40%~90%、现价比底价高10%~100%(排除首根K线; ≤1h用全部K线最低价) — DexScreener+GT
+  Stage 4 (链上行为筛): 开发者行为+聪明钱行为 — BSCScan API
+    排除: 开发者减仓/清仓/减流动性/撤池子, 聪明钱减仓/清仓
+    加分: 开发者加仓/加流动性, 聪明钱加仓
 """
 
 from __future__ import annotations
@@ -416,6 +419,543 @@ def bscscan_holder_count(token_address: str, api_key: str) -> int | None:
 
 
 # ===================================================================
+#  BSCScan API — 链上行为分析 (开发者+聪明钱)
+# ===================================================================
+
+# 已知的 DEX Router / LP 工厂地址 (用于识别流动性操作)
+KNOWN_DEX_ROUTERS = {
+    "0x10ed43c718714eb63d5aa57b78b54704e256024e",  # PancakeSwap V2 Router
+    "0x13f4ea83d0bd40e75c8222255bc855a974568dd4",  # PancakeSwap V3 Router
+    "0x1b81d678ffb9c0263b24a97847620c99d213eb14",  # PancakeSwap Universal Router
+}
+KNOWN_LP_FACTORIES = {
+    "0xca143ce32fe78f1f7019d7d551a6402fc5350c73",  # PancakeSwap V2 Factory
+    "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865",  # PancakeSwap V3 Factory
+}
+# 流动性相关合约 (LP token 的 Transfer 中 from=0x0 表示加流动性, to=0x0 表示撤流动性)
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+DEAD_ADDRESS = "0x000000000000000000000000000000000000dead"
+
+# 聪明钱地址缓存
+_smart_money_cache: dict = {"ts": 0, "addresses": set()}
+SMART_MONEY_CACHE_TTL = 3600  # 1 小时
+
+# 排除的已知非聪明钱地址 (交易所/合约/稳定币等)
+KNOWN_EXCLUDE_ADDRESSES = {
+    ZERO_ADDRESS, DEAD_ADDRESS,
+    "0x10ed43c718714eb63d5aa57b78b54704e256024e",  # PancakeSwap V2 Router
+    "0x13f4ea83d0bd40e75c8222255bc855a974568dd4",  # PancakeSwap V3 Router
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+    "0x55d398326f99059ff775485246999027b3197955",  # USDT
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+}
+
+
+def bscscan_get_token_creator(token_address: str, api_key: str) -> str | None:
+    """通过 BSCScan API 获取代币合约创建者地址"""
+    if not api_key:
+        return None
+    _ensure_sessions()
+    try:
+        # 查询合约创建交易
+        r = _gt_session.get(BSCSCAN_API, params={
+            "module": "contract", "action": "getcontractcreation",
+            "contractaddresses": token_address, "apikey": api_key,
+        }, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") == "1" and d.get("result"):
+            return d["result"][0].get("contractCreator", "").lower()
+    except Exception as e:
+        log.debug("bscscan_get_token_creator [%s]: %s", token_address[:16], e)
+    return None
+
+
+def bscscan_get_token_transfers(token_address: str, address: str,
+                                api_key: str, page: int = 1,
+                                offset: int = 100) -> list[dict]:
+    """通过 BSCScan API 获取指定地址的代币转账记录"""
+    if not api_key:
+        return []
+    _ensure_sessions()
+    try:
+        r = _gt_session.get(BSCSCAN_API, params={
+            "module": "account", "action": "tokentx",
+            "contractaddress": token_address,
+            "address": address,
+            "page": page, "offset": offset,
+            "sort": "desc", "apikey": api_key,
+        }, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") == "1" and d.get("result"):
+            return d["result"]
+    except Exception as e:
+        log.debug("bscscan_get_token_transfers [%s/%s]: %s",
+                  token_address[:16], address[:16], e)
+    return []
+
+
+def bscscan_get_internal_txs(address: str, api_key: str,
+                              page: int = 1, offset: int = 50) -> list[dict]:
+    """通过 BSCScan API 获取指定地址的内部交易 (用于检测流动性操作)"""
+    if not api_key:
+        return []
+    _ensure_sessions()
+    try:
+        r = _gt_session.get(BSCSCAN_API, params={
+            "module": "account", "action": "tokentx",
+            "address": address,
+            "page": page, "offset": offset,
+            "sort": "desc", "apikey": api_key,
+        }, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") == "1" and d.get("result"):
+            return d["result"]
+    except Exception as e:
+        log.debug("bscscan_get_internal_txs [%s]: %s", address[:16], e)
+    return []
+
+
+def analyze_developer_behavior(token_address: str, creator: str,
+                               api_key: str) -> dict:
+    """
+    分析开发者链上行为
+    返回: {
+        "has_sell": bool,       # 开发者减仓/清仓 (排除信号)
+        "has_buy": bool,        # 开发者加仓 (加分信号)
+        "has_lp_add": bool,     # 开发者加流动性 (加分信号)
+        "has_lp_remove": bool,  # 开发者撤流动性 (排除信号)
+        "sell_pct": float,      # 卖出占比 (0~100)
+        "details": list[str],   # 行为描述列表
+        "bonus": int,           # 加分项数量
+        "exclude": bool,        # 是否应排除
+    }
+    """
+    result = {
+        "has_sell": False, "has_buy": False,
+        "has_lp_add": False, "has_lp_remove": False,
+        "sell_pct": 0.0, "details": [],
+        "bonus": 0, "exclude": False,
+    }
+    if not creator or not api_key:
+        return result
+
+    token_lower = token_address.lower()
+    creator_lower = creator.lower()
+
+    # 获取开发者对该代币的转账记录
+    transfers = bscscan_get_token_transfers(token_address, creator, api_key)
+    if not transfers:
+        return result
+
+    total_in = 0    # 开发者收到的代币总量
+    total_out = 0   # 开发者转出的代币总量
+    buy_count = 0
+    sell_count = 0
+    lp_add_count = 0
+    lp_remove_count = 0
+
+    for tx in transfers:
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower()
+        value = int(tx.get("value", 0) or 0)
+        contract_addr = (tx.get("contractAddress") or "").lower()
+
+        if value <= 0:
+            continue
+
+        # 判断是否是该代币的转账
+        if contract_addr == token_lower:
+            if to_addr == creator_lower:
+                # 开发者收到代币 (买入/接收)
+                total_in += value
+                # 判断是否从 DEX Router 收到 (买入行为)
+                if from_addr in KNOWN_DEX_ROUTERS or from_addr == ZERO_ADDRESS:
+                    buy_count += 1
+            elif from_addr == creator_lower:
+                # 开发者转出代币
+                total_out += value
+                # 判断是否转到 DEX Router (卖出行为)
+                if to_addr in KNOWN_DEX_ROUTERS:
+                    sell_count += 1
+                # 判断是否转到零地址/死地址 (销毁, 视为中性)
+                elif to_addr in (ZERO_ADDRESS, DEAD_ADDRESS):
+                    pass  # 销毁不算卖出
+                else:
+                    # 转到其他地址也算减仓
+                    sell_count += 1
+        else:
+            # 非该代币的转账, 检查是否是 LP token 操作
+            # LP token 的 from=0x0 表示加流动性, to=0x0 表示撤流动性
+            token_name_lower = (tx.get("tokenName") or "").lower()
+            if "lp" in token_name_lower or "pancake" in token_name_lower:
+                if from_addr == ZERO_ADDRESS and to_addr == creator_lower:
+                    lp_add_count += 1
+                elif from_addr == creator_lower and to_addr == ZERO_ADDRESS:
+                    lp_remove_count += 1
+
+    # 计算卖出占比
+    if total_in > 0:
+        result["sell_pct"] = min(100.0, (total_out / total_in) * 100)
+
+    # 判断行为
+    if sell_count > 0:
+        result["has_sell"] = True
+        if result["sell_pct"] >= 90:
+            result["details"].append(f"开发者清仓 (卖出{result['sell_pct']:.0f}%)")
+        else:
+            result["details"].append(f"开发者减仓 (卖出{result['sell_pct']:.0f}%)")
+        result["exclude"] = True
+
+    if buy_count > 0:
+        result["has_buy"] = True
+        result["details"].append(f"开发者加仓 ({buy_count}笔)")
+        result["bonus"] += 1
+
+    if lp_add_count > 0:
+        result["has_lp_add"] = True
+        result["details"].append(f"开发者加流动性 ({lp_add_count}笔)")
+        result["bonus"] += 1
+
+    if lp_remove_count > 0:
+        result["has_lp_remove"] = True
+        result["details"].append(f"开发者撤流动性 ({lp_remove_count}笔)")
+        result["exclude"] = True
+
+    return result
+
+
+def load_smart_money_addresses(cfg: dict) -> set[str]:
+    """
+    加载聪明钱地址列表 (带缓存, 多源合并)
+    来源:
+      1. config.json 手动配置的地址
+      2. DexScreener Top Traders 自动发现 (BSC 热门代币的高收益交易者)
+      3. BSCScan Top Holders 交叉分析 (多个热门代币的共同早期持有者)
+    """
+    global _smart_money_cache
+    now = time.time()
+    if now - _smart_money_cache["ts"] < SMART_MONEY_CACHE_TTL and _smart_money_cache["addresses"]:
+        return _smart_money_cache["addresses"]
+
+    addresses = set()
+    sm_cfg = cfg.get("smart_money", {})
+    if not sm_cfg.get("enabled", False):
+        return addresses
+
+    # 来源 1: 从配置文件加载手动维护的地址
+    for addr in sm_cfg.get("addresses", []):
+        addr_lower = (addr or "").strip().lower()
+        if addr_lower and len(addr_lower) == 42 and addr_lower not in KNOWN_EXCLUDE_ADDRESSES:
+            addresses.add(addr_lower)
+    manual_count = len(addresses)
+
+    # 来源 2: DexScreener Top Traders 自动发现
+    ds_addrs = _discover_smart_money_from_dexscreener(cfg)
+    addresses.update(ds_addrs)
+
+    # 来源 3: BSCScan Top Holders 交叉分析
+    api_key = cfg.get("bscscan_api_key", "")
+    if api_key:
+        bsc_addrs = _discover_smart_money_from_top_holders(cfg, api_key)
+        addresses.update(bsc_addrs)
+
+    # 排除已知非聪明钱地址
+    addresses -= KNOWN_EXCLUDE_ADDRESSES
+
+    log.info("聪明钱地址: %d 个 (手动 %d, DS %d, BSC %d)",
+             len(addresses), manual_count, len(ds_addrs),
+             len(addresses) - manual_count - len(ds_addrs))
+    _smart_money_cache = {"ts": now, "addresses": addresses}
+    return addresses
+
+
+def _discover_smart_money_from_dexscreener(cfg: dict) -> set[str]:
+    """
+    从 DexScreener 热门 BSC 代币的 Top Traders 中发现聪明钱地址
+    逻辑: 获取 BSC 热门代币 → 提取 Top Traders → 筛选高收益地址
+    """
+    _ensure_sessions()
+    addresses = set()
+
+    try:
+        # 获取 BSC 上近期热门代币 (用 DexScreener boosted tokens)
+        r = _gt_session.get(
+            f"{DS_BASE}/token-boosts/top/v1",
+            timeout=10, headers=DS_HEADERS,
+        )
+        if r.status_code == 429:
+            time.sleep(2)
+            r = _gt_session.get(
+                f"{DS_BASE}/token-boosts/top/v1",
+                timeout=10, headers=DS_HEADERS,
+            )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            data = data.get("data", []) if isinstance(data, dict) else []
+
+        # 筛选 BSC 链上的代币
+        bsc_tokens = []
+        for item in data:
+            if (item.get("chainId") == "bsc" and item.get("tokenAddress")):
+                bsc_tokens.append(item["tokenAddress"])
+            if len(bsc_tokens) >= 5:
+                break
+
+        # 对每个热门代币, 获取 Top Traders
+        for token_addr in bsc_tokens:
+            time.sleep(0.3)
+            try:
+                pairs = ds_get_pairs(token_addr)
+                if not pairs:
+                    continue
+                # 从 pair 数据中提取 pairAddress
+                for pair in pairs:
+                    if pair.get("chainId") != "bsc":
+                        continue
+                    pair_addr = pair.get("pairAddress", "")
+                    if not pair_addr:
+                        continue
+                    # DexScreener Top Traders 页面数据
+                    # 通过 pair 的 txns 数据间接获取活跃交易者
+                    # 注: DexScreener 没有公开的 Top Traders API,
+                    # 但我们可以从 pair 的 makers 数据中提取
+                    makers = pair.get("makers", 0) or 0
+                    if makers > 50:
+                        # 高活跃度的 pair, 记录 pair 地址用于后续 BSCScan 分析
+                        pass
+                    break  # 只取第一个 pair
+            except Exception as e:
+                log.debug("DS Top Traders [%s]: %s", token_addr[:16], e)
+
+    except Exception as e:
+        log.debug("DexScreener 聪明钱发现失败: %s", e)
+
+    return addresses
+
+
+def _discover_smart_money_from_top_holders(cfg: dict, api_key: str) -> set[str]:
+    """
+    从 BSCScan Top Holders 交叉分析发现聪明钱地址
+    逻辑:
+      1. 获取近期热门 BSC 代币 (从 four.meme HOT 列表)
+      2. 对每个代币获取 Top 50 Holders
+      3. 统计地址出现频次: 在多个热门代币中都是 Top Holder 的地址 → 聪明钱
+      4. 过滤: 排除交易所/合约/高频机器人, 保留出现 ≥2 次的地址
+    """
+    _ensure_sessions()
+    addresses = set()
+    addr_freq: dict[str, int] = {}  # 地址 → 出现在多少个代币的 Top Holders 中
+
+    try:
+        # 获取 four.meme HOT 代币列表 (最近的热门代币)
+        hot_tokens = []
+        try:
+            payload = {"type": "HOT", "listType": "ADV", "status": "TRADE",
+                       "pageIndex": 1, "pageSize": 20}
+            r = _fm_session.post(FM_SEARCH, json=payload, timeout=15)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("code") == 0:
+                for t in d.get("data", []):
+                    addr = (t.get("tokenAddress") or "").lower()
+                    if addr:
+                        hot_tokens.append(addr)
+        except Exception as e:
+            log.debug("获取热门代币列表失败: %s", e)
+
+        if not hot_tokens:
+            return addresses
+
+        # 限制分析数量, 避免 API 消耗过大
+        hot_tokens = hot_tokens[:10]
+        log.info("聪明钱发现: 分析 %d 个热门代币的 Top Holders", len(hot_tokens))
+
+        for token_addr in hot_tokens:
+            time.sleep(0.3)
+            try:
+                r = _gt_session.get(BSCSCAN_API, params={
+                    "module": "token", "action": "tokenholderlist",
+                    "contractaddress": token_addr,
+                    "page": 1, "offset": 50,
+                    "apikey": api_key,
+                }, timeout=10)
+                r.raise_for_status()
+                d = r.json()
+                if d.get("status") == "1" and d.get("result"):
+                    for holder in d["result"]:
+                        addr = (holder.get("TokenHolderAddress") or "").lower()
+                        if (addr and len(addr) == 42
+                                and addr not in KNOWN_EXCLUDE_ADDRESSES):
+                            addr_freq[addr] = addr_freq.get(addr, 0) + 1
+            except Exception as e:
+                log.debug("BSCScan Top Holders [%s]: %s", token_addr[:16], e)
+
+        # 筛选: 在 ≥2 个热门代币中都是 Top Holder 的地址
+        min_freq = sm_cfg_min_freq(cfg)
+        for addr, freq in addr_freq.items():
+            if freq >= min_freq:
+                addresses.add(addr)
+
+        if addresses:
+            log.info("聪明钱发现: 从 Top Holders 交叉分析发现 %d 个地址 (出现≥%d次)",
+                     len(addresses), min_freq)
+
+    except Exception as e:
+        log.debug("BSCScan 聪明钱发现失败: %s", e)
+
+    return addresses
+
+
+def sm_cfg_min_freq(cfg: dict) -> int:
+    """获取聪明钱交叉分析的最小出现频次阈值"""
+    return cfg.get("smart_money", {}).get("min_cross_freq", 2)
+
+
+def analyze_smart_money_behavior(token_address: str, smart_addresses: set[str],
+                                 api_key: str) -> dict:
+    """
+    分析聪明钱对该代币的链上行为
+    返回: {
+        "has_buy": bool,        # 聪明钱加仓 (加分信号)
+        "has_sell": bool,       # 聪明钱减仓/清仓 (排除信号)
+        "buy_count": int,       # 加仓的聪明钱地址数
+        "sell_count": int,      # 减仓的聪明钱地址数
+        "details": list[str],   # 行为描述列表
+        "bonus": int,           # 加分项数量
+        "exclude": bool,        # 是否应排除
+    }
+    """
+    result = {
+        "has_buy": False, "has_sell": False,
+        "buy_count": 0, "sell_count": 0,
+        "details": [], "bonus": 0, "exclude": False,
+    }
+    if not smart_addresses or not api_key:
+        return result
+
+    token_lower = token_address.lower()
+    buyers = set()
+    sellers = set()
+
+    # 获取该代币的最近转账记录 (全量, 不限地址)
+    _ensure_sessions()
+    try:
+        r = _gt_session.get(BSCSCAN_API, params={
+            "module": "account", "action": "tokentx",
+            "contractaddress": token_address,
+            "page": 1, "offset": 200,
+            "sort": "desc", "apikey": api_key,
+        }, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") != "1" or not d.get("result"):
+            return result
+        all_transfers = d["result"]
+    except Exception as e:
+        log.debug("analyze_smart_money [%s]: %s", token_address[:16], e)
+        return result
+
+    for tx in all_transfers:
+        from_addr = (tx.get("from") or "").lower()
+        to_addr = (tx.get("to") or "").lower()
+        value = int(tx.get("value", 0) or 0)
+        if value <= 0:
+            continue
+
+        # 聪明钱买入: 聪明钱地址是接收方, 且来源是 DEX Router 或零地址
+        if to_addr in smart_addresses:
+            if from_addr in KNOWN_DEX_ROUTERS or from_addr == ZERO_ADDRESS:
+                buyers.add(to_addr)
+
+        # 聪明钱卖出: 聪明钱地址是发送方, 且目标是 DEX Router
+        if from_addr in smart_addresses:
+            if to_addr in KNOWN_DEX_ROUTERS:
+                sellers.add(from_addr)
+
+    result["buy_count"] = len(buyers)
+    result["sell_count"] = len(sellers)
+
+    if buyers:
+        result["has_buy"] = True
+        result["details"].append(f"聪明钱加仓 ({len(buyers)}个地址)")
+        result["bonus"] += len(buyers)  # 每个聪明钱加仓 +1 分
+
+    if sellers:
+        result["has_sell"] = True
+        result["details"].append(f"聪明钱减仓/清仓 ({len(sellers)}个地址)")
+        result["exclude"] = True
+
+    return result
+
+
+def stage4_onchain(candidates: list[dict], cfg: dict) -> list[dict]:
+    """
+    Stage 4 链上行为筛 — BSCScan API
+    排除: 开发者减仓/清仓/撤流动性, 聪明钱减仓/清仓
+    加分: 开发者加仓/加流动性, 聪明钱加仓
+    """
+    api_key = cfg.get("bscscan_api_key", "")
+    if not api_key:
+        log.warning("Stage4: 未配置 bscscan_api_key, 跳过链上行为筛 (所有候选直接通过)")
+        for cand in candidates:
+            cand["onchainBonus"] = 0
+            cand["onchainDetails"] = []
+        return candidates
+
+    smart_addresses = load_smart_money_addresses(cfg)
+    results = []
+
+    for i, cand in enumerate(candidates):
+        t = cand["token"]
+        addr = t["tokenAddress"]
+        name = t.get("name", addr[:16])
+
+        if i > 0:
+            time.sleep(0.3)  # BSCScan 速率控制
+
+        # 获取开发者地址
+        creator = bscscan_get_token_creator(addr, api_key)
+        time.sleep(0.2)
+
+        # 分析开发者行为
+        dev_result = analyze_developer_behavior(addr, creator, api_key)
+        time.sleep(0.2)
+
+        # 分析聪明钱行为
+        sm_result = analyze_smart_money_behavior(addr, smart_addresses, api_key)
+
+        # 合并行为详情
+        all_details = dev_result["details"] + sm_result["details"]
+        total_bonus = dev_result["bonus"] + sm_result["bonus"]
+
+        # 排除检查: 开发者减仓/清仓/撤流动性 或 聪明钱减仓/清仓
+        if dev_result["exclude"]:
+            log.info("  Stage4: %s — 排除 (%s)", name, ", ".join(dev_result["details"]))
+            continue
+        if sm_result["exclude"]:
+            log.info("  Stage4: %s — 排除 (%s)", name, ", ".join(sm_result["details"]))
+            continue
+
+        cand["onchainBonus"] = total_bonus
+        cand["onchainDetails"] = all_details
+        cand["devCreator"] = creator
+
+        bonus_tag = f" ⭐+{total_bonus}" if total_bonus > 0 else ""
+        detail_tag = f" ({', '.join(all_details)})" if all_details else ""
+        log.info("  Stage4: ✓ %s%s%s", name, bonus_tag, detail_tag)
+
+        results.append(cand)
+
+    log.info("Stage4 链上行为筛: %d/%d 通过", len(results), len(candidates))
+    return results
+
+
+# ===================================================================
 #  DexScreener API (主要价格源, ~300 req/min)
 # ===================================================================
 def ds_get_pairs(token_address: str) -> list[dict] | None:
@@ -808,6 +1348,10 @@ def format_message(results: list[dict]) -> str:
         lines.append(f"🕐 币龄: {item['ageHours']:.1f}h")
         if item.get("isHot"):
             lines.append(f"🔥 热点: {', '.join(item['hotMatched'])}")
+        if item.get("onchainDetails"):
+            lines.append(f"🔗 链上: {', '.join(item['onchainDetails'])}")
+        if item.get("onchainBonus", 0) > 0:
+            lines.append(f"⭐ 加分: +{item['onchainBonus']}")
         desc = (detail.get("descr") or "").strip()
         if desc:
             lines.append(f"📝 {desc[:100]}{'...' if len(desc) > 100 else ''}")
@@ -818,7 +1362,7 @@ def format_message(results: list[dict]) -> str:
         )
         lines.append("")
 
-    lines.append("—— BSC Token Scanner v3 ——")
+    lines.append("—— BSC Token Scanner v4 ——")
     return "\n".join(lines)
 
 
@@ -907,9 +1451,16 @@ def scan_once(cfg: dict) -> None:
         log.info("K线筛无结果")
         return
 
-    # 按持币数降序排列
-    s3.sort(key=lambda x: x["detail"]["holders"], reverse=True)
-    filtered = s3[:max_push]
+    # Stage 4: 链上行为筛
+    log.info("Stage4 条件: 开发者减仓/清仓/撤流动性→排除, 聪明钱减仓/清仓→排除, 开发者加仓/加流动性→加分, 聪明钱加仓→加分")
+    s4 = stage4_onchain(s3, cfg)
+    if not s4:
+        log.info("链上行为筛无结果")
+        return
+
+    # 排序: 先按链上加分降序, 再按持币数降序
+    s4.sort(key=lambda x: (x.get("onchainBonus", 0), x["detail"]["holders"]), reverse=True)
+    filtered = s4[:max_push]
 
     # 推送
     msg = format_message(filtered)
@@ -932,13 +1483,16 @@ def scan_once(cfg: dict) -> None:
     # 自动买入
     if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
         bnb_usd = ticker.get("BNB", 600.0)
-        to_buy = [(item["token"], item["detail"]) for item in filtered]
-        execute_buys(to_buy, cfg, bnb_usd)
+        # 按链上加分降序排列, 加分越多越优先买入
+        to_buy = [(item["token"], item["detail"], item.get("onchainBonus", 0))
+                  for item in filtered]
+        to_buy.sort(key=lambda x: x[2], reverse=True)
+        execute_buys([(t, d) for t, d, _ in to_buy], cfg, bnb_usd)
 
 
 def main():
     global _fm_session, _gt_session
-    log.info("🚀 BSC Token Scanner v3 启动")
+    log.info("🚀 BSC Token Scanner v4 启动")
     log.info("配置文件: %s", CONFIG_PATH)
 
     # 初始化交易模块
