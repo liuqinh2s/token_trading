@@ -690,7 +690,7 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
         floor_price = None
         if candles:
             floor_price = calc_floor_price(candles, create_ts_sec)
-            # 币龄≤1h 时 calc_floor_price 可能返回 None (无首小时后K线), 改用全部K线最低价
+            # 币龄≤1h 时 calc_floor_price 返回 None (无首小时后K线), 用全部K线最低价(尚在首小时内, 无需排除发行价)
             if floor_price is None and age_hours <= 1:
                 floor_price = min(float(c[3]) for c in candles)
 
@@ -739,7 +739,9 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
                          name, ratio * 100)
                 continue
 
-        # 底价检查: 现价比底价高10%~100% (币龄>1h排除首根K线, 币龄≤1h用全部K线最低价)
+        # 底价检查: 现价比底价高10%~100%
+        # 币龄>1h: 排除首小时K线(去除发行价干扰)后的最低价
+        # 币龄≤1h: 全部K线最低价(尚在首小时内, 无需排除)
         if floor_price and floor_price > 0 and current_price:
             floor_ratio = (current_price - floor_price) / floor_price
             if floor_ratio < FLOOR_RATIO_LOW or floor_ratio > FLOOR_RATIO_HIGH:
