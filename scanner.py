@@ -554,6 +554,7 @@ def stage1_prefilter(tokens: list[dict], now_ms: int) -> list[dict]:
         age_ms = now_ms - create_date
         if age_ms <= 0 or age_ms > max_age_ms:
             continue
+        age_hours = age_ms / (3600 * 1000)
         price = float(t.get("price", 0) or 0)
         if price > MAX_CURRENT_PRICE_OLD:
             continue
@@ -561,7 +562,6 @@ def stage1_prefilter(tokens: list[dict], now_ms: int) -> list[dict]:
         if age_hours < 4 and price > MAX_PRICE_UNDER_4H:
             continue
         hold = int(t.get("hold", 0) or 0)
-        age_hours = age_ms / (3600 * 1000)
         min_hold = (HOLDERS_THRESHOLD_OLD * 0.5) if age_hours > 1 else (HOLDERS_THRESHOLD_YOUNG * 0.5)
         if hold < min_hold:
             continue
