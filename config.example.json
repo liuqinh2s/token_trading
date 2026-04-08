@@ -21,7 +21,7 @@
         "twitter": true
     },
     "smart_money": {
-        "enabled": false,
+        "enabled": true,
         "addresses": [],
         "min_cross_freq": 2
     },
