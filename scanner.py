@@ -5,7 +5,7 @@ BSC Token Scanner - four.meme 新币扫描器 v3
 三级筛选管线:
   Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、币龄<4h且价>$0.00001排除、持币地址粗筛 — 仅用 search API 批量数据
   Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段、币龄<4h且价>$0.00001排除 — detail API
-  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.000023(>1h)、价在最高价40%~90%、现价比底价高10%~100%(>1h,排除首根K线) — DexScreener+GT
+  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.000023(>1h)、价在最高价40%~90%、现价比底价高10%~100%(排除首根K线; ≤1h用全部K线最低价) — DexScreener+GT
 """
 
 from __future__ import annotations
@@ -84,8 +84,8 @@ MAX_HIGH_PRICE = 0.00004               # 历史最高价上限 (USD)
 MAX_EARLY_HIGH_PRICE = 0.000023        # 前2小时最高价上限 (USD, 币龄>1h时检查)
 PRICE_RATIO_LOW = 0.4                  # 当前价 ≥ 最高价 * 40%
 PRICE_RATIO_HIGH = 0.9                 # 当前价 ≤ 最高价 * 90%
-FLOOR_RATIO_LOW = 0.1                  # 现价比底价高 ≥ 10% (币龄>1h, 排除首根K线)
-FLOOR_RATIO_HIGH = 1.0                 # 现价比底价高 ≤ 100% (币龄>1h, 排除首根K线)
+FLOOR_RATIO_LOW = 0.1                  # 现价比底价高 ≥ 10%
+FLOOR_RATIO_HIGH = 1.0                 # 现价比底价高 ≤ 100%
 HOLDERS_THRESHOLD_OLD = 60             # 币龄 > 1h 时持币地址数阈值
 HOLDERS_THRESHOLD_YOUNG = 30           # 币龄 ≤ 1h 时持币地址数阈值
 MIN_SOCIAL_COUNT = 1                   # 最少关联社交媒体数
@@ -628,7 +628,7 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
     """
     Stage 3 K线筛 — 两阶段: DS快筛(现价) → GT精筛(K线)
     条件: ATH≤$0.00004, 前2h最高(>1h)≤$0.000023, 现价/ATH在40%~90%,
-          现价比底价高10%~100%(币龄>1h,排除首根K线)
+          现价比底价高10%~100%(排除首根K线; 币龄≤1h时用全部K线最低价)
     """
     global _gt_rate_delay
 
@@ -687,7 +687,12 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
             gt_current = float(latest[4])
 
         current_price = ds_current or gt_current
-        floor_price = calc_floor_price(candles, create_ts_sec) if candles else None
+        floor_price = None
+        if candles:
+            floor_price = calc_floor_price(candles, create_ts_sec)
+            # 币龄≤1h 时 calc_floor_price 可能返回 None (无首小时后K线), 改用全部K线最低价
+            if floor_price is None and age_hours <= 1:
+                floor_price = min(float(c[3]) for c in candles)
 
         if ath is None and high2h is None:
             log.info("  Stage3-B: %s — 无K线数据, 跳过", name)
@@ -726,16 +731,16 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
                      name, high2h, MAX_EARLY_HIGH_PRICE)
             continue
 
-        # 价格区间: 现价/ATH 在 40%~90% (币龄≥1h时检查)
-        if age_hours >= 1 and ath > 0 and current_price:
+        # 价格区间: 现价/ATH 在 40%~90%
+        if ath > 0 and current_price:
             ratio = current_price / ath
             if ratio < PRICE_RATIO_LOW or ratio > PRICE_RATIO_HIGH:
                 log.info("  Stage3-B: %s — 现/高 %.1f%% 不在 40%%~90%%, 跳过",
                          name, ratio * 100)
                 continue
 
-        # 底价检查: 现价比底价高10%~100% (币龄>1h, 排除首根K线)
-        if age_hours > 1 and floor_price and floor_price > 0 and current_price:
+        # 底价检查: 现价比底价高10%~100% (币龄>1h排除首根K线, 币龄≤1h用全部K线最低价)
+        if floor_price and floor_price > 0 and current_price:
             floor_ratio = (current_price - floor_price) / floor_price
             if floor_ratio < FLOOR_RATIO_LOW or floor_ratio > FLOOR_RATIO_HIGH:
                 log.info("  Stage3-B: %s — 现价比底价高 %.1f%%, 不在 10%%~100%%, 跳过",
@@ -754,7 +759,7 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
         })
         hot_tag = f" 🔥{','.join(matched)}" if is_hot else ""
         floor_tag = f", 底+{((current_price - floor_price) / floor_price * 100):.1f}%" if (
-            age_hours > 1 and floor_price and floor_price > 0 and current_price) else ""
+            floor_price and floor_price > 0 and current_price) else ""
         log.info("  Stage3-B: ✓ %s — ATH %.2e, 2h高 %.2e, 现/高 %.1f%%%s%s",
                  name, ath, high2h or 0,
                  (current_price / ath * 100) if ath > 0 and current_price else 0,
@@ -891,7 +896,7 @@ def scan_once(cfg: dict) -> None:
         return
 
     # Stage 3: K线筛
-    log.info("Stage3 条件: ATH≤$%s, 前2h最高(>1h)≤$%s, 现/高在%.0f%%~%.0f%%, 现价比底价高%.0f%%~%.0f%%(>1h)",
+    log.info("Stage3 条件: ATH≤$%s, 前2h最高(>1h)≤$%s, 现/高在%.0f%%~%.0f%%, 现价比底价高%.0f%%~%.0f%%",
              MAX_HIGH_PRICE, MAX_EARLY_HIGH_PRICE,
              PRICE_RATIO_LOW * 100, PRICE_RATIO_HIGH * 100,
              FLOOR_RATIO_LOW * 100, FLOOR_RATIO_HIGH * 100)
