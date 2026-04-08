@@ -5,7 +5,7 @@ BSC Token Scanner - four.meme 新币扫描器 v3
 三级筛选管线:
   Stage 1 (初筛): 币龄≤3天、当前价≤$0.00002、持币地址粗筛 — 仅用 search API 批量数据
   Stage 2 (详情筛): 社交媒体≥1、持币(>1h:≥60,≤1h:≥30)、总量=10亿、当前价分段 — detail API
-  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.00002(>1h)、价在最高价40%~90%、现价比底价高10%~50%(>1h,排除首根K线) — DexScreener+GT
+  Stage 3 (K线筛): 历史最高价≤$0.00004、前2h最高价≤$0.00002(>1h)、价在最高价40%~90%、现价比底价高10%~100%(>1h,排除首根K线) — DexScreener+GT
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ MAX_EARLY_HIGH_PRICE = 0.00002         # 前2小时最高价上限 (USD, 币龄>
 PRICE_RATIO_LOW = 0.4                  # 当前价 ≥ 最高价 * 40%
 PRICE_RATIO_HIGH = 0.9                 # 当前价 ≤ 最高价 * 90%
 FLOOR_RATIO_LOW = 0.1                  # 现价比底价高 ≥ 10% (币龄>1h, 排除首根K线)
-FLOOR_RATIO_HIGH = 0.5                 # 现价比底价高 ≤ 50% (币龄>1h, 排除首根K线)
+FLOOR_RATIO_HIGH = 1.0                 # 现价比底价高 ≤ 100% (币龄>1h, 排除首根K线)
 HOLDERS_THRESHOLD_OLD = 60             # 币龄 > 1h 时持币地址数阈值
 HOLDERS_THRESHOLD_YOUNG = 30           # 币龄 ≤ 1h 时持币地址数阈值
 MIN_SOCIAL_COUNT = 1                   # 最少关联社交媒体数
@@ -519,7 +519,7 @@ def calc_first_2h_max(candles: list[list], create_ts_sec: int) -> float | None:
 def calc_floor_price(candles: list[list], create_ts_sec: int) -> float | None:
     """
     计算底价: 排除第1根1小时K线后, 所有K线的最低价中的最小值。
-    用于币龄>1h的代币, 判断现价是否在底价之上10%~50%。
+    用于币龄>1h的代币, 判断现价是否在底价之上10%~100%。
     """
     if not candles:
         return None
@@ -621,7 +621,7 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
     """
     Stage 3 K线筛 — 两阶段: DS快筛(现价) → GT精筛(K线)
     条件: ATH≤$0.00004, 前2h最高(>1h)≤$0.00002, 现价/ATH在40%~90%,
-          现价比底价高10%~50%(币龄>1h,排除首根K线)
+          现价比底价高10%~100%(币龄>1h,排除首根K线)
     """
     global _gt_rate_delay
 
@@ -719,11 +719,11 @@ def stage3_kline(candidates: list[dict], hotspots: list[dict]) -> list[dict]:
                          name, ratio * 100)
                 continue
 
-        # 底价检查: 现价比底价高10%~50% (币龄>1h, 排除首根K线)
+        # 底价检查: 现价比底价高10%~100% (币龄>1h, 排除首根K线)
         if age_hours > 1 and floor_price and floor_price > 0 and current_price:
             floor_ratio = (current_price - floor_price) / floor_price
             if floor_ratio < FLOOR_RATIO_LOW or floor_ratio > FLOOR_RATIO_HIGH:
-                log.info("  Stage3-B: %s — 现价比底价高 %.1f%%, 不在 10%%~50%%, 跳过",
+                log.info("  Stage3-B: %s — 现价比底价高 %.1f%%, 不在 10%%~100%%, 跳过",
                          name, floor_ratio * 100)
                 continue
 
