@@ -128,10 +128,11 @@ def _build_session(proxy_cfg: dict | None = None,
 
 _fm_session: requests.Session = None  # type: ignore
 _gt_session: requests.Session = None  # type: ignore
+_bsc_session: requests.Session = None  # type: ignore
 
 
 def _ensure_sessions():
-    global _fm_session, _gt_session
+    global _fm_session, _gt_session, _bsc_session
     if _fm_session is None:
         try:
             cfg = load_config()
@@ -140,6 +141,7 @@ def _ensure_sessions():
             proxy = None
         _fm_session = _build_session(proxy, FM_HEADERS)
         _gt_session = _build_session(proxy, GT_HEADERS)
+        _bsc_session = _build_session(proxy, DS_HEADERS)
 
 
 # ===================================================================
@@ -397,24 +399,59 @@ def fm_ticker_prices() -> dict[str, float]:
 
 
 # ===================================================================
-#  BSCScan API — 链上真实持仓地址数
+#  BSCScan API — 统一请求封装
 # ===================================================================
-def bscscan_holder_count(token_address: str, api_key: str) -> int | None:
-    """通过 BSCScan API 获取链上真实持仓地址数"""
+BSCSCAN_TIMEOUT = 15  # BSCScan 统一超时 (秒)
+BSCSCAN_MAX_RETRIES = 2  # BSCScan 最大重试次数
+
+
+def _bscscan_get(params: dict, api_key: str,
+                 timeout: int = BSCSCAN_TIMEOUT) -> dict | None:
+    """
+    BSCScan API 统一 GET 请求封装
+    自带重试、429 处理、超时控制
+    返回: 解析后的 JSON dict, 失败返回 None
+    """
     if not api_key:
         return None
     _ensure_sessions()
-    try:
-        r = _gt_session.get(BSCSCAN_API, params={
-            "module": "token", "action": "tokenholdercount",
-            "contractaddress": token_address, "apikey": api_key,
-        }, timeout=8)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("status") == "1" and d.get("result"):
+    params = {**params, "apikey": api_key}
+    for attempt in range(BSCSCAN_MAX_RETRIES + 1):
+        try:
+            r = _bsc_session.get(BSCSCAN_API, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 3 * (attempt + 1)
+                log.warning("BSCScan 429, 等待 %ds (%d/%d)",
+                            wait, attempt + 1, BSCSCAN_MAX_RETRIES + 1)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ReadTimeout:
+            if attempt < BSCSCAN_MAX_RETRIES:
+                log.debug("BSCScan 超时, 重试 (%d/%d)", attempt + 1, BSCSCAN_MAX_RETRIES)
+                time.sleep(2)
+                continue
+            log.warning("BSCScan 超时, 已达最大重试次数")
+        except Exception as e:
+            log.debug("BSCScan 请求异常: %s", e)
+            if attempt < BSCSCAN_MAX_RETRIES:
+                time.sleep(2)
+                continue
+    return None
+
+
+def bscscan_holder_count(token_address: str, api_key: str) -> int | None:
+    """通过 BSCScan API 获取链上真实持仓地址数"""
+    d = _bscscan_get({
+        "module": "token", "action": "tokenholdercount",
+        "contractaddress": token_address,
+    }, api_key)
+    if d and d.get("status") == "1" and d.get("result"):
+        try:
             return int(d["result"])
-    except Exception:
-        pass
+        except (ValueError, TypeError):
+            pass
     return None
 
 
@@ -454,21 +491,12 @@ KNOWN_EXCLUDE_ADDRESSES = {
 
 def bscscan_get_token_creator(token_address: str, api_key: str) -> str | None:
     """通过 BSCScan API 获取代币合约创建者地址"""
-    if not api_key:
-        return None
-    _ensure_sessions()
-    try:
-        # 查询合约创建交易
-        r = _gt_session.get(BSCSCAN_API, params={
-            "module": "contract", "action": "getcontractcreation",
-            "contractaddresses": token_address, "apikey": api_key,
-        }, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("status") == "1" and d.get("result"):
-            return d["result"][0].get("contractCreator", "").lower()
-    except Exception as e:
-        log.debug("bscscan_get_token_creator [%s]: %s", token_address[:16], e)
+    d = _bscscan_get({
+        "module": "contract", "action": "getcontractcreation",
+        "contractaddresses": token_address,
+    }, api_key)
+    if d and d.get("status") == "1" and d.get("result"):
+        return d["result"][0].get("contractCreator", "").lower()
     return None
 
 
@@ -476,46 +504,29 @@ def bscscan_get_token_transfers(token_address: str, address: str,
                                 api_key: str, page: int = 1,
                                 offset: int = 100) -> list[dict]:
     """通过 BSCScan API 获取指定地址的代币转账记录"""
-    if not api_key:
-        return []
-    _ensure_sessions()
-    try:
-        r = _gt_session.get(BSCSCAN_API, params={
-            "module": "account", "action": "tokentx",
-            "contractaddress": token_address,
-            "address": address,
-            "page": page, "offset": offset,
-            "sort": "desc", "apikey": api_key,
-        }, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("status") == "1" and d.get("result"):
-            return d["result"]
-    except Exception as e:
-        log.debug("bscscan_get_token_transfers [%s/%s]: %s",
-                  token_address[:16], address[:16], e)
+    d = _bscscan_get({
+        "module": "account", "action": "tokentx",
+        "contractaddress": token_address,
+        "address": address,
+        "page": page, "offset": offset,
+        "sort": "desc",
+    }, api_key)
+    if d and d.get("status") == "1" and d.get("result"):
+        return d["result"]
     return []
 
 
 def bscscan_get_internal_txs(address: str, api_key: str,
                               page: int = 1, offset: int = 50) -> list[dict]:
     """通过 BSCScan API 获取指定地址的内部交易 (用于检测流动性操作)"""
-    if not api_key:
-        return []
-    _ensure_sessions()
-    try:
-        r = _gt_session.get(BSCSCAN_API, params={
-            "module": "account", "action": "tokentx",
-            "address": address,
-            "page": page, "offset": offset,
-            "sort": "desc", "apikey": api_key,
-        }, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("status") == "1" and d.get("result"):
-            return d["result"]
-    except Exception as e:
-        log.debug("bscscan_get_internal_txs [%s]: %s", address[:16], e)
+    d = _bscscan_get({
+        "module": "account", "action": "tokentx",
+        "address": address,
+        "page": page, "offset": offset,
+        "sort": "desc",
+    }, api_key)
+    if d and d.get("status") == "1" and d.get("result"):
+        return d["result"]
     return []
 
 
@@ -778,15 +789,12 @@ def _discover_smart_money_from_top_holders(cfg: dict, api_key: str) -> set[str]:
         for token_addr in hot_tokens:
             time.sleep(0.3)
             try:
-                r = _gt_session.get(BSCSCAN_API, params={
+                d = _bscscan_get({
                     "module": "token", "action": "tokenholderlist",
                     "contractaddress": token_addr,
                     "page": 1, "offset": 50,
-                    "apikey": api_key,
-                }, timeout=10)
-                r.raise_for_status()
-                d = r.json()
-                if d.get("status") == "1" and d.get("result"):
+                }, api_key)
+                if d and d.get("status") == "1" and d.get("result"):
                     for holder in d["result"]:
                         addr = (holder.get("TokenHolderAddress") or "").lower()
                         if (addr and len(addr) == 42
@@ -843,22 +851,15 @@ def analyze_smart_money_behavior(token_address: str, smart_addresses: set[str],
     sellers = set()
 
     # 获取该代币的最近转账记录 (全量, 不限地址)
-    _ensure_sessions()
-    try:
-        r = _gt_session.get(BSCSCAN_API, params={
-            "module": "account", "action": "tokentx",
-            "contractaddress": token_address,
-            "page": 1, "offset": 200,
-            "sort": "desc", "apikey": api_key,
-        }, timeout=10)
-        r.raise_for_status()
-        d = r.json()
-        if d.get("status") != "1" or not d.get("result"):
-            return result
-        all_transfers = d["result"]
-    except Exception as e:
-        log.debug("analyze_smart_money [%s]: %s", token_address[:16], e)
+    d = _bscscan_get({
+        "module": "account", "action": "tokentx",
+        "contractaddress": token_address,
+        "page": 1, "offset": 200,
+        "sort": "desc",
+    }, api_key)
+    if not d or d.get("status") != "1" or not d.get("result"):
         return result
+    all_transfers = d["result"]
 
     for tx in all_transfers:
         from_addr = (tx.get("from") or "").lower()
@@ -1524,6 +1525,7 @@ def main():
             cfg = load_config()
             _fm_session = _build_session(cfg.get("proxy"), FM_HEADERS)
             _gt_session = _build_session(cfg.get("proxy"), GT_HEADERS)
+            _bsc_session = _build_session(cfg.get("proxy"), DS_HEADERS)
             scan_once(cfg)
             interval = cfg.get("scan_interval_minutes", 15)
             log.info("下次扫描: %d 分钟后", interval)
