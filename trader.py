@@ -4,6 +4,7 @@ BSC 自动交易模块 - PancakeSwap V2
 卖出:
   1. 回撤止盈: 盈利超过20%, 当价格回撤到 (买入价+最高价)/2 时卖出
   2. 超期清仓: 持仓超过2天且未盈利时卖出
+  3. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
 from __future__ import annotations
@@ -1011,6 +1012,45 @@ def has_open_position(conn: sqlite3.Connection, token_address: str) -> bool:
     return row is not None
 
 
+def is_in_cooldown(conn: sqlite3.Connection, token_address: str,
+                   trading_cfg: dict) -> tuple[bool, str]:
+    """
+    检查该代币是否在平仓冷却期内。
+    盈利平仓: 冷却 rebuy_cooldown_profit_hours (默认12h)
+    亏损平仓: 冷却 rebuy_cooldown_loss_hours (默认48h)
+    返回: (是否冷却中, 原因描述)
+    """
+    profit_cd_h = trading_cfg.get("rebuy_cooldown_profit_hours", 12)
+    loss_cd_h = trading_cfg.get("rebuy_cooldown_loss_hours", 48)
+    now_ms = int(time.time() * 1000)
+
+    # 查询该代币最近一次已平仓记录
+    row = conn.execute(
+        """SELECT sell_time, pnl_pct FROM positions
+           WHERE LOWER(token_address) = ? AND status = 'CLOSED'
+           ORDER BY sell_time DESC LIMIT 1""",
+        (token_address.lower(),)
+    ).fetchone()
+    if not row:
+        return False, ""
+
+    sell_time, pnl_pct = row
+    if sell_time is None:
+        return False, ""
+
+    elapsed_h = (now_ms - sell_time) / (3600 * 1000)
+    if pnl_pct is not None and pnl_pct > 0:
+        # 盈利平仓
+        if elapsed_h < profit_cd_h:
+            return True, f"盈利平仓后冷却中({elapsed_h:.1f}h/{profit_cd_h}h)"
+    else:
+        # 亏损平仓
+        if elapsed_h < loss_cd_h:
+            return True, f"亏损平仓后冷却中({elapsed_h:.1f}h/{loss_cd_h}h)"
+
+    return False, ""
+
+
 def close_position(conn: sqlite3.Connection, position_id: int,
                    sell_price_usd: float, sell_tx: str, sell_reason: str,
                    buy_price_usd: float):
@@ -1242,6 +1282,12 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         # 检查是否已有持仓
         if has_open_position(conn, addr):
             log.info("跳过 %s: 已有持仓", name)
+            continue
+
+        # 检查平仓冷却期
+        in_cd, cd_reason = is_in_cooldown(conn, addr, trading_cfg)
+        if in_cd:
+            log.info("跳过 %s: %s", name, cd_reason)
             continue
 
         # 计算买入金额

@@ -35,6 +35,8 @@
         "min_buy_usd": 5,
         "max_buy_usd": 100,
         "tp_trigger_pct": 20,
+        "rebuy_cooldown_profit_hours": 12,
+        "rebuy_cooldown_loss_hours": 48,
         "expire_hours": 48,
         "monitor_interval_sec": 60
     }
