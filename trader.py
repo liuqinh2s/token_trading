@@ -2,7 +2,7 @@
 BSC 自动交易模块 - PancakeSwap V2
 买入: 扫描筛选通过后自动买入
 卖出:
-  1. 回撤止盈: 盈利超过100%, 当价格回撤到 (买入价+最高价)/2 时卖出
+  1. 回撤止盈: 盈利超过20%, 当价格回撤到 (买入价+最高价)/2 时卖出
   2. 超期清仓: 持仓超过2天且未盈利时卖出
 """
 
@@ -1049,7 +1049,7 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 回撤止盈: 盈利超过100%, 价格回撤到 (buy_price + max_price) / 2
+      1. 回撤止盈: 盈利超过20%, 价格回撤到 (buy_price + max_price) / 2
       2. 超期清仓: 持仓超过2天且未盈利
     """
     trading_cfg = cfg.get("trading", {})
@@ -1062,7 +1062,7 @@ def check_sell_conditions(pos: dict, current_price: float,
     profit_pct = (current_price - buy_price) / buy_price * 100
 
     # 策略1: 回撤止盈
-    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 100)  # 触发止盈的盈利百分比
+    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 20)  # 触发止盈的盈利百分比
     max_profit_pct = (max_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
 
     if max_profit_pct >= tp_trigger_pct:
