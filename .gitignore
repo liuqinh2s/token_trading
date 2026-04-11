@@ -1,4 +1,5 @@
 config.json
+queue.json
 *.log
 *.db
 *.db-shm

@@ -2,11 +2,12 @@
 
 ## 项目概述
 
-BSC Token Scanner v4 — 扫描 four.meme 平台上新发行的 BSC 代币，四级管线智能筛选后推送到 Telegram，可选自动交易。
+BSC Token Scanner v5 — 链上发现 + 队列淘汰制，扫描 four.meme 平台上新发行的 BSC 代币，智能筛选后推送到 Telegram，可选自动交易。
 
 - 主要语言：Python
 - 入口文件：scanner.py（扫描器）、trader.py（交易模块）
 - 配置文件：config.json（运行时配置，不入库）、config.example.json（配置模板）
+- 队列状态：queue.json（代币队列 + 淘汰记录 + lastBlock）
 - 数据库：tokens.db（SQLite，已推送代币记录）
 - 日志：scanner.log
 
@@ -35,8 +36,21 @@ BSC Token Scanner v4 — 扫描 four.meme 平台上新发行的 BSC 代币，四
 
 ## 关键架构约束
 
-- 四级筛选管线逐级收窄：初筛 → 详情筛 → K线筛 → 链上行为筛
+- v5 架构: 链上发现 + 队列淘汰制 (替代旧版四级管线)
+- 代币发现: BSC RPC eth_getLogs 扫链上 TokenCreated 事件, 100% 覆盖
+- 队列淘汰: 持续跟踪代币, 满足淘汰条件永久剔除
+- 精筛: 对存活代币执行 K线/价格/持币数/钱包行为 条件筛选
+- BSCScan API 使用 Etherscan V2 (api.etherscan.io/v2/api?chainid=56)
 - API 调用需注意限流：DexScreener ~300 req/min、GeckoTerminal ~30 req/min、BSCScan ~5 req/s
 - GeckoTerminal 作为 DexScreener 的备选数据源，需实现自动退避重试
 - 敏感信息（私钥、API Key、Bot Token）不得硬编码，通过环境变量或 config.json 传入
 - config.json 已在 .gitignore 中，不要提交到版本库
+
+## 跨项目筛选策略同步（必须遵守）
+
+本项目 (`token_trading`) 与姊妹项目 `token_scanner` 共用同一套筛选策略（入场筛、淘汰条件、精筛阈值、持币数查询方案等）。两个项目语言不同（Python vs JavaScript），但筛选逻辑和阈值必须完全一致。
+
+- 任何筛选策略的改动（常量阈值、淘汰条件、精筛逻辑、数据源切换等），必须同时修改 `token_trading/scanner.py` 和 `token_scanner/scripts/scan.js`
+- 修改前先对比两边当前实现，确认差异点，避免遗漏
+- 对应关系：`token_trading/scanner.py` 顶部常量区 ↔ `token_scanner/scripts/scan.js` 顶部 Constants 区；`elimination_check` ↔ `eliminationCheck`；`quality_filter` ↔ `qualityFilter`；`admission_filter` ↔ `admissionFilter`
+- 文件头注释中的淘汰条件/精筛条件描述也要同步更新
