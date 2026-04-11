@@ -1653,7 +1653,7 @@ def format_message(results: list[dict]) -> str:
         lines.append(
             f"🌐 <a href='https://four.meme/token/{addr}'>four.meme</a>"
             f" | <a href='https://bscscan.com/token/{addr}'>BscScan</a>"
-            f" | <a href='https://dexscreener.com/bsc/{addr}'>DexScreener</a>"
+            f" | <a href='https://web3.binance.com/zh-CN/token/bsc/{addr}'>币安钱包</a>"
         )
         lines.append("")
 
