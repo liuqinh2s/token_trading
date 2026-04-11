@@ -20,7 +20,7 @@ v2 架构: 链上发现 + 队列淘汰制
   - 币龄 > 5min 且最高持币数 < 3
   - 币龄 > 15min 且最高持币数 < 5
   - 币龄 > 1h 且最高持币数 < 10
-  - 币龄 > 72h
+  - 币龄 > 48h
 
 精筛排除 (钱包行为):
   - 开发者减仓/清仓/撤流动性
@@ -106,7 +106,7 @@ GT_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 DS_HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 
 # 精筛阈值
-MAX_AGE_HOURS = 72
+MAX_AGE_HOURS = 48
 SCAN_INTERVAL_MIN = 15
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 MAX_CURRENT_PRICE_OLD = 0.000023       # 币龄 > 1h 当前价格上限 (USD)

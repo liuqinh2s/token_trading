@@ -1089,7 +1089,8 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 回撤止盈: 盈利超过20%, 价格回撤到 (buy_price + max_price) / 2
+      1. 回撤止盈: 盈利超过100%, 价格回撤到 (buy_price + max_price) / 2
+         - 如果回撤时当前价格低于买入价 (不盈利), 不卖出, 返回 RESET 信号
       2. 超期清仓: 持仓超过2天且未盈利
     """
     trading_cfg = cfg.get("trading", {})
@@ -1102,13 +1103,16 @@ def check_sell_conditions(pos: dict, current_price: float,
     profit_pct = (current_price - buy_price) / buy_price * 100
 
     # 策略1: 回撤止盈
-    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 20)  # 触发止盈的盈利百分比
+    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 100)  # 触发止盈的盈利百分比
     max_profit_pct = (max_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
 
     if max_profit_pct >= tp_trigger_pct:
         # 已触发止盈条件, 检查回撤
         sell_threshold = (buy_price + max_price) / 2
         if current_price <= sell_threshold:
+            # 回撤到阈值, 但如果当前不盈利则不卖出, 重置止盈状态
+            if current_price <= buy_price:
+                return False, "RESET_TP"
             return True, f"TRAILING_TP (最高盈利 {max_profit_pct:.0f}%, 当前 {profit_pct:.0f}%)"
 
     # 策略2: 超期清仓
@@ -1390,6 +1394,13 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 # 检查卖出条件
                 pos_updated = {**pos, "max_price_usd": max_price}
                 should_sell, reason = check_sell_conditions(pos_updated, current_price, cfg)
+
+                # 止盈回撤但不盈利: 重置止盈状态, 等下一个触发点
+                if not should_sell and reason == "RESET_TP":
+                    log.info("  %s: 止盈回撤但未盈利, 重置止盈状态 (最高 $%.12f → 当前 $%.12f)",
+                             name, max_price, current_price)
+                    update_position_price(conn, pos["id"], current_price, current_price)
+                    continue
 
                 if should_sell:
                     log.info("触发卖出 %s: %s", name, reason)
