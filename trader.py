@@ -1497,7 +1497,7 @@ SKIP_TOKENS = {
 
 def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
     """
-    扫描钱包中所有 BEP-20 代币, 返回价值 > $1 的持仓列表 (排除 BNB/USDT 等稳定币)
+    扫描钱包中所有 BEP-20 代币, 返回价值 > $0.1 的持仓列表 (排除 BNB/USDT 等稳定币)
 
     代币地址来源 (多源合并):
       1. 数据库历史持仓记录 (OPEN + CLOSED)
@@ -1617,7 +1617,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
                 continue
 
             value_usd = token_amount * price_usd
-            if value_usd < 1.0:
+            if value_usd < 0.1:
                 continue
 
             # 获取代币名称
@@ -1648,7 +1648,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
 
         time.sleep(0.3)
 
-    log.info("持仓同步: 发现 %d 个价值 > $1 的链上持仓", len(holdings))
+    log.info("持仓同步: 发现 %d 个价值 > $0.1 的链上持仓", len(holdings))
     return holdings
 
 
