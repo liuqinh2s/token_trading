@@ -403,6 +403,7 @@ def fm_detail(address: str) -> dict | None:
             "progress": float(tp.get("progress", 0) or raw.get("progress", 0) or 0),
             "day1Vol": float(tp.get("day1Vol", 0) or raw.get("day1Vol", 0) or 0),
             "liquidity": float(tp.get("liquidity", 0) or 0),
+            "raisedAmount": float(tp.get("raisedAmount", 0) or raw.get("raisedAmount", 0) or 0),
             "launchTime": launch_ts,
         }
     except Exception as e:
@@ -1676,6 +1677,7 @@ def elimination_check(queue: list[dict], now_ms: int,
             t["socialCount"] = detail["socialCount"]
             t["socialLinks"] = detail["socialLinks"]
             t["day1Vol"] = detail.get("day1Vol") or t.get("day1Vol", 0)
+            t["raisedAmount"] = detail.get("raisedAmount") or t.get("raisedAmount", 0)
             # 用 detail API 的 launchTime 修正 createdAt (队列中的值可能不准)
             if detail.get("launchTime") and detail["launchTime"] > 0:
                 t["createdAt"] = detail["launchTime"]
@@ -2043,6 +2045,7 @@ def scan_once(cfg: dict) -> None:
                 "peakHolders": detail["holders"],
                 "liquidity": detail.get("liquidity", 0),
                 "peakLiquidity": detail.get("liquidity", 0),
+                "raisedAmount": detail.get("raisedAmount", 0),
                 "progress": detail.get("progress", 0),
                 "day1Vol": detail.get("day1Vol", 0),
                 "consecDrops": 0,
