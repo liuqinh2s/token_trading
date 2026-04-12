@@ -134,7 +134,7 @@ MAX_AGE_HOURS = 48
 SCAN_INTERVAL_MIN = 1                  # 1 分钟一轮
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 QUALITY_MAX_AGE_MIN = 5                # 精筛: 币龄 ≤ 5 分钟
-QUALITY_MIN_HOLDERS = 10               # 精筛: 持币地址数 ≥ 10
+QUALITY_MIN_HOLDERS = 5                # 精筛: 持币地址数 ≥ 5
 QUALITY_MAX_PRICE = 0.000006           # 精筛: 当前价 < $0.000006
 COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记
 MIN_SOCIAL_COUNT = 1                   # 最少关联社交媒体数
@@ -1799,7 +1799,7 @@ def quality_filter(candidates: list[dict], now_ms: int) -> list[dict]:
     """
     精筛: 极简条件 + 趋势确认, 以快致胜
     条件:
-      - 持币地址数 ≥ 10
+      - 持币地址数 ≥ 5
       - 币龄 ≤ 5 分钟
       - 当前价 < $0.000006
       - 持币地址数近 2 轮扫描递增 (首轮入队代币豁免)
