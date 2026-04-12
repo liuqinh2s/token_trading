@@ -38,6 +38,7 @@
         "rebuy_cooldown_profit_hours": 12,
         "rebuy_cooldown_loss_hours": 48,
         "expire_hours": 48,
-        "monitor_interval_sec": 60
+        "monitor_interval_sec": 60,
+        "max_price_deviation": 3.0
     }
 }

@@ -1255,6 +1255,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     对筛选通过的代币执行自动买入
     tokens: [(token_dict, detail_dict), ...]
     自动检测交易场所: bonding curve (PUBLISH) 或 PancakeSwap (TRADE)
+    买入前检查实时价格, 偏离精筛价格过大则放弃
     """
     trading_cfg = cfg.get("trading", {})
     if not trading_cfg.get("enabled", False):
@@ -1262,6 +1263,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
 
     slippage = trading_cfg.get("slippage_pct", 12.0)
     max_positions = trading_cfg.get("max_positions", 5)
+    # 价格保护: 实时价格偏离精筛价格的最大倍数 (默认 3 倍)
+    max_price_deviation = trading_cfg.get("max_price_deviation", 3.0)
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
 
@@ -1294,6 +1297,22 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         if in_cd:
             log.info("跳过 %s: %s", name, cd_reason)
             continue
+
+        # 价格保护: 买入前查实时价格, 和精筛价格对比
+        scan_price = detail.get("price", 0)
+        if scan_price > 0 and max_price_deviation > 0:
+            realtime_price = get_token_price_usd_auto(addr, bnb_price_usd)
+            if realtime_price and realtime_price > 0:
+                deviation = realtime_price / scan_price
+                if deviation > max_price_deviation:
+                    log.warning("跳过 %s: 价格偏离过大 (精筛 $%.2e → 实时 $%.2e, %.1f倍, 上限 %.1f倍)",
+                                name, scan_price, realtime_price, deviation, max_price_deviation)
+                    continue
+                log.info("价格检查 %s: 精筛 $%.2e → 实时 $%.2e (%.1f倍, OK)",
+                         name, scan_price, realtime_price, deviation)
+            else:
+                log.warning("跳过 %s: 无法获取实时价格, 放弃买入", name)
+                continue
 
         # 计算买入金额
         buy_usdt = calculate_buy_amount(cfg, bnb_price_usd)
