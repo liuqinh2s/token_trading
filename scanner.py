@@ -25,6 +25,7 @@ v6 架构: 极速扫描 (1 分钟一轮)
   - 进度 < 5% 且币龄 > 4h
   - 币龄 > 15min 且最高持币数 < 3
   - 币龄 > 1h 且最高持币数 < 5
+  - 币龄 > 5min (超精筛窗口, 直接淘汰省 API)
   - 币龄 > 48h
 
 精筛条件 (极简三条件):
@@ -1611,16 +1612,27 @@ def elimination_check(queue: list[dict], now_ms: int,
 
     # 1. 币龄淘汰 (无需 API)
     max_age_ms = MAX_AGE_HOURS * 3600 * 1000
+    max_quality_age_ms = QUALITY_MAX_AGE_MIN * 60 * 1000  # 精筛币龄上限 (5min)
     age_filtered = []
+    over_age_count = 0
+    over_quality_age_count = 0
     for t in queue:
-        if now_ms - t.get("createdAt", 0) > max_age_ms:
+        age_ms = now_ms - t.get("createdAt", 0)
+        if age_ms > max_age_ms:
             eliminated.append({**t, "eliminatedAt": now_ms,
                                "elimReason": f"币龄>{MAX_AGE_HOURS}h"})
+            over_age_count += 1
+        elif age_ms > max_quality_age_ms:
+            eliminated.append({**t, "eliminatedAt": now_ms,
+                               "elimReason": f"币龄>{QUALITY_MAX_AGE_MIN}min (超精筛窗口)"})
+            over_quality_age_count += 1
         else:
             age_filtered.append(t)
 
-    if eliminated:
-        log.info("淘汰: 币龄超限 %d 个", len(eliminated))
+    if over_age_count:
+        log.info("淘汰: 币龄>%dh %d 个", MAX_AGE_HOURS, over_age_count)
+    if over_quality_age_count:
+        log.info("淘汰: 币龄>%dmin %d 个 (超精筛窗口)", QUALITY_MAX_AGE_MIN, over_quality_age_count)
 
     if not age_filtered:
         return survivors, eliminated
