@@ -32,8 +32,8 @@ v6 架构: 极速扫描 (1 分钟一轮)
   - 持币地址数 ≥ 10
   - 币龄 ≤ 5 分钟
   - 当前价 < $0.000006
-  - 持币地址数近 2 轮扫描递增 (首轮入队豁免)
-  - 价格近 2 轮扫描递增 (首轮入队豁免)
+  - 持币地址数近 2 轮扫描递增 (不足 2 轮不通过)
+  - 价格近 2 轮扫描递增 (不足 2 轮不通过)
 """
 
 from __future__ import annotations
@@ -1814,8 +1814,8 @@ def quality_filter(candidates: list[dict], now_ms: int) -> list[dict]:
       - 持币地址数 ≥ 5
       - 币龄 ≤ 5 分钟
       - 当前价 < $0.000006
-      - 持币地址数近 2 轮扫描递增 (首轮入队代币豁免)
-      - 价格近 2 轮扫描递增 (首轮入队代币豁免)
+      - 持币地址数近 2 轮扫描递增 (不足 2 轮不通过)
+      - 价格近 2 轮扫描递增 (不足 2 轮不通过)
     """
     results = []
     max_age_ms = QUALITY_MAX_AGE_MIN * 60 * 1000
@@ -1838,14 +1838,14 @@ def quality_filter(candidates: list[dict], now_ms: int) -> list[dict]:
         if current_price <= 0 or current_price >= QUALITY_MAX_PRICE:
             continue
 
-        # 条件 4: 持币地址数近 2 轮递增 (历史不足 2 轮则豁免)
+        # 条件 4: 持币地址数近 2 轮递增 (不足 2 轮不通过)
         h_hist = t.get("holdersHistory", [])
-        if len(h_hist) >= 2 and h_hist[-1] <= h_hist[-2]:
+        if len(h_hist) < 2 or h_hist[-1] <= h_hist[-2]:
             continue
 
-        # 条件 5: 价格近 2 轮递增 (历史不足 2 轮则豁免)
+        # 条件 5: 价格近 2 轮递增 (不足 2 轮不通过)
         p_hist = t.get("priceHistory", [])
-        if len(p_hist) >= 2 and p_hist[-1] <= p_hist[-2]:
+        if len(p_hist) < 2 or p_hist[-1] <= p_hist[-2]:
             continue
 
         results.append(t)
