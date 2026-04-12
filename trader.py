@@ -1262,28 +1262,15 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         return
 
     slippage = trading_cfg.get("slippage_pct", 12.0)
-    max_positions = trading_cfg.get("max_positions", 5)
     # 价格保护: 实时价格偏离精筛价格的最大倍数 (默认 3 倍)
     max_price_deviation = trading_cfg.get("max_price_deviation", 3.0)
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
 
-    # 检查当前持仓数
-    open_positions = get_open_positions(conn)
-    if len(open_positions) >= max_positions:
-        log.info("已达最大持仓数 %d/%d, 跳过买入", len(open_positions), max_positions)
-        conn.close()
-        return
-
     # BNB 余额不足时自动补充 (gas 费需要 BNB)
     _ensure_bnb_for_gas(bnb_price_usd, slippage)
 
     for tk, detail in tokens:
-        # 每次循环重新检查持仓数
-        current_open = len(get_open_positions(conn))
-        if current_open >= max_positions:
-            log.info("已达最大持仓数 %d/%d, 停止买入", current_open, max_positions)
-            break
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
 

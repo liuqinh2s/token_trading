@@ -1923,7 +1923,7 @@ def print_console(msg: str) -> None:
 #  主扫描流程
 # ===================================================================
 _scan_count = 0                    # 扫描轮次计数, 用于持仓同步降频
-_SYNC_EVERY_N_SCANS = 10          # 每 N 轮扫描同步一次持仓
+_SYNC_EVERY_N_SCANS = 15          # 每 15 轮扫描同步一次持仓 (约 15 分钟)
 
 def scan_once(cfg: dict) -> None:
     global _scan_count
