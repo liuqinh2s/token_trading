@@ -1383,6 +1383,17 @@ def monitor_positions(cfg_loader, bnb_price_func):
                     log.debug("监控: 无法获取 %s 价格", name)
                     continue
 
+                # 计算持仓价值, 低于 $0.1 跳过监控
+                try:
+                    decimals = pos.get("token_decimals", 18)
+                    token_amount = int(pos.get("buy_amount", 0)) / (10 ** decimals)
+                    position_value = token_amount * current_price
+                    if position_value < 0.1:
+                        log.debug("监控: 跳过 %s (价值 $%.4f < $0.1)", name, position_value)
+                        continue
+                except Exception:
+                    pass  # 无法计算价值时继续监控
+
                 # 更新最高价
                 max_price = max(pos["max_price_usd"] or 0, current_price)
                 update_position_price(conn, pos["id"], current_price, max_price)
