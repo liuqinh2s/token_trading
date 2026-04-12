@@ -30,7 +30,9 @@ v6 架构: 极速扫描 (1 分钟一轮)
 精筛条件 (极简三条件):
   - 持币地址数 ≥ 10
   - 币龄 ≤ 5 分钟
-  - 当前价 < $0.000004
+  - 当前价 < $0.000006
+  - 持币地址数近 2 轮扫描递增 (首轮入队豁免)
+  - 价格近 2 轮扫描递增 (首轮入队豁免)
 """
 
 from __future__ import annotations
@@ -133,7 +135,7 @@ SCAN_INTERVAL_MIN = 1                  # 1 分钟一轮
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 QUALITY_MAX_AGE_MIN = 5                # 精筛: 币龄 ≤ 5 分钟
 QUALITY_MIN_HOLDERS = 10               # 精筛: 持币地址数 ≥ 10
-QUALITY_MAX_PRICE = 0.000004           # 精筛: 当前价 < $0.000004
+QUALITY_MAX_PRICE = 0.000006           # 精筛: 当前价 < $0.000006
 COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记
 MIN_SOCIAL_COUNT = 1                   # 最少关联社交媒体数
 
@@ -1712,6 +1714,11 @@ def elimination_check(queue: list[dict], now_ms: int,
         t["peakHolders"] = max(t.get("peakHolders", 0), current_holders)
         t["peakLiquidity"] = max(t.get("peakLiquidity", 0), current_liq)
 
+        # 记录价格历史 (只保留最近 5 轮, 与 holdersHistory 对齐)
+        price_hist = t.get("priceHistory", [])
+        price_hist.append(current_price)
+        t["priceHistory"] = price_hist[-5:]
+
         # 连续下跌计数
         last_price = t.get("lastPrice", 0)
         if last_price > 0 and current_price < last_price:
@@ -1790,11 +1797,13 @@ def elimination_check(queue: list[dict], now_ms: int,
 # ===================================================================
 def quality_filter(candidates: list[dict], now_ms: int) -> list[dict]:
     """
-    精筛: 极简三条件, 以快致胜
+    精筛: 极简条件 + 趋势确认, 以快致胜
     条件:
       - 持币地址数 ≥ 10
       - 币龄 ≤ 5 分钟
-      - 当前价 < $0.000004
+      - 当前价 < $0.000006
+      - 持币地址数近 2 轮扫描递增 (首轮入队代币豁免)
+      - 价格近 2 轮扫描递增 (首轮入队代币豁免)
     """
     results = []
     max_age_ms = QUALITY_MAX_AGE_MIN * 60 * 1000
@@ -1815,6 +1824,16 @@ def quality_filter(candidates: list[dict], now_ms: int) -> list[dict]:
 
         # 条件 3: 当前价 < $0.000004
         if current_price <= 0 or current_price >= QUALITY_MAX_PRICE:
+            continue
+
+        # 条件 4: 持币地址数近 2 轮递增 (历史不足 2 轮则豁免)
+        h_hist = t.get("holdersHistory", [])
+        if len(h_hist) >= 2 and h_hist[-1] <= h_hist[-2]:
+            continue
+
+        # 条件 5: 价格近 2 轮递增 (历史不足 2 轮则豁免)
+        p_hist = t.get("priceHistory", [])
+        if len(p_hist) >= 2 and p_hist[-1] <= p_hist[-2]:
             continue
 
         results.append(t)
@@ -1891,9 +1910,14 @@ def print_console(msg: str) -> None:
 # ===================================================================
 #  主扫描流程
 # ===================================================================
+_scan_count = 0                    # 扫描轮次计数, 用于持仓同步降频
+_SYNC_EVERY_N_SCANS = 10          # 每 N 轮扫描同步一次持仓
+
 def scan_once(cfg: dict) -> None:
+    global _scan_count
+    _scan_count += 1
     log.info("=" * 50)
-    log.info("开始扫描")
+    log.info("开始扫描 (第 %d 轮)", _scan_count)
     log.info("=" * 50)
     max_push = cfg.get("max_push_count", 100)
 
@@ -1905,13 +1929,14 @@ def scan_once(cfg: dict) -> None:
         ticker["BNB"] = 600.0
     log.info("BNB=$%.2f", ticker.get("BNB", 0))
 
-    # 每次扫描前重新同步持仓
+    # 每 N 轮同步一次持仓 (监控线程已持续跟踪, 无需每轮全量同步)
     if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
-        try:
-            bnb_usd = ticker.get("BNB", 600.0)
-            _sync_positions_from_wallet(bnb_usd)
-        except Exception as e:
-            log.warning("扫描前持仓同步失败: %s", e)
+        if _scan_count % _SYNC_EVERY_N_SCANS == 1:
+            try:
+                bnb_usd = ticker.get("BNB", 600.0)
+                _sync_positions_from_wallet(bnb_usd)
+            except Exception as e:
+                log.warning("扫描前持仓同步失败: %s", e)
 
     now_ms = int(time.time() * 1000)
 
@@ -1958,6 +1983,7 @@ def scan_once(cfg: dict) -> None:
                 "day1Vol": detail.get("day1Vol", 0),
                 "consecDrops": 0,
                 "lastPrice": detail["price"],
+                "priceHistory": [detail["price"]],
             })
 
     log.info("入队后: %d 个代币", len(queue_state["tokens"]))

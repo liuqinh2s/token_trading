@@ -1509,46 +1509,47 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
     except Exception as e:
         log.debug("读取数据库历史持仓失败: %s", e)
 
-    # 来源 2: BSCScan tokentx API
-    try:
-        cfg_path = Path(__file__).parent / "config.json"
-        api_key = ""
-        if cfg_path.exists():
+    # 来源 2+3: BSCScan tokentx + addresstokenbalance 并行查询
+    cfg_path = Path(__file__).parent / "config.json"
+    api_key = ""
+    if cfg_path.exists():
+        try:
             with open(cfg_path, "r") as f:
                 api_key = json.load(f).get("bscscan_api_key", "")
+        except Exception:
+            pass
 
-        params = {
-            "module": "account", "action": "tokentx",
-            "address": _wallet_address, "startblock": 0, "endblock": 99999999,
-            "page": 1, "offset": 1000, "sort": "desc",
-        }
-        if api_key:
-            params["apikey"] = api_key
+    def _fetch_tokentx() -> set[str]:
+        """BSCScan tokentx API"""
+        addrs = set()
+        try:
+            params = {
+                "module": "account", "action": "tokentx",
+                "address": _wallet_address, "startblock": 0, "endblock": 99999999,
+                "page": 1, "offset": 1000, "sort": "desc",
+            }
+            if api_key:
+                params["apikey"] = api_key
+            r = req.get("https://api.bscscan.com/api", params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") == "1":
+                for tx in data.get("result", []):
+                    a = (tx.get("contractAddress") or "").lower()
+                    if a and a not in SKIP_TOKENS:
+                        addrs.add(a)
+            if addrs:
+                log.info("持仓同步: 从 BSCScan tokentx 补充 %d 个代币地址", len(addrs))
+        except Exception as e:
+            log.debug("BSCScan tokentx 查询失败: %s", e)
+        return addrs
 
-        r = req.get("https://api.bscscan.com/api", params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        bscscan_count = 0
-        if data.get("status") == "1":
-            for tx in data.get("result", []):
-                addr = (tx.get("contractAddress") or "").lower()
-                if addr and addr not in SKIP_TOKENS:
-                    token_addrs.add(addr)
-                    bscscan_count += 1
-        if bscscan_count > 0:
-            log.info("持仓同步: 从 BSCScan tokentx 补充 %d 个代币地址", bscscan_count)
-    except Exception as e:
-        log.debug("BSCScan tokentx 查询失败: %s", e)
-
-    # 来源 3: BSCScan addresstokenbalance API (直接获取所有持有代币)
-    try:
-        cfg_path = Path(__file__).parent / "config.json"
-        api_key = ""
-        if cfg_path.exists():
-            with open(cfg_path, "r") as f:
-                api_key = json.load(f).get("bscscan_api_key", "")
-
-        if api_key:
+    def _fetch_tokenbalance() -> set[str]:
+        """BSCScan addresstokenbalance API"""
+        addrs = set()
+        if not api_key:
+            return addrs
+        try:
             params3 = {
                 "module": "account", "action": "addresstokenbalance",
                 "address": _wallet_address, "page": 1, "offset": 100,
@@ -1557,17 +1558,23 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
             r3 = req.get("https://api.bscscan.com/api", params=params3, timeout=15)
             r3.raise_for_status()
             data3 = r3.json()
-            balance_count = 0
             if data3.get("status") == "1":
                 for item in data3.get("result", []):
-                    addr = (item.get("TokenAddress") or "").lower()
-                    if addr and addr not in SKIP_TOKENS:
-                        token_addrs.add(addr)
-                        balance_count += 1
-            if balance_count > 0:
-                log.info("持仓同步: 从 BSCScan addresstokenbalance 补充 %d 个代币地址", balance_count)
-    except Exception as e:
-        log.debug("BSCScan addresstokenbalance 查询失败: %s", e)
+                    a = (item.get("TokenAddress") or "").lower()
+                    if a and a not in SKIP_TOKENS:
+                        addrs.add(a)
+            if addrs:
+                log.info("持仓同步: 从 BSCScan addresstokenbalance 补充 %d 个代币地址", len(addrs))
+        except Exception as e:
+            log.debug("BSCScan addresstokenbalance 查询失败: %s", e)
+        return addrs
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=2) as pool:
+        f1 = pool.submit(_fetch_tokentx)
+        f2 = pool.submit(_fetch_tokenbalance)
+        token_addrs.update(f1.result())
+        token_addrs.update(f2.result())
 
     if not token_addrs:
         log.info("持仓同步: 无历史代币记录, 跳过")
