@@ -746,7 +746,8 @@ def get_token_price_usd_auto(token_address: str, bnb_price_usd: float,
 def calculate_buy_amount(cfg: dict, bnb_price_usd: float) -> float:
     """
     计算本次买入的 USDT 数量
-    规则: USDT 余额的 1/20, 但不小于 $5, 不大于 $100
+    规则: USDT 余额的 buy_fraction, 但不小于 min_buy_usd, 不大于 max_buy_usd
+    默认: $1 (小额试水模式)
     返回: USDT 数量 (0 表示余额不足)
     """
     trading_cfg = cfg.get("trading", {})
