@@ -2,7 +2,7 @@
 BSC Token Scanner v6 — 极速扫描, 以快致胜
 数据源: BSC RPC (链上事件) + four.meme API (详情) + DexScreener (价格) + GeckoTerminal (持币数)
 
-v6 架构: 极速扫描 (1 分钟一轮)
+v6 架构: 极速扫描 (15 分钟一轮)
   1. 链上发现 (~1s): BSC RPC eth_getLogs → four.meme V1 合约 TokenCreated 事件 → 新代币地址
   2. 入场筛 (~数秒): four.meme Detail API → 淘汰无社交 / 总量≠10亿 / 币龄>5min
   3. 淘汰检查 (~数秒): DexScreener 批量查价 + GeckoTerminal 持币数 + Detail API → 永久淘汰弃盘币
@@ -133,7 +133,7 @@ BINANCE_HEADERS = {
 
 # 精筛阈值
 MAX_AGE_HOURS = 48
-SCAN_INTERVAL_MIN = 1                  # 1 分钟一轮
+SCAN_INTERVAL_MIN = 15                 # 15 分钟一轮
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 QUALITY_MIN_AGE_MIN = 3                # 精筛: 币龄 ≥ 3 分钟 (数据稳定)
 QUALITY_MIN_HOLDERS = 15               # 精筛: 持币地址数 ≥ 15
@@ -566,13 +566,13 @@ def discover_on_chain(from_block: int) -> tuple[list[dict], int]:
     latest_block = int(block_res["result"], 16)
 
     if from_block <= 0:
-        # 首次运行: 只扫最近 1 分钟 (~20 blocks, BSC ~3s/block)
-        from_block = latest_block - 20
+        # 首次运行: 只扫最近 15 分钟 (~300 blocks, BSC ~3s/block)
+        from_block = latest_block - 300
 
-    # 安全上限: 不超过 40 blocks (~2 分钟, 防止积压)
-    if latest_block - from_block > 40:
-        log.warning("区块跨度过大 (%d), 截断到最近 40 blocks", latest_block - from_block)
-        from_block = latest_block - 40
+    # 安全上限: 不超过 5000 blocks (~4h, 防止长时间未运行后积压)
+    if latest_block - from_block > 5000:
+        log.warning("区块跨度过大 (%d), 截断到最近 5000 blocks", latest_block - from_block)
+        from_block = latest_block - 5000
 
     log.info("链上扫描区块 %d ~ %d (%d blocks), 监听 %d 个工厂合约",
              from_block, latest_block, latest_block - from_block, len(FOUR_MEME_FACTORIES))
