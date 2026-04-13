@@ -21,7 +21,7 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 价格从峰值跌 90%+
   - 持币地址从 ≥30 跌破 10
   - 无社交媒体
-  - 流动性从 >$1k 跌破 $100
+  - 流动性从 >$1k 跌破 $100 (仅已毕业代币)
   - 进度 < 1% 且币龄 > 2h
   - 进度 < 5% 且币龄 > 4h
   - 币龄 > 15min 且最高持币数 < 3
@@ -1891,8 +1891,8 @@ def elimination_check(queue: list[dict], now_ms: int,
         if not elim_reason and detail and detail["socialCount"] < MIN_SOCIAL_COUNT:
             elim_reason = "无社交媒体"
 
-        # 4. 流动性从 >$1k 跌破 $100
-        if not elim_reason:
+        # 4. 流动性从 >$1k 跌破 $100 (仅已毕业代币, 未毕业流动性数据不准确)
+        if not elim_reason and is_graduated:
             if (t.get("peakLiquidity", 0) >= ELIM_LIQ_PEAK_MIN
                     and current_liq < ELIM_LIQ_FLOOR):
                 elim_reason = f"流动性 ${t.get('peakLiquidity', 0):.0f}→${current_liq:.0f}"
