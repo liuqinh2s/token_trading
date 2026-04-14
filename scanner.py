@@ -2289,6 +2289,74 @@ def print_console(msg: str) -> None:
 
 
 # ===================================================================
+#  从 token_scanner (GitHub Pages) 拉取精筛结果
+# ===================================================================
+SCANNER_LATEST_URL = "https://liuqinh2s.github.io/token_scanner/data/latest.json"
+
+def fetch_scanner_quality_tokens() -> list[dict]:
+    """
+    从 token_scanner 的 GitHub Pages 拉取最新精筛结果
+    返回精筛通过的代币列表 (转换为 token_trading 内部格式)
+    失败返回空列表, 不影响主流程
+    """
+    _ensure_sessions()
+    try:
+        resp = _gt_session.get(SCANNER_LATEST_URL, timeout=10)
+        if resp.status_code != 200:
+            log.info("拉取 scanner 精筛结果: HTTP %d, 跳过", resp.status_code)
+            return []
+        data = resp.json()
+        tokens = data.get("tokens", [])
+        if not tokens:
+            return []
+        # 检查数据新鲜度: scanTime 格式 "2026-04-14 21:01:34"
+        scan_time_str = data.get("scanTime", "")
+        if scan_time_str:
+            try:
+                from datetime import timedelta
+                scan_dt = datetime.strptime(scan_time_str, "%Y-%m-%d %H:%M:%S")
+                scan_dt = scan_dt.replace(tzinfo=timezone(timedelta(hours=8)))
+                age_min = (datetime.now(timezone(timedelta(hours=8))) - scan_dt).total_seconds() / 60
+                if age_min > 30:
+                    log.info("拉取 scanner 精筛结果: 数据过旧 (%.0f 分钟前), 跳过", age_min)
+                    return []
+            except Exception:
+                pass
+        # 转换字段名: scanner 输出格式 → trading 内部格式
+        result = []
+        for t in tokens:
+            result.append({
+                "address": t.get("address", ""),
+                "name": t.get("name", ""),
+                "symbol": t.get("symbol", ""),
+                "holders": t.get("holders", 0),
+                "peakHolders": t.get("peak_holders", 0),
+                "createdAt": t.get("created_at", 0),
+                "totalSupply": t.get("total_supply", 0),
+                "price": t.get("price", 0),
+                "peakPrice": t.get("max_price", 0),
+                "socialCount": t.get("social_count", 0),
+                "socialLinks": t.get("social_links", {}),
+                "progress": t.get("progress", 0),
+                "liquidity": t.get("liquidity", 0),
+                "peakLiquidity": t.get("peak_liquidity", 0),
+                "raisedAmount": t.get("raised_amount", 0),
+                "volume24h": t.get("volume_24h", 0),
+                "volumeH1": t.get("volume_h1", 0),
+                "buysH1": t.get("buys_h1", 0),
+                "sellsH1": t.get("sells_h1", 0),
+                "buysH24": t.get("buys_h24", 0),
+                "sellsH24": t.get("sells_h24", 0),
+                "_from_scanner": True,  # 标记来源
+            })
+        log.info("拉取 scanner 精筛结果: %d 个代币 (scanTime=%s)", len(result), scan_time_str)
+        return result
+    except Exception as e:
+        log.info("拉取 scanner 精筛结果失败: %s", e)
+        return []
+
+
+# ===================================================================
 #  主扫描流程
 # ===================================================================
 _scan_count = 0                    # 扫描轮次计数, 用于持仓同步降频
@@ -2553,6 +2621,21 @@ def scan_once(cfg: dict) -> None:
     queue_state["qualityCooldown"] = _quality_cooldown
     queue_state["scanRound"] = scan_round
     save_queue(queue_state)
+
+    # 合并 token_scanner 的精筛结果 (补充本地可能遗漏的代币)
+    scanner_tokens = fetch_scanner_quality_tokens()
+    if scanner_tokens:
+        local_addrs = {t.get("address", "") for t in quality_results}
+        merged_count = 0
+        for st in scanner_tokens:
+            if st["address"] and st["address"] not in local_addrs:
+                quality_results.append(st)
+                local_addrs.add(st["address"])
+                merged_count += 1
+                log.info("合并 scanner 精筛: + %s (%s)", st.get("name") or st["address"][:16], st["address"][:16])
+        if merged_count > 0:
+            log.info("合并 scanner 精筛: 新增 %d 个代币 (本地已有 %d 个重叠)",
+                     merged_count, len(scanner_tokens) - merged_count)
 
     if not quality_results:
         log.info("本轮无推荐代币 (耗时 %.1f 秒)", time.time() - _t_start)
