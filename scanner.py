@@ -2327,9 +2327,22 @@ def main():
             _gt_session = _build_session(cfg.get("proxy"), GT_HEADERS)
             _bsc_session = _build_session(cfg.get("proxy"), DS_HEADERS)
             scan_once(cfg)
+
+            # 对齐整点时间: 计算到下一个整点间隔的等待秒数
+            # 例如 interval=15 → 对齐到 :00, :15, :30, :45
             interval = cfg.get("scan_interval_minutes", SCAN_INTERVAL_MIN)
-            log.info("下次扫描: %d 分钟后", interval)
-            time.sleep(interval * 60)
+            now = time.time()
+            interval_sec = interval * 60
+            # 距离下一个整点间隔的秒数
+            elapsed_in_slot = now % interval_sec
+            wait_sec = interval_sec - elapsed_in_slot
+            # 如果距离下一个整点不足 30 秒, 跳到再下一个 (避免刚扫完立刻再扫)
+            if wait_sec < 30:
+                wait_sec += interval_sec
+            next_time = datetime.fromtimestamp(now + wait_sec).strftime("%H:%M:%S")
+            log.info("下次扫描: %s (等待 %.0f 秒, 对齐 %d 分钟整点)",
+                     next_time, wait_sec, interval)
+            time.sleep(wait_sec)
         except KeyboardInterrupt:
             log.info("用户中断, 退出")
             if _HAS_TRADER:
