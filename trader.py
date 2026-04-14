@@ -1483,6 +1483,66 @@ def stop_monitor():
 
 
 # ===================================================================
+#  启动时清理低价值历史记录
+# ===================================================================
+CLEANUP_VALUE_THRESHOLD = 0.1  # 低于 $0.1 的已平仓记录直接删除
+
+
+def _cleanup_low_value_positions(bnb_price_usd: float):
+    """
+    清理数据库中价值极低的已平仓记录, 减少启动时链上扫描量
+    删除条件: status=CLOSED 且 (sell_price 和 current_price 都低于阈值)
+    不会删除 OPEN 持仓, 不调用任何 API
+    """
+    conn = sqlite3.connect(str(DB_PATH))
+    _init_positions_db(conn)
+
+    # 查询所有 CLOSED 记录, 用数据库中已有的价格数据判断
+    rows = conn.execute("""
+        SELECT id, token_address, token_name, buy_amount, token_decimals,
+               sell_price_usd, current_price
+        FROM positions
+        WHERE status = 'CLOSED'
+    """).fetchall()
+
+    if not rows:
+        conn.close()
+        return
+
+    delete_ids = []
+    for row in rows:
+        pos_id, addr, name, buy_amount_str, decimals, sell_price, current_price = row
+        # 用 sell_price 和 current_price 中较大的估算残余价值
+        best_price = max(sell_price or 0, current_price or 0)
+        if best_price < CLEANUP_VALUE_THRESHOLD:
+            # 价格本身就低于阈值, 直接标记删除
+            delete_ids.append((pos_id, name or addr[:16]))
+            continue
+        # 如果有 buy_amount, 估算持仓价值
+        try:
+            amount = int(buy_amount_str or "0")
+            dec = decimals or 18
+            token_amount = amount / (10 ** dec)
+            value = token_amount * best_price
+            if value < CLEANUP_VALUE_THRESHOLD:
+                delete_ids.append((pos_id, name or addr[:16]))
+        except (ValueError, TypeError, OverflowError):
+            pass
+
+    if delete_ids:
+        conn.execute(
+            f"DELETE FROM positions WHERE id IN ({','.join(str(d[0]) for d in delete_ids)})"
+        )
+        conn.commit()
+        log.info("数据库清理: 删除 %d 条低价值已平仓记录 (价值<$%.2f)",
+                 len(delete_ids), CLEANUP_VALUE_THRESHOLD)
+
+    remaining = conn.execute("SELECT COUNT(DISTINCT token_address) FROM positions").fetchone()[0]
+    log.info("数据库清理: 剩余 %d 个不同代币地址", remaining)
+    conn.close()
+
+
+# ===================================================================
 #  启动时钱包扫描 — 从链上同步真实持仓
 # ===================================================================
 SKIP_TOKENS = {
@@ -1729,6 +1789,10 @@ def init_trader(cfg: dict, bnb_price_usd: float = 0):
         balance_bnb = get_bnb_balance()
         balance_usdt = get_usdt_balance()
         log.info("钱包余额: %.4f BNB, %.2f USDT", balance_bnb, balance_usdt)
+
+        # 清理低价值历史记录, 减少链上扫描量
+        if bnb_price_usd > 0:
+            _cleanup_low_value_positions(bnb_price_usd)
 
         # 从链上同步真实持仓
         if bnb_price_usd > 0:
