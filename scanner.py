@@ -2293,24 +2293,24 @@ def print_console(msg: str) -> None:
 # ===================================================================
 SCANNER_LATEST_URL = "https://liuqinh2s.github.io/token_scanner/data/latest.json"
 
-def fetch_scanner_quality_tokens() -> list[dict]:
+def fetch_scanner_quality_tokens() -> tuple[list[dict], str]:
     """
     从 token_scanner 的 GitHub Pages 拉取最新精筛结果
-    返回精筛通过的代币列表 (转换为 token_trading 内部格式)
-    失败返回空列表, 不影响主流程
+    返回 (代币列表, scanTime 字符串)
+    失败返回 ([], "")
     """
     _ensure_sessions()
     try:
         resp = _gt_session.get(SCANNER_LATEST_URL, timeout=10)
         if resp.status_code != 200:
             log.info("拉取 scanner 精筛结果: HTTP %d, 跳过", resp.status_code)
-            return []
+            return [], ""
         data = resp.json()
         tokens = data.get("tokens", [])
-        if not tokens:
-            return []
-        # 检查数据新鲜度: scanTime 格式 "2026-04-14 21:01:34"
         scan_time_str = data.get("scanTime", "")
+        if not tokens:
+            return [], scan_time_str
+        # 检查数据新鲜度: scanTime 格式 "2026-04-14 21:01:34"
         if scan_time_str:
             try:
                 from datetime import timedelta
@@ -2319,7 +2319,7 @@ def fetch_scanner_quality_tokens() -> list[dict]:
                 age_min = (datetime.now(timezone(timedelta(hours=8))) - scan_dt).total_seconds() / 60
                 if age_min > 30:
                     log.info("拉取 scanner 精筛结果: 数据过旧 (%.0f 分钟前), 跳过", age_min)
-                    return []
+                    return [], scan_time_str
             except Exception:
                 pass
         # 转换字段名: scanner 输出格式 → trading 内部格式
@@ -2350,10 +2350,43 @@ def fetch_scanner_quality_tokens() -> list[dict]:
                 "_from_scanner": True,  # 标记来源
             })
         log.info("拉取 scanner 精筛结果: %d 个代币 (scanTime=%s)", len(result), scan_time_str)
-        return result
+        return result, scan_time_str
     except Exception as e:
         log.info("拉取 scanner 精筛结果失败: %s", e)
-        return []
+        return [], ""
+
+
+# 上一轮 scanner 的 scanTime, 用于轮询时判断是否有新数据
+_last_scanner_scan_time: str = ""
+
+def poll_scanner_quality_tokens(poll_interval: int = 30, max_wait: int = 300) -> list[dict]:
+    """
+    轮询 token_scanner 的 GitHub Pages, 等待本轮新数据
+    - poll_interval: 轮询间隔 (秒), 默认 30s
+    - max_wait: 最大等待时间 (秒), 默认 300s (5 分钟)
+    - 判断逻辑: scanTime 与上一轮不同 → 说明 scanner 已更新
+    返回精筛代币列表, 超时返回空列表
+    """
+    global _last_scanner_scan_time
+    waited = 0
+    log.info("等待 scanner 新数据 (上次 scanTime=%s, 每 %ds 轮询, 最多等 %ds)...",
+             _last_scanner_scan_time or "无", poll_interval, max_wait)
+    while waited < max_wait:
+        tokens, scan_time = fetch_scanner_quality_tokens()
+        # 有数据且 scanTime 与上一轮不同 → 拿到新数据
+        if scan_time and scan_time != _last_scanner_scan_time:
+            log.info("scanner 新数据到达 (scanTime=%s, 等待 %ds)", scan_time, waited)
+            _last_scanner_scan_time = scan_time
+            return tokens
+        # 首次运行 (无上一轮记录), 有数据就直接用
+        if not _last_scanner_scan_time and tokens:
+            _last_scanner_scan_time = scan_time
+            return tokens
+        time.sleep(poll_interval)
+        waited += poll_interval
+        log.info("轮询 scanner... (已等 %ds/%ds)", waited, max_wait)
+    log.info("等待 scanner 新数据超时 (%ds), 本轮不合并 scanner 结果", max_wait)
+    return []
 
 
 # ===================================================================
@@ -2622,8 +2655,8 @@ def scan_once(cfg: dict) -> None:
     queue_state["scanRound"] = scan_round
     save_queue(queue_state)
 
-    # 合并 token_scanner 的精筛结果 (补充本地可能遗漏的代币)
-    scanner_tokens = fetch_scanner_quality_tokens()
+    # 合并 token_scanner 的精筛结果 (轮询等待新数据, 补充本地可能遗漏的代币)
+    scanner_tokens = poll_scanner_quality_tokens(poll_interval=30, max_wait=300)
     if scanner_tokens:
         local_addrs = {t.get("address", "") for t in quality_results}
         merged_count = 0
