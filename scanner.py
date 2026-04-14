@@ -2292,8 +2292,8 @@ def print_console(msg: str) -> None:
 #  主扫描流程
 # ===================================================================
 _scan_count = 0                    # 扫描轮次计数, 用于持仓同步降频
-_SYNC_EVERY_N_SCANS = 15          # 每 15 轮扫描同步一次持仓 (约 15 分钟)
-_quality_cooldown: dict[str, int] = {}  # 精筛冷却: {address: last_pass_round}
+_SYNC_EVERY_N_SCANS = 1           # 每轮扫描同步一次持仓 (间隔已改为 15 分钟)
+_quality_cooldown: dict[str, int] = {}  # 精筛冷却: {address: last_pass_round} (从 queue.json 恢复)
 
 def scan_once(cfg: dict) -> None:
     global _scan_count
@@ -2433,9 +2433,13 @@ def scan_once(cfg: dict) -> None:
             t["copycat"] = cc
 
     # 精筛 (动量筛选, 从存活币中找起飞信号)
+    # 冷却期: 从 queue_state 恢复, 持久化到 queue.json (与 token_scanner 一致)
+    global _quality_cooldown
+    _quality_cooldown = queue_state.get("qualityCooldown", _quality_cooldown)
+    scan_round = queue_state.get("scanRound", _scan_count - 1) + 1
     quality_results = quality_filter(survivors, now_ms,
                                      cooldown_map=_quality_cooldown,
-                                     current_round=_scan_count)
+                                     current_round=scan_round)
 
     # 精筛代币持币数刷新: 用 BSCScan 网页爬取真实持币数 (four.meme detail 对未毕业币不准)
     # 必须在再验证之前执行, 否则再验证用的是旧数据
@@ -2546,6 +2550,8 @@ def scan_once(cfg: dict) -> None:
     queue_state["tokens"] = survivors
     queue_state["lastBlock"] = latest_block
     queue_state["lastScanTime"] = now_ms
+    queue_state["qualityCooldown"] = _quality_cooldown
+    queue_state["scanRound"] = scan_round
     save_queue(queue_state)
 
     if not quality_results:
