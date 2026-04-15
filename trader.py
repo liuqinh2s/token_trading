@@ -1181,15 +1181,21 @@ def notify_buy(cfg: dict, token_name: str, token_address: str,
 
 
 def notify_sell(cfg: dict, token_name: str, token_address: str,
-                sell_reason: str, pnl_pct: float, tx_hash: str):
+                sell_reason: str, pnl_pct: float, tx_hash: str,
+                buy_price: float = 0, max_price: float = 0,
+                sell_price: float = 0):
     """卖出通知"""
     emoji = "🔴" if pnl_pct < 0 else "🟡" if pnl_pct < 50 else "🟢"
+    max_pnl_pct = ((max_price - buy_price) / buy_price * 100) if (buy_price > 0 and max_price > 0) else 0
     text = (
         f"{emoji} <b>卖出</b>\n"
         f"代币: {token_name}\n"
         f"合约: <code>{token_address}</code>\n"
         f"原因: {sell_reason}\n"
-        f"盈亏: {pnl_pct:+.1f}%\n"
+        f"盈亏: {pnl_pct:+.1f}% | 最高盈利: {max_pnl_pct:+.1f}%\n"
+        f"买入: ${buy_price:.12f}\n"
+        f"最高: ${max_price:.12f}\n"
+        f"卖出: ${sell_price:.12f}\n"
         f"TX: <a href='https://bscscan.com/tx/{tx_hash}'>查看</a>"
     )
     _send_trade_notify(cfg, text)
@@ -1427,7 +1433,9 @@ def monitor_positions(cfg_loader, bnb_price_func):
                         close_position(conn, pos["id"], current_price,
                                        sell_result["tx_hash"], reason, buy_price)
                         pnl = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
-                        notify_sell(cfg, name, addr, reason, pnl, sell_result["tx_hash"])
+                        notify_sell(cfg, name, addr, reason, pnl, sell_result["tx_hash"],
+                                    buy_price=buy_price, max_price=max_price,
+                                    sell_price=current_price)
                     else:
                         log.error("卖出失败: %s", name)
 
