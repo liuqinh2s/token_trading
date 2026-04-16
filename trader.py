@@ -8,7 +8,9 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve
   - bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
   1. 回撤止盈: 盈利超过20%, 当价格回撤到 (买入价+最高价)/2 时卖出
-  2. 超期清仓: 持仓超过2天且未盈利时卖出
+  2. 超期清仓 (阶梯式):
+     - 持仓超过24小时且未盈利 → 卖出
+     - 持仓超过48小时且盈利未达 tp_trigger_pct → 卖出
   3. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
@@ -1107,9 +1109,11 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 回撤止盈: 盈利超过100%, 价格回撤到 (buy_price + max_price) / 2
+      1. 回撤止盈: 盈利超过阈值, 价格回撤到 (buy_price + max_price) / 2
          - 如果回撤时当前价格低于买入价 (不盈利), 不卖出, 返回 RESET 信号
-      2. 超期清仓: 持仓超过2天且未盈利
+      2. 超期清仓 (阶梯式):
+         - 持仓超过24小时且未盈利 → 卖出
+         - 持仓超过48小时且盈利未达 tp_trigger_pct → 卖出
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
@@ -1133,13 +1137,19 @@ def check_sell_conditions(pos: dict, current_price: float,
                 return False, "RESET_TP"
             return True, f"TRAILING_TP (最高盈利 {max_profit_pct:.0f}%, 当前 {profit_pct:.0f}%)"
 
-    # 策略2: 超期清仓
-    expire_hours = trading_cfg.get("expire_hours", 48)  # 默认2天
+    # 策略2: 超期清仓 (阶梯式)
     hold_ms = int(time.time() * 1000) - pos["buy_time"]
     hold_hours = hold_ms / (3600 * 1000)
+    expire_hours_1 = trading_cfg.get("expire_hours_1", 24)   # 第一阶梯: 24h 未盈利
+    expire_hours_2 = trading_cfg.get("expire_hours_2", 48)   # 第二阶梯: 48h 盈利未达100%
 
-    if hold_hours >= expire_hours and current_price <= buy_price:
-        return True, f"EXPIRE (持仓 {hold_hours:.1f}h, 盈亏 {profit_pct:.1f}%)"
+    # 阶梯1: 超过24h且未盈利 (亏损或持平)
+    if hold_hours >= expire_hours_1 and profit_pct <= 0:
+        return True, f"EXPIRE_24H (持仓 {hold_hours:.1f}h, 盈亏 {profit_pct:.1f}%)"
+
+    # 阶梯2: 超过48h且盈利未达止盈触发点
+    if hold_hours >= expire_hours_2 and profit_pct < tp_trigger_pct:
+        return True, f"EXPIRE_48H (持仓 {hold_hours:.1f}h, 盈亏 {profit_pct:.1f}%, 未达 {tp_trigger_pct}%)"
 
     return False, ""
 
@@ -1385,8 +1395,14 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 hold_ms = int(time.time() * 1000) - pos["buy_time"]
                 hold_hours = hold_ms / (3600 * 1000)
                 hold_days = hold_hours / 24
-                expire_hours = trading_cfg.get("expire_hours", 48)
-                expire_tag = " ⚠️超期" if (hold_hours >= expire_hours and current_price <= buy_price) else ""
+                expire_hours_1 = trading_cfg.get("expire_hours_1", 24)
+                expire_hours_2 = trading_cfg.get("expire_hours_2", 48)
+                tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 100)
+                expire_tag = ""
+                if hold_hours >= expire_hours_1 and profit_pct <= 0:
+                    expire_tag = " ⚠️超期24h未盈利"
+                elif hold_hours >= expire_hours_2 and profit_pct < tp_trigger_pct:
+                    expire_tag = f" ⚠️超期48h未达{tp_trigger_pct}%"
                 log.info("  %s [%s]: 当前 $%.12f | 买入 $%.12f | 最高 $%.12f | 盈亏 %+.1f%% | 持仓 %.1f天(%.0fh)%s",
                          name, venue, current_price, buy_price, max_price, profit_pct,
                          hold_days, hold_hours, expire_tag)
