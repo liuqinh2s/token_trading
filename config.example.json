@@ -1,7 +1,7 @@
 {
     "telegram_bot_token": "YOUR_TOKEN",
     "telegram_chat_id": "YOUR_CHAT_ID",
-    "scan_interval_minutes": 1,
+    "scan_interval_minutes": 15,
     "max_push_count": 100,
     "max_age_hours": 48,
     "bscscan_api_key": "",
