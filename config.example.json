@@ -33,7 +33,7 @@
         "buy_fraction": 0.05,
         "min_buy_usd": 1,
         "max_buy_usd": 1,
-        "tp_trigger_pct": 100,
+        "tp_trigger_pct": 50,
         "rebuy_cooldown_profit_hours": 12,
         "rebuy_cooldown_loss_hours": 48,
         "expire_hours_1": 24,

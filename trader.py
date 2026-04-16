@@ -1125,7 +1125,7 @@ def check_sell_conditions(pos: dict, current_price: float,
     profit_pct = (current_price - buy_price) / buy_price * 100
 
     # 策略1: 回撤止盈
-    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 100)  # 触发止盈的盈利百分比
+    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 50)  # 触发止盈的盈利百分比
     max_profit_pct = (max_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
 
     if max_profit_pct >= tp_trigger_pct:
