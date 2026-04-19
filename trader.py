@@ -237,6 +237,11 @@ def _init_positions_db(conn: sqlite3.Connection):
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_pos_status ON positions(status)
     """)
+    # 迁移: 添加 channel 列 (潜伏型 'quality' / 毕业通道 'graduated')
+    try:
+        conn.execute("ALTER TABLE positions ADD COLUMN channel TEXT DEFAULT 'quality'")
+    except Exception:
+        pass  # 列已存在
     conn.commit()
 
 
@@ -989,14 +994,14 @@ def sell_token(token_address: str, amount: int | None = None,
 #  持仓管理
 # ===================================================================
 def record_buy(conn: sqlite3.Connection, token_address: str, token_name: str,
-               decimals: int, buy_result: dict):
+               decimals: int, buy_result: dict, channel: str = "quality"):
     """记录买入持仓"""
     now_ms = int(time.time() * 1000)
     conn.execute("""
         INSERT INTO positions
             (token_address, token_name, token_decimals, buy_price_usd, buy_amount,
-             buy_bnb, buy_tx, buy_time, max_price_usd, current_price, status, venue)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)
+             buy_bnb, buy_tx, buy_time, max_price_usd, current_price, status, venue, channel)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
     """, (
         token_address.lower(),
         token_name,
@@ -1009,6 +1014,7 @@ def record_buy(conn: sqlite3.Connection, token_address: str, token_name: str,
         buy_result["buy_price_usd"],  # max_price 初始 = buy_price
         buy_result["buy_price_usd"],
         buy_result.get("venue", "PANCAKE"),
+        channel,
     ))
     conn.commit()
 
@@ -1111,12 +1117,13 @@ def check_sell_conditions(pos: dict, current_price: float,
     策略 (潜伏型配套, 回测最优解):
       1. 回撤止盈: 最高盈利超过 tp_trigger_pct 后, 价格回撤到 (buy_price + max_price) / 2 卖出
          - 如果回撤时当前价格低于买入价 (不盈利), 不卖出, 返回 RESET 信号重置峰值
-      2. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 60%, 避免误杀后来大涨的币)
+      2. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
       3. 无超期清仓 (潜伏型策略买入的是蓄势待发的币, 可能需要很长时间才起飞)
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
     max_price = pos["max_price_usd"]
+    channel = pos.get("channel", "quality")
 
     if buy_price <= 0:
         return False, ""
@@ -1136,8 +1143,12 @@ def check_sell_conditions(pos: dict, current_price: float,
                 return False, "RESET_TP"
             return True, f"TRAILING_TP (最高盈利 {max_profit_pct:.0f}%, 当前 {profit_pct:.0f}%)"
 
-    # 策略2: 兜底止损
-    stop_loss_pct = trading_cfg.get("stop_loss_pct", -60)  # 默认 -60%
+    # 策略2: 兜底止损 (毕业通道用更紧的止损)
+    default_sl = trading_cfg.get("stop_loss_pct", -60)
+    if channel == "graduated":
+        stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -30)
+    else:
+        stop_loss_pct = default_sl
     if stop_loss_pct and profit_pct <= stop_loss_pct:
         return True, f"STOP_LOSS (亏损 {profit_pct:.0f}%, 阈值 {stop_loss_pct}%)"
 
@@ -1243,6 +1254,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     for tk, detail in tokens:
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
+        channel = tk.get("channel", "quality")  # 通道: quality / graduated
 
         # 检查是否已有持仓
         if has_open_position(conn, addr):
@@ -1303,7 +1315,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
             continue
 
         if result:
-            record_buy(conn, addr, name, result["decimals"], result)
+            record_buy(conn, addr, name, result["decimals"], result, channel)
             notify_buy(cfg, name, addr, buy_usdt,
                        result["buy_price_usd"], result["tx_hash"])
 

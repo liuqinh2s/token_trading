@@ -35,6 +35,7 @@
         "max_buy_usd": 1,
         "tp_trigger_pct": 30,
         "stop_loss_pct": -60,
+        "grad_stop_loss_pct": -30,
         "rebuy_cooldown_profit_hours": 12,
         "rebuy_cooldown_loss_hours": 48,
         "monitor_interval_sec": 60,
