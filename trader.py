@@ -7,11 +7,12 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve
 卖出:
   - bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
-  1. 回撤止盈: 盈利超过20%, 当价格回撤到 (买入价+最高价)/2 时卖出
+  1. 暴涨止盈: 盈利达到 2000% (20倍) 立即全部卖出, 落袋为安
   2. 超期清仓 (阶梯式):
-     - 持仓超过24小时且未盈利 → 卖出
-     - 持仓超过48小时且盈利未达 tp_trigger_pct → 卖出
-  3. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
+     - 持仓超过48小时且仍亏损 → 卖出 (给了足够时间还亏就别等了)
+     - 持仓超过72小时且盈利未达500% (5倍) → 卖出 (资金效率太低)
+  3. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+  4. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
 from __future__ import annotations
@@ -1114,11 +1115,12 @@ def check_sell_conditions(pos: dict, current_price: float,
     检查是否满足卖出条件
     返回: (是否应该卖出, 卖出原因)
 
-    策略 (潜伏型配套, 回测最优解):
-      1. 回撤止盈: 最高盈利超过 tp_trigger_pct 后, 价格回撤到 (buy_price + max_price) / 2 卖出
-         - 如果回撤时当前价格低于买入价 (不盈利), 不卖出, 返回 RESET 信号重置峰值
-      2. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
-      3. 无超期清仓 (潜伏型策略买入的是蓄势待发的币, 可能需要很长时间才起飞)
+    策略 (土狗市场专用, 宁赚一次大的不赚多次小的):
+      1. 暴涨止盈: 盈利达到 tp_moon_pct (默认 2000%=20倍) 立即全部卖出
+      2. 超期清仓 (阶梯式):
+         - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
+         - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
+      3. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
@@ -1130,20 +1132,27 @@ def check_sell_conditions(pos: dict, current_price: float,
 
     profit_pct = (current_price - buy_price) / buy_price * 100
 
-    # 策略1: 回撤止盈
-    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 30)  # 触发止盈的盈利百分比
-    max_profit_pct = (max_price - buy_price) / buy_price * 100 if buy_price > 0 else 0
+    # 策略1: 暴涨止盈 — 达到目标倍数立即落袋
+    tp_moon_pct = trading_cfg.get("tp_moon_pct", 2000)  # 20倍
+    if profit_pct >= tp_moon_pct:
+        return True, f"MOON_TP (盈利 {profit_pct:.0f}%, 阈值 {tp_moon_pct}%)"
 
-    if max_profit_pct >= tp_trigger_pct:
-        # 已触发止盈条件, 检查回撤
-        sell_threshold = (buy_price + max_price) / 2
-        if current_price <= sell_threshold:
-            # 回撤到阈值, 但如果当前不盈利则不卖出, 重置止盈状态
-            if current_price <= buy_price:
-                return False, "RESET_TP"
-            return True, f"TRAILING_TP (最高盈利 {max_profit_pct:.0f}%, 当前 {profit_pct:.0f}%)"
+    # 策略2: 超期清仓 — 资金回收
+    hold_ms = int(time.time() * 1000) - pos["buy_time"]
+    hold_hours = hold_ms / (3600 * 1000)
 
-    # 策略2: 兜底止损 (毕业通道用更紧的止损)
+    # 2a: 超过 expire_loss_hours 且仍亏损 → 卖出
+    expire_loss_hours = trading_cfg.get("expire_loss_hours", 48)
+    if hold_hours >= expire_loss_hours and profit_pct < 0:
+        return True, f"EXPIRE_LOSS (持仓 {hold_hours:.0f}h, 亏损 {profit_pct:.0f}%)"
+
+    # 2b: 超过 expire_underperform_hours 且盈利未达 expire_min_profit_pct → 卖出
+    expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 72)
+    expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 500)
+    if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
+        return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
+
+    # 策略3: 兜底止损 (毕业通道用更紧的止损)
     default_sl = trading_cfg.get("stop_loss_pct", -60)
     if channel == "graduated":
         stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -30)
@@ -1397,14 +1406,14 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 hold_ms = int(time.time() * 1000) - pos["buy_time"]
                 hold_hours = hold_ms / (3600 * 1000)
                 hold_days = hold_hours / 24
-                expire_hours_1 = trading_cfg.get("expire_hours_1", 24)
-                expire_hours_2 = trading_cfg.get("expire_hours_2", 48)
-                tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 100)
+                expire_loss_hours = trading_cfg.get("expire_loss_hours", 48)
+                expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 72)
+                expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 500)
                 expire_tag = ""
-                if hold_hours >= expire_hours_1 and profit_pct <= 0:
-                    expire_tag = " ⚠️超期24h未盈利"
-                elif hold_hours >= expire_hours_2 and profit_pct < tp_trigger_pct:
-                    expire_tag = f" ⚠️超期48h未达{tp_trigger_pct}%"
+                if hold_hours >= expire_loss_hours and profit_pct < 0:
+                    expire_tag = f" ⚠️超期{expire_loss_hours:.0f}h仍亏损"
+                elif hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
+                    expire_tag = f" ⚠️超期{expire_underperform_hours:.0f}h未达{expire_min_profit_pct:.0f}%"
                 log.info("  %s [%s]: 当前 $%.12f | 买入 $%.12f | 最高 $%.12f | 盈亏 %+.1f%% | 持仓 %.1f天(%.0fh)%s",
                          name, venue, current_price, buy_price, max_price, profit_pct,
                          hold_days, hold_hours, expire_tag)
@@ -1412,13 +1421,6 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 # 检查卖出条件
                 pos_updated = {**pos, "max_price_usd": max_price}
                 should_sell, reason = check_sell_conditions(pos_updated, current_price, cfg)
-
-                # 止盈回撤但不盈利: 重置止盈状态, 等下一个触发点
-                if not should_sell and reason == "RESET_TP":
-                    log.info("  %s: 止盈回撤但未盈利, 重置止盈状态 (最高 $%.12f → 当前 $%.12f)",
-                             name, max_price, current_price)
-                    update_position_price(conn, pos["id"], current_price, current_price)
-                    continue
 
                 if should_sell:
                     log.info("触发卖出 %s: %s", name, reason)
