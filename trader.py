@@ -8,11 +8,16 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve
   - bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
   1. 暴涨止盈: 盈利达到 2000% (20倍) 立即全部卖出, 落袋为安
-  2. 超期清仓 (阶梯式):
+  2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
+     - 持币数从峰值跌 >30% (相对值)
+     - 流动性从峰值跌 >30% (相对值, 仅已毕业)
+     - 进度从峰值跌 >15 个百分点 (绝对值, 仅未毕业)
+     - 任意 2 个指标同时触发 → 动能衰竭, 立即止盈
+  3. 超期清仓 (阶梯式):
      - 持仓超过48小时且仍亏损 → 卖出 (给了足够时间还亏就别等了)
      - 持仓超过72小时且盈利未达500% (5倍) → 卖出 (资金效率太低)
-  3. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
-  4. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
+  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+  5. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
 from __future__ import annotations
@@ -243,6 +248,22 @@ def _init_positions_db(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE positions ADD COLUMN channel TEXT DEFAULT 'quality'")
     except Exception:
         pass  # 列已存在
+    # 动能跟踪表: 记录每个持仓的持币数/流动性/进度历史
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS momentum (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id  INTEGER NOT NULL,
+            ts           INTEGER NOT NULL,
+            holders      INTEGER,
+            liquidity    REAL,
+            progress     REAL,
+            price        REAL,
+            FOREIGN KEY (position_id) REFERENCES positions(id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_momentum_pos ON momentum(position_id)
+    """)
     conn.commit()
 
 
@@ -1106,21 +1127,130 @@ def update_position_price(conn: sqlite3.Connection, position_id: int,
     conn.commit()
 
 
+def record_momentum(conn: sqlite3.Connection, position_id: int,
+                    holders: int | None, liquidity: float | None,
+                    progress: float | None, price: float | None):
+    """记录一条动能快照 (每轮监控调用一次)"""
+    conn.execute("""
+        INSERT INTO momentum (position_id, ts, holders, liquidity, progress, price)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (position_id, int(time.time() * 1000), holders, liquidity, progress, price))
+    conn.commit()
+
+
+def get_momentum_history(conn: sqlite3.Connection, position_id: int,
+                         limit: int = 30) -> list[dict]:
+    """获取持仓的动能历史 (最近 N 条, 按时间升序)"""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT * FROM momentum WHERE position_id = ?
+        ORDER BY ts DESC LIMIT ?
+    """, (position_id, limit)).fetchall()
+    conn.row_factory = None
+    return [dict(r) for r in reversed(rows)]  # 升序返回
+
+
+def calc_momentum_signals(history: list[dict]) -> dict:
+    """
+    根据动能历史计算衰竭信号
+    返回: {
+        "holders_peak": int, "holders_last": int, "holders_drawdown_pct": float,
+        "liquidity_peak": float, "liquidity_last": float, "liquidity_drawdown_pct": float,
+        "progress_peak": float, "progress_last": float, "progress_drop_pp": float,
+        "bad_count": int, "bad_signals": list[str],
+        "is_graduated": bool,
+    }
+    """
+    if len(history) < 2:
+        return {"bad_count": 0, "bad_signals": []}
+
+    # 提取有效序列
+    h_seq = [r["holders"] for r in history if r["holders"] is not None]
+    l_seq = [r["liquidity"] for r in history if r["liquidity"] is not None]
+    p_seq = [r["progress"] for r in history if r["progress"] is not None]
+
+    result = {
+        "holders_peak": 0, "holders_last": 0, "holders_drawdown_pct": 0,
+        "liquidity_peak": 0, "liquidity_last": 0, "liquidity_drawdown_pct": 0,
+        "progress_peak": 0, "progress_last": 0, "progress_drop_pp": 0,
+        "bad_count": 0, "bad_signals": [],
+        "is_graduated": False,
+    }
+
+    # 持币数回撤 (相对值)
+    if h_seq:
+        peak_h = max(h_seq)
+        last_h = h_seq[-1]
+        result["holders_peak"] = peak_h
+        result["holders_last"] = last_h
+        if peak_h > 0:
+            result["holders_drawdown_pct"] = (peak_h - last_h) / peak_h * 100
+
+    # 流动性回撤 (相对值, 仅已毕业有意义)
+    if l_seq:
+        peak_l = max(l_seq)
+        last_l = l_seq[-1]
+        result["liquidity_peak"] = peak_l
+        result["liquidity_last"] = last_l
+        if peak_l > 0:
+            result["liquidity_drawdown_pct"] = (peak_l - last_l) / peak_l * 100
+
+    # 进度回撤 (绝对值百分点, 仅未毕业有意义)
+    if p_seq:
+        peak_p = max(p_seq)
+        last_p = p_seq[-1]
+        result["progress_peak"] = peak_p
+        result["progress_last"] = last_p
+        result["progress_drop_pp"] = (peak_p - last_p) * 100  # 百分点
+        result["is_graduated"] = last_p >= 1.0
+
+    # 判断恶化信号
+    bad_signals = []
+
+    # 持币数: 从峰值跌 >30%
+    if result["holders_peak"] > 0 and result["holders_drawdown_pct"] > 30:
+        bad_signals.append(
+            f"持币跌{result['holders_drawdown_pct']:.0f}% "
+            f"({result['holders_peak']}→{result['holders_last']})")
+
+    # 流动性: 从峰值跌 >30% (仅已毕业, 流动性 >$100 才有意义)
+    if result["is_graduated"] and result["liquidity_peak"] > 100:
+        if result["liquidity_drawdown_pct"] > 30:
+            bad_signals.append(
+                f"流动性跌{result['liquidity_drawdown_pct']:.0f}% "
+                f"(${result['liquidity_peak']:.0f}→${result['liquidity_last']:.0f})")
+
+    # 进度: 从峰值跌 >15 个百分点 (仅未毕业, 峰值进度 >5% 才有意义)
+    if not result["is_graduated"] and result["progress_peak"] > 0.05:
+        if result["progress_drop_pp"] > 15:
+            bad_signals.append(
+                f"进度跌{result['progress_drop_pp']:.0f}pp "
+                f"({result['progress_peak']*100:.1f}%→{result['progress_last']*100:.1f}%)")
+
+    result["bad_count"] = len(bad_signals)
+    result["bad_signals"] = bad_signals
+    return result
+
+
 # ===================================================================
 #  卖出策略
 # ===================================================================
 def check_sell_conditions(pos: dict, current_price: float,
-                          cfg: dict) -> tuple[bool, str]:
+                          cfg: dict,
+                          momentum: dict | None = None) -> tuple[bool, str]:
     """
     检查是否满足卖出条件
     返回: (是否应该卖出, 卖出原因)
 
     策略 (土狗市场专用, 宁赚一次大的不赚多次小的):
       1. 暴涨止盈: 盈利达到 tp_moon_pct (默认 2000%=20倍) 立即全部卖出
-      2. 超期清仓 (阶梯式):
+      2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
+      3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
          - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
-      3. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+
+    momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
@@ -1137,22 +1267,31 @@ def check_sell_conditions(pos: dict, current_price: float,
     if profit_pct >= tp_moon_pct:
         return True, f"MOON_TP (盈利 {profit_pct:.0f}%, 阈值 {tp_moon_pct}%)"
 
-    # 策略2: 超期清仓 — 资金回收
+    # 策略2: 动能衰竭止盈 — 多指标同时恶化, 趁还有利润赶紧跑
+    # 条件: ≥2 个动能指标恶化 + 当前盈利 > 0 (亏损时不触发, 留给止损兜底)
+    if momentum and trading_cfg.get("momentum_tp_enabled", True):
+        min_bad = trading_cfg.get("momentum_min_bad_signals", 2)
+        if momentum.get("bad_count", 0) >= min_bad and profit_pct > 0:
+            signals_str = " + ".join(momentum["bad_signals"])
+            return True, (f"MOMENTUM_TP (盈利 {profit_pct:.0f}%, "
+                          f"{momentum['bad_count']}个动能衰竭: {signals_str})")
+
+    # 策略3: 超期清仓 — 资金回收
     hold_ms = int(time.time() * 1000) - pos["buy_time"]
     hold_hours = hold_ms / (3600 * 1000)
 
-    # 2a: 超过 expire_loss_hours 且仍亏损 → 卖出
+    # 3a: 超过 expire_loss_hours 且仍亏损 → 卖出
     expire_loss_hours = trading_cfg.get("expire_loss_hours", 48)
     if hold_hours >= expire_loss_hours and profit_pct < 0:
         return True, f"EXPIRE_LOSS (持仓 {hold_hours:.0f}h, 亏损 {profit_pct:.0f}%)"
 
-    # 2b: 超过 expire_underperform_hours 且盈利未达 expire_min_profit_pct → 卖出
+    # 3b: 超过 expire_underperform_hours 且盈利未达 expire_min_profit_pct → 卖出
     expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 72)
     expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 500)
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
-    # 策略3: 兜底止损 (毕业通道用更紧的止损)
+    # 策略4: 兜底止损 (毕业通道用更紧的止损)
     default_sl = trading_cfg.get("stop_loss_pct", -60)
     if channel == "graduated":
         stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -30)
@@ -1346,6 +1485,18 @@ def monitor_positions(cfg_loader, bnb_price_func):
     bnb_price_func: callable, 返回 BNB 的 USD 价格
     """
     log.info("持仓监控线程启动")
+
+    # 延迟导入 scanner 模块的数据查询函数 (避免循环依赖)
+    _fm_detail = None
+    _ds_batch = None
+    try:
+        from scanner import fm_detail as _fm_detail_fn, ds_batch_prices as _ds_batch_fn
+        _fm_detail = _fm_detail_fn
+        _ds_batch = _ds_batch_fn
+        log.info("监控: 动能跟踪已启用 (fm_detail + DexScreener)")
+    except ImportError:
+        log.warning("监控: 无法导入 scanner 数据函数, 动能跟踪禁用")
+
     while not _monitor_stop.is_set():
         try:
             cfg = cfg_loader()
@@ -1371,6 +1522,15 @@ def monitor_positions(cfg_loader, bnb_price_func):
 
             log.info("监控: %d 个持仓", len(positions))
             slippage = trading_cfg.get("slippage_pct", 15.0)
+
+            # 批量查询 DexScreener 数据 (价格 + 流动性, 一次请求)
+            ds_data = {}
+            if _ds_batch:
+                try:
+                    addrs = [pos["token_address"] for pos in positions]
+                    ds_data = _ds_batch(addrs)
+                except Exception as e:
+                    log.debug("监控: DexScreener 批量查询失败: %s", e)
 
             for pos in positions:
                 if _monitor_stop.is_set():
@@ -1418,9 +1578,44 @@ def monitor_positions(cfg_loader, bnb_price_func):
                          name, venue, current_price, buy_price, max_price, profit_pct,
                          hold_days, hold_hours, expire_tag)
 
+                # --- 动能数据采集 ---
+                cur_holders = None
+                cur_liquidity = None
+                cur_progress = None
+
+                # DexScreener: 流动性 (已在批量查询中获取)
+                ds = ds_data.get(addr, {})
+                if ds:
+                    cur_liquidity = ds.get("liquidity", 0)
+
+                # fm_detail: 持币数 + 进度 (仅 four.meme 代币)
+                if _fm_detail:
+                    try:
+                        detail = _fm_detail(addr)
+                        if detail:
+                            cur_holders = detail.get("holders", 0)
+                            cur_progress = detail.get("progress", 0)
+                    except Exception as e:
+                        log.debug("监控: fm_detail 查询失败 %s: %s", name, e)
+
+                # 记录动能快照
+                record_momentum(conn, pos["id"],
+                                cur_holders, cur_liquidity, cur_progress, current_price)
+
+                # 计算动能信号
+                momentum_signals = None
+                if trading_cfg.get("momentum_tp_enabled", True):
+                    history = get_momentum_history(conn, pos["id"])
+                    if len(history) >= 2:
+                        momentum_signals = calc_momentum_signals(history)
+                        if momentum_signals["bad_count"] > 0:
+                            log.info("  %s 动能信号: %s",
+                                     name, " + ".join(momentum_signals["bad_signals"]))
+
                 # 检查卖出条件
                 pos_updated = {**pos, "max_price_usd": max_price}
-                should_sell, reason = check_sell_conditions(pos_updated, current_price, cfg)
+                should_sell, reason = check_sell_conditions(
+                    pos_updated, current_price, cfg, momentum=momentum_signals)
 
                 if should_sell:
                     log.info("触发卖出 %s: %s", name, reason)
