@@ -1,11 +1,13 @@
 """
-BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve
+BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding Curve
 买入:
-  - bonding curve: 根据报价币 (quote) 自动选择 BNB 或 USDT 直接买入
+  - four.meme bonding curve: 根据报价币 (quote) 自动选择 BNB 或 USDT 直接买入
+  - flap bonding curve: 根据 quote token 自动选择 BNB 或 ERC20 (USD1/USDT) 买入
   - PancakeSwap: 用 BNB 直接买入 (BNB → Token)
   - 买入金额以 USDT 计价, BNB 报价时自动换算
 卖出:
-  - bonding curve: 卖出收到报价币 (BNB 或 USDT)
+  - four.meme bonding curve: 卖出收到报价币 (BNB 或 USDT)
+  - flap bonding curve: 卖出收到 quote token (BNB 或 ERC20)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
   1. 暴涨止盈: 盈利达到 2000% (20倍) 立即全部卖出, 落袋为安
   2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
@@ -211,6 +213,63 @@ FM_HELPER_ABI = json.loads("""[
     ]
   }
 ]""")
+
+# flap 合约地址 (BSC 链上代币发射平台, 来源: docs.flap.sh)
+# Portal: 事件发射 + 交易合约 (buy/sell/previewBuy/previewSell/getTokenV5)
+FLAP_PORTAL = Web3.to_checksum_address("0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0")
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+# flap quote token 分类 (用于价格换算和支付方式判断)
+# 零地址 = 原生 BNB; 稳定币 = USD 计价
+FLAP_STABLE_QUOTES = {
+    "0x55d398326f99059ff775485246999027b3197955",  # USDT
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+    "0x61a10e8556bed032ea176330e7f17d6a12a10000",  # USD1/lisUSD
+}
+
+# flap Portal ABI (最小化: buy/sell/previewBuy/previewSell + getTokenV5)
+FLAP_PORTAL_ABI = json.loads("""[
+  {
+    "name":"buy",
+    "type":"function","stateMutability":"payable",
+    "inputs":[
+      {"name":"token","type":"address"},
+      {"name":"recipient","type":"address"},
+      {"name":"minAmount","type":"uint256"}
+    ],
+    "outputs":[{"name":"amount","type":"uint256"}]
+  },
+  {
+    "name":"sell",
+    "type":"function","stateMutability":"nonpayable",
+    "inputs":[
+      {"name":"token","type":"address"},
+      {"name":"amount","type":"uint256"},
+      {"name":"minEth","type":"uint256"}
+    ],
+    "outputs":[{"name":"eth","type":"uint256"}]
+  },
+  {
+    "name":"previewBuy",
+    "type":"function","stateMutability":"view",
+    "inputs":[
+      {"name":"token","type":"address"},
+      {"name":"eth","type":"uint256"}
+    ],
+    "outputs":[{"name":"amount","type":"uint256"}]
+  },
+  {
+    "name":"previewSell",
+    "type":"function","stateMutability":"view",
+    "inputs":[
+      {"name":"token","type":"address"},
+      {"name":"amount","type":"uint256"}
+    ],
+    "outputs":[{"name":"eth","type":"uint256"}]
+  }
+]""")
+
 # ===================================================================
 DB_PATH = Path(__file__).parent / "tokens.db"
 
@@ -423,15 +482,28 @@ def fm_get_token_info(token_address: str) -> dict | None:
 def detect_venue(token_address: str) -> str:
     """
     检测代币当前的交易场所
-    返回: 'BONDING' (bonding curve) | 'PANCAKE' (已迁移到 PancakeSwap) | 'UNKNOWN'
+    返回: 'BONDING' (four.meme bonding curve) | 'FLAP' (flap bonding curve) |
+          'PANCAKE' (已迁移到 PancakeSwap) | 'UNKNOWN'
+    优先查 four.meme, 查不到再查 flap
     """
+    # 先查 four.meme
     info = fm_get_token_info(token_address)
-    if info is None:
+    if info is not None:
+        if info["liquidityAdded"]:
+            return "PANCAKE"
+        if info["offers"] > 0:
+            return "BONDING"
         return "UNKNOWN"
-    if info["liquidityAdded"]:
-        return "PANCAKE"
-    if info["offers"] > 0:
-        return "BONDING"
+
+    # four.meme 查不到, 尝试 flap
+    state = flap_get_token_state(token_address)
+    if state is not None:
+        if state["graduated"]:
+            return "PANCAKE"
+        if state["status"] in (1, 2):  # Tradable / InDuel
+            return "FLAP"
+        return "UNKNOWN"
+
     return "UNKNOWN"
 
 
@@ -726,6 +798,327 @@ def fm_sell_token(token_address: str, amount: int | None = None,
         return None
 
 
+# ===================================================================
+#  flap Bonding Curve 买卖
+# ===================================================================
+def flap_get_token_state(token_address: str) -> dict | None:
+    """
+    通过 RPC eth_call 调用 flap Portal 合约 getTokenV5(address) 读取代币状态
+    返回: {"status", "reserve", "price_native", "quote_token", "graduated", "progress"} 或 None
+    """
+    if not _w3:
+        return None
+    try:
+        # getTokenV5(address) selector: 0x5c4bc504
+        token_cs = Web3.to_checksum_address(token_address)
+        call_data = "0x5c4bc504" + token_cs[2:].lower().zfill(64)
+        result = _w3.eth.call({
+            "to": FLAP_PORTAL,
+            "data": call_data,
+        })
+        raw = result.hex()
+        if len(raw) < 576:
+            return None
+        words = [int(raw[i:i+64], 16) for i in range(0, min(len(raw), 768), 64)]
+
+        status = words[0]       # 0=Invalid, 1=Tradable, 2=InDuel, 3=Killed, 4=DEX
+        reserve_wei = words[1]
+        price_wei = words[3]
+
+        if status == 0:  # Invalid — 不是 flap 代币
+            return None
+
+        reserve_native = reserve_wei / 1e18
+        price_native = price_wei / 1e18
+        graduated = (status == 4)
+
+        # 解析 quote token 地址 (word[9])
+        quote_token = ZERO_ADDRESS
+        if len(words) > 9 and len(raw) >= 640:
+            qt_hex = raw[9 * 64 + 24: 9 * 64 + 64]
+            quote_token = ("0x" + qt_hex).lower()
+
+        # 计算进度
+        progress = 0.0
+        if graduated:
+            progress = 1.0
+        elif len(words) > 8 and words[5] > 0 and words[7] > 0 and words[8] > 0:
+            r_virtual = words[5] / 1e18
+            h_tokens = words[6] / 1e18
+            K = words[7] / 1e18
+            target_supply = words[8] / 1e18
+            x_target = 1e9 - target_supply
+            denominator = x_target + h_tokens
+            if denominator > 0:
+                target_reserve = K / denominator - r_virtual
+                if target_reserve > 0:
+                    progress = min(reserve_native / target_reserve, 1.0)
+
+        return {
+            "status": status,
+            "reserve": reserve_native,
+            "price_native": price_native,
+            "quote_token": quote_token,
+            "graduated": graduated,
+            "progress": progress,
+        }
+    except Exception as e:
+        log.debug("flap_get_token_state [%s]: %s", token_address[:16], e)
+        return None
+
+
+def flap_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
+                   token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
+    """
+    通过 flap Portal bonding curve 买入代币
+    自动检测 quote token:
+      - 零地址 = 原生 BNB: 用 BNB 直接买 (payable), 金额以 USDT 计价后换算为 BNB
+      - 稳定币 (USDT/USD1 等): 先 approve 再调用 buy (msg.value=0, Portal 从钱包 transferFrom)
+    """
+    if not _w3 or not _wallet_address or not _private_key:
+        log.error("Web3/钱包未初始化")
+        return None
+
+    token_cs = Web3.to_checksum_address(token_address)
+
+    try:
+        # 查询 flap 代币状态, 获取 quote token
+        state = flap_get_token_state(token_address)
+        if state is None:
+            log.error("flap: 无法获取代币状态: %s", token_name)
+            return None
+        if state["graduated"]:
+            log.info("flap: %s 已毕业, 切换到 PancakeSwap 买入", token_name)
+            return buy_token(token_address, buy_usdt, slippage_pct, token_name, bnb_price_usd)
+
+        quote_token = state["quote_token"]
+
+        portal = _w3.eth.contract(address=FLAP_PORTAL, abi=FLAP_PORTAL_ABI)
+        token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+
+        # flap buy() 是 payable, 统一用 BNB 支付 (合约内部自动处理 quote token 转换)
+        buy_bnb = buy_usdt / bnb_price_usd
+        buy_bnb_wei = Web3.to_wei(buy_bnb, "ether")
+
+        # 检查 BNB 余额
+        bnb_balance = get_bnb_balance()
+        gas_reserve = 0.002
+        if bnb_balance < buy_bnb + gas_reserve:
+            log.error("flap: BNB 余额不足: 需要 %.6f BNB, 当前 %.6f BNB",
+                      buy_bnb + gas_reserve, bnb_balance)
+            return None
+
+        log.info("flap 买入 %s: $%.2f → %.6f BNB (quote: %s)",
+                 token_name, buy_usdt, buy_bnb, quote_token[:16])
+
+        # previewBuy 预估
+        try:
+            estimated_amount = portal.functions.previewBuy(token_cs, buy_bnb_wei).call()
+            min_amount = int(estimated_amount * (1 - slippage_pct / 100))
+            log.info("flap 预估: 花费 %.6f BNB → %s 代币", buy_bnb, estimated_amount)
+        except Exception as e:
+            log.warning("flap previewBuy 失败: %s, 使用 minAmount=0", e)
+            min_amount = 0
+
+        msg_value = buy_bnb_wei
+
+        # ===== 执行买入 =====
+        balance_before = token_contract.functions.balanceOf(_wallet_address).call()
+
+        nonce = _w3.eth.get_transaction_count(_wallet_address)
+        tx = portal.functions.buy(
+            token_cs, _wallet_address, min_amount,
+        ).build_transaction({
+            "from": _wallet_address, "value": msg_value,
+            "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
+            "nonce": nonce, "chainId": BSC_CHAIN_ID,
+        })
+
+        signed = _w3.eth.account.sign_transaction(tx, _private_key)
+        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("flap 买入 TX: %s", tx_hash.hex())
+
+        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] != 1:
+            log.error("flap 买入失败: %s", tx_hash.hex())
+            return None
+
+        balance_after = token_contract.functions.balanceOf(_wallet_address).call()
+        actual_received = balance_after - balance_before
+        decimals = token_contract.functions.decimals().call()
+
+        if actual_received <= 0:
+            log.error("flap 买入异常: TX 成功但未收到代币 %s (TX: %s)",
+                      token_name or token_address[:16], tx_hash.hex())
+            return None
+
+        buy_price_usd = buy_usdt / (actual_received / 10**decimals)
+
+        log.info("flap 买入成功 %s: $%.2f (%.6f BNB) → %s 代币, 单价 $%.12f",
+                 token_name or token_address[:16], buy_usdt, buy_bnb,
+                 actual_received, buy_price_usd)
+
+        return {
+            "tx_hash": tx_hash.hex(),
+            "token_amount": str(actual_received),
+            "decimals": decimals,
+            "buy_price_usd": buy_price_usd,
+            "buy_bnb": buy_bnb,
+            "venue": "FLAP",
+        }
+
+    except Exception as e:
+        log.error("flap 买入异常 [%s]: %s", token_name or token_address[:16], e)
+        return None
+
+
+def flap_sell_token(token_address: str, amount: int | None = None,
+                    token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
+    """
+    通过 flap Portal bonding curve 卖出代币
+    卖出收到 quote token (BNB 或 ERC20)
+    """
+    if not _w3 or not _wallet_address or not _private_key:
+        log.error("Web3/钱包未初始化")
+        return None
+
+    token_cs = Web3.to_checksum_address(token_address)
+
+    try:
+        token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+
+        if amount is None:
+            amount = token_contract.functions.balanceOf(_wallet_address).call()
+        if amount <= 0:
+            log.warning("flap: 无代币可卖: %s", token_name or token_address[:16])
+            return None
+
+        # 查询 flap 代币状态
+        state = flap_get_token_state(token_address)
+        if state is None:
+            log.warning("flap: 无法获取代币状态, 尝试 PancakeSwap 卖出: %s", token_name)
+            return sell_token(token_address, amount, token_name=token_name,
+                              bnb_price_usd=bnb_price_usd)
+        if state["graduated"]:
+            log.info("flap: %s 已毕业, 切换到 PancakeSwap 卖出", token_name)
+            return sell_token(token_address, amount, token_name=token_name,
+                              bnb_price_usd=bnb_price_usd)
+
+        quote_token = state["quote_token"]
+        is_erc20_quote = quote_token != ZERO_ADDRESS and quote_token != ("0x" + "0" * 40)
+
+        portal = _w3.eth.contract(address=FLAP_PORTAL, abi=FLAP_PORTAL_ABI)
+
+        # Approve Portal 使用代币
+        allowance = token_contract.functions.allowance(_wallet_address, FLAP_PORTAL).call()
+        if allowance < amount:
+            log.info("flap: Approve 代币 to Portal: %s", token_name)
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            approve_tx = token_contract.functions.approve(
+                FLAP_PORTAL, MAX_UINT256
+            ).build_transaction({
+                "from": _wallet_address, "gas": DEFAULT_GAS_APPROVE,
+                "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
+            signed = _w3.eth.account.sign_transaction(approve_tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("flap: 代币 Approve 失败")
+                return None
+            time.sleep(2)
+
+        # previewSell 预估收益
+        try:
+            estimated_eth = portal.functions.previewSell(token_cs, amount).call()
+            min_eth = int(estimated_eth * (1 - 15.0 / 100))  # 卖出滑点 15%
+            log.info("flap 预估卖出: %s 代币 → %s quote", amount, estimated_eth)
+        except Exception as e:
+            log.warning("flap previewSell 失败: %s, 使用 minEth=0", e)
+            min_eth = 0
+
+        # 记录卖出前余额
+        if is_erc20_quote:
+            quote_cs = Web3.to_checksum_address(quote_token)
+            quote_contract = _w3.eth.contract(address=quote_cs, abi=ERC20_ABI)
+            balance_before = quote_contract.functions.balanceOf(_wallet_address).call()
+        else:
+            balance_before = _w3.eth.get_balance(_wallet_address)
+
+        # 执行卖出
+        nonce = _w3.eth.get_transaction_count(_wallet_address)
+        tx = portal.functions.sell(
+            token_cs, amount, min_eth,
+        ).build_transaction({
+            "from": _wallet_address, "gas": DEFAULT_GAS_SWAP,
+            "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
+        })
+
+        signed = _w3.eth.account.sign_transaction(tx, _private_key)
+        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("flap 卖出 TX: %s", tx_hash.hex())
+
+        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] != 1:
+            log.error("flap 卖出失败: %s", tx_hash.hex())
+            return None
+
+        # 计算收到的金额
+        if is_erc20_quote:
+            balance_after = quote_contract.functions.balanceOf(_wallet_address).call()
+            quote_decimals = quote_contract.functions.decimals().call()
+            received = (balance_after - balance_before) / (10 ** quote_decimals)
+            log.info("flap 卖出成功 %s [ERC20报价]: 收回 %.4f",
+                     token_name or token_address[:16], received)
+            return {
+                "tx_hash": tx_hash.hex(),
+                "usdt_received": received,  # 稳定币 ≈ USD
+            }
+        else:
+            balance_after = _w3.eth.get_balance(_wallet_address)
+            gas_cost = receipt["gasUsed"] * receipt["effectiveGasPrice"]
+            bnb_received = float(Web3.from_wei(balance_after - balance_before + gas_cost, "ether"))
+            usdt_received = bnb_received * bnb_price_usd
+            log.info("flap 卖出成功 %s [BNB报价]: 收回 %.6f BNB ($%.4f)",
+                     token_name or token_address[:16], bnb_received, usdt_received)
+            return {
+                "tx_hash": tx_hash.hex(),
+                "usdt_received": usdt_received,
+                "bnb_received": bnb_received,
+            }
+
+    except Exception as e:
+        log.error("flap 卖出异常 [%s]: %s", token_name or token_address[:16], e)
+        return None
+
+
+def get_token_price_flap(token_address: str, bnb_price_usd: float = 600.0) -> float | None:
+    """
+    通过 flap Portal previewBuy 查询 bonding curve 上的代币价格
+    返回: 1 个代币值多少 USD
+    """
+    if not _w3:
+        return None
+    try:
+        state = flap_get_token_state(token_address)
+        if state is None:
+            return None
+        # 直接用链上价格换算
+        price_native = state["price_native"]
+        if price_native <= 0:
+            return None
+        quote_token = state["quote_token"]
+        qt = quote_token.lower()
+        if qt == ZERO_ADDRESS or qt == ("0x" + "0" * 40):
+            return price_native * bnb_price_usd
+        if qt in FLAP_STABLE_QUOTES:
+            return price_native  # 已是 USD 计价
+        return None  # 非标 quote token, 无法换算
+    except Exception as e:
+        log.debug("get_token_price_flap [%s]: %s", token_address[:16], e)
+        return None
+
+
 def get_token_price_bnb_bonding(token_address: str,
                                  amount_in_bnb: float = 0.001) -> float | None:
     """
@@ -756,7 +1149,7 @@ def get_token_price_usd_auto(token_address: str, bnb_price_usd: float,
                               venue: str = "") -> float | None:
     """
     自动检测交易场所并获取 USD 价格
-    优先尝试 PancakeSwap, 失败则尝试 bonding curve
+    优先尝试 PancakeSwap, 失败则尝试 four.meme bonding curve, 再尝试 flap
     """
     if venue == "PANCAKE":
         price = get_token_price_bnb(token_address)
@@ -768,13 +1161,21 @@ def get_token_price_usd_auto(token_address: str, bnb_price_usd: float,
         if price is not None:
             return price * bnb_price_usd
 
-    # 自动检测: 先试 PancakeSwap, 再试 bonding curve
+    if venue == "FLAP":
+        price = get_token_price_flap(token_address, bnb_price_usd)
+        if price is not None:
+            return price
+
+    # 自动检测: 先试 PancakeSwap, 再试 four.meme bonding curve, 最后试 flap
     price = get_token_price_bnb(token_address)
     if price is not None:
         return price * bnb_price_usd
     price = get_token_price_bnb_bonding(token_address)
     if price is not None:
         return price * bnb_price_usd
+    price = get_token_price_flap(token_address, bnb_price_usd)
+    if price is not None:
+        return price
     return None
 
 
@@ -1446,6 +1847,9 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
                     log.info("代币 %s 报价币: USDT", name)
                 else:
                     log.info("代币 %s 报价币: BNB", name)
+        elif venue == "FLAP":
+            # flap buy() 是 payable, 统一用 BNB 支付
+            log.info("代币 %s (flap)", name)
 
         # 计算买入金额 (根据支付币种选择对应余额)
         buy_usdt = calculate_buy_amount(cfg, bnb_price_usd, pay_currency)
@@ -1456,6 +1860,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         result = None
         if venue == "BONDING":
             result = fm_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
+        elif venue == "FLAP":
+            result = flap_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
         elif venue == "PANCAKE":
             result = buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
         else:
@@ -1624,6 +2030,9 @@ def monitor_positions(cfg_loader, bnb_price_func):
                     if current_venue == "BONDING":
                         sell_result = fm_sell_token(addr, token_name=name,
                                                     bnb_price_usd=bnb_price)
+                    elif current_venue == "FLAP":
+                        sell_result = flap_sell_token(addr, token_name=name,
+                                                      bnb_price_usd=bnb_price)
                     else:
                         sell_result = sell_token(addr, slippage_pct=slippage,
                                                  token_name=name,
