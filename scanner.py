@@ -3842,6 +3842,7 @@ def scan_once(cfg: dict) -> None:
                 "name": item.get("name", ""),
                 "shortName": item.get("symbol", ""),
                 "channel": "graduated" if item.get("isGraduated") else "quality",
+                "source": item.get("source", "four.meme"),
             }
             detail_data = {
                 "holders": item.get("holders", 0),

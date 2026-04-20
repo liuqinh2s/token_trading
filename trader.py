@@ -2,12 +2,20 @@
 BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding Curve
 买入:
   - four.meme bonding curve: 根据报价币 (quote) 自动选择 BNB 或 USDT 直接买入
-  - flap bonding curve: 根据 quote token 自动选择 BNB 或 ERC20 (USD1/USDT) 买入
+  - flap bonding curve: 统一通过 Router 合约用 BNB 买入 (Portal 有 access control)
   - PancakeSwap: 用 BNB 直接买入 (BNB → Token)
   - 买入金额以 USDT 计价, BNB 报价时自动换算
+
+  flap 平台交易架构:
+    - Portal (0xe2cE6ab...): 状态查询 (getTokenV5) + 事件发射, 不可直接调用 buy/sell
+    - Router (0x296B001...): 所有 flap 代币的交易入口 (买入/卖出), 内部调用 Portal
+    - Portal 对外部直接调用 buy()/sell() 返回 0xac5f6092 (access control)
+    - Router swap 函数 selector: 0x27772d13 (未公开 ABI, 通过逆向链上交易得到)
+    - 不管 quote token 是什么 (BNB/USD1/USDT), Router 统一用 BNB 支付/收取
+
 卖出:
   - four.meme bonding curve: 卖出收到报价币 (BNB 或 USDT)
-  - flap bonding curve: 卖出收到 quote token (BNB 或 ERC20)
+  - flap bonding curve: 通过 Router 卖出, 收到 BNB (gas 较高, 需 700k)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
   1. 暴涨止盈: 盈利达到 2000% (20倍) 立即全部卖出, 落袋为安
   2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
@@ -217,7 +225,11 @@ FM_HELPER_ABI = json.loads("""[
 # flap 合约地址 (BSC 链上代币发射平台, 来源: docs.flap.sh)
 # Portal: 事件发射 + 交易合约 (buy/sell/previewBuy/previewSell/getTokenV5)
 FLAP_PORTAL = Web3.to_checksum_address("0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0")
+# Router: 税币 (7777) 必须通过 Router 交易, Portal 对税币有 access control
+FLAP_ROUTER = Web3.to_checksum_address("0x296B00198Dc7eC3410e12da814D9267bB8dF506A")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+# 0xEeee...eee 代表原生代币 (BNB), Router 合约使用此地址标识 native token
+FLAP_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 
 # flap quote token 分类 (用于价格换算和支付方式判断)
 # 零地址 = 原生 BNB; 稳定币 = USD 计价
@@ -479,14 +491,24 @@ def fm_get_token_info(token_address: str) -> dict | None:
         return None
 
 
-def detect_venue(token_address: str) -> str:
+def detect_venue(token_address: str, source_hint: str = "") -> str:
     """
     检测代币当前的交易场所
     返回: 'BONDING' (four.meme bonding curve) | 'FLAP' (flap bonding curve) |
           'PANCAKE' (已迁移到 PancakeSwap) | 'UNKNOWN'
-    优先查 four.meme, 查不到再查 flap
+    source_hint: 可选来源提示 ("flap" / "four.meme"), 优先查对应平台, 减少无效 RPC 调用
     """
-    # 先查 four.meme
+    if source_hint == "flap":
+        # flap 代币: 只查 flap Portal, 两个平台完全独立
+        state = flap_get_token_state(token_address)
+        if state is not None:
+            if state["graduated"]:
+                return "PANCAKE"
+            if state["status"] in (1, 2):  # Tradable / InDuel
+                return "FLAP"
+        return "UNKNOWN"
+
+    # 默认: 先查 four.meme, 查不到再查 flap
     info = fm_get_token_info(token_address)
     if info is not None:
         if info["liquidityAdded"]:
@@ -867,80 +889,145 @@ def flap_get_token_state(token_address: str) -> dict | None:
         return None
 
 
-def flap_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
-                   token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
+def _flap_router_buy(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
+                     token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
     """
-    通过 flap Portal bonding curve 买入代币
-    自动检测 quote token:
-      - 零地址 = 原生 BNB: 用 BNB 直接买 (payable), 金额以 USDT 计价后换算为 BNB
-      - 稳定币 (USDT/USD1 等): 先 approve 再调用 buy (msg.value=0, Portal 从钱包 transferFrom)
+    通过 flap Router 合约买入税币 (7777 后缀)
+    Portal 对税币有 access control, 必须通过 Router 中转。
+    Router 函数 selector: 0x27772d13 (未公开 ABI, 通过逆向链上交易得到)
+    参数结构 (ABI-encoded struct):
+      tokenIn: address (0xEeee...eee = native BNB)
+      tokenOut: address (目标代币)
+      amountIn: uint256 (BNB 金额 wei)
+      minAmountOut: uint256 (最小输出, 不能为 0)
+      ... routing info (WBNB, token, Portal 地址)
     """
-    if not _w3 or not _wallet_address or not _private_key:
-        log.error("Web3/钱包未初始化")
-        return None
-
     token_cs = Web3.to_checksum_address(token_address)
-
     try:
-        # 查询 flap 代币状态, 获取 quote token
+        # 查询代币状态
         state = flap_get_token_state(token_address)
         if state is None:
-            log.error("flap: 无法获取代币状态: %s", token_name)
+            log.error("flap router: 无法获取代币状态: %s", token_name)
             return None
         if state["graduated"]:
-            log.info("flap: %s 已毕业, 切换到 PancakeSwap 买入", token_name)
+            log.info("flap router: %s 已毕业, 切换到 PancakeSwap 买入", token_name)
             return buy_token(token_address, buy_usdt, slippage_pct, token_name, bnb_price_usd)
 
-        quote_token = state["quote_token"]
-
-        portal = _w3.eth.contract(address=FLAP_PORTAL, abi=FLAP_PORTAL_ABI)
-        token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
-
-        # flap buy() 是 payable, 统一用 BNB 支付 (合约内部自动处理 quote token 转换)
         buy_bnb = buy_usdt / bnb_price_usd
-        buy_bnb_wei = Web3.to_wei(buy_bnb, "ether")
+        buy_wei = Web3.to_wei(buy_bnb, "ether")
 
         # 检查 BNB 余额
         bnb_balance = get_bnb_balance()
         gas_reserve = 0.002
         if bnb_balance < buy_bnb + gas_reserve:
-            log.error("flap: BNB 余额不足: 需要 %.6f BNB, 当前 %.6f BNB",
+            log.error("flap router: BNB 余额不足: 需要 %.6f BNB, 当前 %.6f BNB",
                       buy_bnb + gas_reserve, bnb_balance)
             return None
 
-        log.info("flap 买入 %s: $%.2f → %.6f BNB (quote: %s)",
-                 token_name, buy_usdt, buy_bnb, quote_token[:16])
+        token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
 
-        # previewBuy 预估
+        # 构造 Router calldata (逆向自链上成功交易)
+        # selector: 0x27772d13
+        # struct 参数: offset(32) + struct fields
+        selector = "27772d13"
+        native = FLAP_NATIVE_TOKEN[2:].lower().zfill(64)
+        token_hex = token_cs[2:].lower().zfill(64)
+        amount_hex = hex(buy_wei)[2:].zfill(64)
+        # minAmountOut = 1 (Router 不允许 0, 实际滑点由链上价格决定)
+        min_out_hex = hex(1)[2:].zfill(64)
+        wbnb_hex = WBNB[2:].lower().zfill(64)
+        portal_hex = FLAP_PORTAL[2:].lower().zfill(64)
+        recipient_hex = _wallet_address[2:].lower().zfill(64)
+        zero_hex = "0" * 64
+
+        # 完整 calldata 结构 (从链上成功交易逆向):
+        # [0] offset to struct = 32
+        # struct:
+        #   [0] tokenIn (native)
+        #   [1] tokenOut (target)
+        #   [2] amountIn
+        #   [3] minAmountOut
+        #   [4] deadline (0)
+        #   [5] 0x50 = 80 (offset to recipient within struct)
+        #   [6] recipient
+        #   [7] 0
+        #   [8] 0
+        #   [9] 0x180 = 384 (offset to route array)
+        #   [10] 0x1a0 = 416 (offset)
+        #   [11] 0x1c0 = 448 (offset)
+        #   [12] 0
+        #   [13] 0
+        #   [14] 1 (route length)
+        #   [15] 0x20 = 32 (offset to route[0])
+        #   [16] 0
+        #   [17] WBNB
+        #   [18] tokenOut
+        #   [19] Portal
+        #   [20] 0
+        #   [21] 0xc0 = 192 (offset)
+        #   [22] 0
+        calldata = selector
+        calldata += hex(32)[2:].zfill(64)  # offset to struct
+        calldata += native                  # [0] tokenIn
+        calldata += token_hex               # [1] tokenOut
+        calldata += amount_hex              # [2] amountIn
+        calldata += min_out_hex             # [3] minAmountOut
+        calldata += zero_hex                # [4] deadline = 0
+        calldata += hex(80)[2:].zfill(64)   # [5] offset 0x50
+        calldata += recipient_hex           # [6] recipient
+        calldata += zero_hex                # [7] 0
+        calldata += zero_hex                # [8] 0
+        calldata += hex(384)[2:].zfill(64)  # [9] offset 0x180
+        calldata += hex(416)[2:].zfill(64)  # [10] offset 0x1a0
+        calldata += hex(448)[2:].zfill(64)  # [11] offset 0x1c0
+        calldata += zero_hex                # [12] 0
+        calldata += zero_hex                # [13] 0
+        calldata += hex(1)[2:].zfill(64)    # [14] route length = 1
+        calldata += hex(32)[2:].zfill(64)   # [15] offset to route[0]
+        calldata += zero_hex                # [16] 0
+        calldata += wbnb_hex                # [17] WBNB
+        calldata += token_hex               # [18] tokenOut
+        calldata += portal_hex              # [19] Portal
+        calldata += zero_hex                # [20] 0
+        calldata += hex(192)[2:].zfill(64)  # [21] offset 0xc0
+        calldata += zero_hex                # [22] 0
+
+        # 先模拟
         try:
-            estimated_amount = portal.functions.previewBuy(token_cs, buy_bnb_wei).call()
-            min_amount = int(estimated_amount * (1 - slippage_pct / 100))
-            log.info("flap 预估: 花费 %.6f BNB → %s 代币", buy_bnb, estimated_amount)
+            result = _w3.eth.call({
+                "from": _wallet_address,
+                "to": FLAP_ROUTER,
+                "data": "0x" + calldata,
+                "value": buy_wei,
+            })
+            estimated = int(result.hex(), 16)
+            log.info("flap router 预估: %.6f BNB → %s 代币", buy_bnb, estimated)
         except Exception as e:
-            log.warning("flap previewBuy 失败: %s, 使用 minAmount=0", e)
-            min_amount = 0
+            log.warning("flap router 模拟失败: %s, 继续尝试发送", e)
+            estimated = 0
 
-        msg_value = buy_bnb_wei
-
-        # ===== 执行买入 =====
+        # 执行买入
         balance_before = token_contract.functions.balanceOf(_wallet_address).call()
 
         nonce = _w3.eth.get_transaction_count(_wallet_address)
-        tx = portal.functions.buy(
-            token_cs, _wallet_address, min_amount,
-        ).build_transaction({
-            "from": _wallet_address, "value": msg_value,
-            "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
-            "nonce": nonce, "chainId": BSC_CHAIN_ID,
-        })
+        tx = {
+            "from": _wallet_address,
+            "to": FLAP_ROUTER,
+            "data": "0x" + calldata,
+            "value": buy_wei,
+            "gas": 500_000,
+            "gasPrice": _w3.eth.gas_price,
+            "nonce": nonce,
+            "chainId": BSC_CHAIN_ID,
+        }
 
         signed = _w3.eth.account.sign_transaction(tx, _private_key)
         tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("flap 买入 TX: %s", tx_hash.hex())
+        log.info("flap router 买入 TX: %s", tx_hash.hex())
 
         receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
         if receipt["status"] != 1:
-            log.error("flap 买入失败: %s", tx_hash.hex())
+            log.error("flap router 买入失败: %s", tx_hash.hex())
             return None
 
         balance_after = token_contract.functions.balanceOf(_wallet_address).call()
@@ -948,13 +1035,13 @@ def flap_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12
         decimals = token_contract.functions.decimals().call()
 
         if actual_received <= 0:
-            log.error("flap 买入异常: TX 成功但未收到代币 %s (TX: %s)",
+            log.error("flap router 买入异常: TX 成功但未收到代币 %s (TX: %s)",
                       token_name or token_address[:16], tx_hash.hex())
             return None
 
         buy_price_usd = buy_usdt / (actual_received / 10**decimals)
 
-        log.info("flap 买入成功 %s: $%.2f (%.6f BNB) → %s 代币, 单价 $%.12f",
+        log.info("flap router 买入成功 %s: $%.2f (%.6f BNB) → %s 代币, 单价 $%.12f",
                  token_name or token_address[:16], buy_usdt, buy_bnb,
                  actual_received, buy_price_usd)
 
@@ -968,15 +1055,158 @@ def flap_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12
         }
 
     except Exception as e:
-        log.error("flap 买入异常 [%s]: %s", token_name or token_address[:16], e)
+        log.error("flap router 买入异常 [%s]: %s", token_name or token_address[:16], e)
         return None
+
+
+def _flap_router_sell(token_address: str, amount: int,
+                      token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
+    """
+    通过 flap Router 合约卖出税币 (7777 后缀)
+    Router 函数 selector: 0x27772d13 (与买入相同的 swap 函数, tokenIn/tokenOut 互换)
+    """
+    token_cs = Web3.to_checksum_address(token_address)
+    try:
+        token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+        decimals = token_contract.functions.decimals().call()
+
+        # Approve Router 使用代币
+        allowance = token_contract.functions.allowance(_wallet_address, FLAP_ROUTER).call()
+        if allowance < amount:
+            log.info("flap router: Approve 代币 to Router: %s", token_name)
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            approve_tx = token_contract.functions.approve(
+                FLAP_ROUTER, MAX_UINT256
+            ).build_transaction({
+                "from": _wallet_address, "gas": DEFAULT_GAS_APPROVE,
+                "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
+            signed = _w3.eth.account.sign_transaction(approve_tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("flap router: 代币 Approve 失败")
+                return None
+            time.sleep(2)
+
+        # 构造 Router sell calldata (与 buy 结构相同, tokenIn/tokenOut 互换)
+        # 卖出: tokenIn = 代币, tokenOut = NATIVE (BNB)
+        selector = "27772d13"
+        token_hex = token_cs[2:].lower().zfill(64)
+        native = FLAP_NATIVE_TOKEN[2:].lower().zfill(64)
+        amount_hex = hex(amount)[2:].zfill(64)
+        min_out_hex = hex(1)[2:].zfill(64)  # minAmountOut = 1
+        wbnb_hex = WBNB[2:].lower().zfill(64)
+        portal_hex = FLAP_PORTAL[2:].lower().zfill(64)
+        recipient_hex = _wallet_address[2:].lower().zfill(64)
+        zero_hex = "0" * 64
+
+        calldata = selector
+        calldata += hex(32)[2:].zfill(64)   # offset to struct
+        calldata += token_hex               # [0] tokenIn = 代币
+        calldata += native                  # [1] tokenOut = NATIVE (BNB)
+        calldata += amount_hex              # [2] amountIn = 卖出数量
+        calldata += min_out_hex             # [3] minAmountOut = 1
+        calldata += zero_hex                # [4] deadline = 0
+        calldata += hex(80)[2:].zfill(64)   # [5] offset 0x50
+        calldata += recipient_hex           # [6] recipient
+        calldata += zero_hex                # [7] 0
+        calldata += zero_hex                # [8] 0
+        calldata += hex(384)[2:].zfill(64)  # [9] offset 0x180
+        calldata += hex(416)[2:].zfill(64)  # [10] offset 0x1a0
+        calldata += hex(448)[2:].zfill(64)  # [11] offset 0x1c0
+        calldata += zero_hex                # [12] 0
+        calldata += zero_hex                # [13] 0
+        calldata += hex(1)[2:].zfill(64)    # [14] route length = 1
+        calldata += hex(32)[2:].zfill(64)   # [15] offset to route[0]
+        calldata += zero_hex                # [16] 0
+        calldata += token_hex               # [17] tokenIn (代币)
+        calldata += wbnb_hex                # [18] WBNB
+        calldata += portal_hex              # [19] Portal
+        calldata += zero_hex                # [20] 0
+        calldata += hex(192)[2:].zfill(64)  # [21] offset 0xc0
+        calldata += zero_hex                # [22] 0
+
+        # 模拟
+        try:
+            result = _w3.eth.call({
+                "from": _wallet_address,
+                "to": FLAP_ROUTER,
+                "data": "0x" + calldata,
+                "value": 0,
+            })
+            estimated_bnb = int(result.hex(), 16)
+            log.info("flap router 预估卖出: %s 代币 → %s wei BNB",
+                     amount, estimated_bnb)
+        except Exception as e:
+            log.warning("flap router 卖出模拟失败: %s", e)
+            estimated_bnb = 0
+
+        # 记录卖出前 BNB 余额
+        balance_before = _w3.eth.get_balance(_wallet_address)
+
+        # 执行卖出 (msg.value = 0, 卖代币收 BNB)
+        nonce = _w3.eth.get_transaction_count(_wallet_address)
+        tx = {
+            "from": _wallet_address,
+            "to": FLAP_ROUTER,
+            "data": "0x" + calldata,
+            "value": 0,
+            "gas": 700_000,  # 卖出 gas 消耗较高 (~570k), 需要充足余量
+            "gasPrice": _w3.eth.gas_price,
+            "nonce": nonce,
+            "chainId": BSC_CHAIN_ID,
+        }
+
+        signed = _w3.eth.account.sign_transaction(tx, _private_key)
+        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("flap router 卖出 TX: %s", tx_hash.hex())
+
+        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+        if receipt["status"] != 1:
+            log.error("flap router 卖出失败: %s", tx_hash.hex())
+            return None
+
+        # 计算收到的 BNB
+        balance_after = _w3.eth.get_balance(_wallet_address)
+        gas_cost = receipt["gasUsed"] * receipt["effectiveGasPrice"]
+        bnb_received = float(Web3.from_wei(balance_after - balance_before + gas_cost, "ether"))
+        usdt_received = bnb_received * bnb_price_usd
+
+        log.info("flap router 卖出成功 %s: %d 代币 → %.6f BNB ($%.4f)",
+                 token_name or token_address[:16], amount, bnb_received, usdt_received)
+
+        return {
+            "tx_hash": tx_hash.hex(),
+            "usdt_received": usdt_received,
+            "bnb_received": bnb_received,
+        }
+
+    except Exception as e:
+        log.error("flap router 卖出异常 [%s]: %s", token_name or token_address[:16], e)
+        return None
+
+
+def flap_buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
+                   token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
+    """
+    通过 flap Router 合约买入代币 (所有 flap 代币统一走 Router)
+    Portal 对外部直接调用有 access control (error 0xac5f6092), 必须通过 Router 中转。
+    Router 内部调用 Portal 完成实际交易, TokenBought 事件仍从 Portal 发出。
+    """
+    if not _w3 or not _wallet_address or not _private_key:
+        log.error("Web3/钱包未初始化")
+        return None
+    return _flap_router_buy(token_address, buy_usdt, slippage_pct,
+                            token_name, bnb_price_usd)
 
 
 def flap_sell_token(token_address: str, amount: int | None = None,
                     token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
     """
-    通过 flap Portal bonding curve 卖出代币
-    卖出收到 quote token (BNB 或 ERC20)
+    通过 flap Router 合约卖出代币 (所有 flap 代币统一走 Router)
+    Portal 对外部直接调用有 access control (error 0xac5f6092), 必须通过 Router 中转。
+    卖出 gas 消耗较高 (~570k), 需要设置 gas limit ≥ 700000。
     """
     if not _w3 or not _wallet_address or not _private_key:
         log.error("Web3/钱包未初始化")
@@ -1004,88 +1234,8 @@ def flap_sell_token(token_address: str, amount: int | None = None,
             return sell_token(token_address, amount, token_name=token_name,
                               bnb_price_usd=bnb_price_usd)
 
-        quote_token = state["quote_token"]
-        is_erc20_quote = quote_token != ZERO_ADDRESS and quote_token != ("0x" + "0" * 40)
-
-        portal = _w3.eth.contract(address=FLAP_PORTAL, abi=FLAP_PORTAL_ABI)
-
-        # Approve Portal 使用代币
-        allowance = token_contract.functions.allowance(_wallet_address, FLAP_PORTAL).call()
-        if allowance < amount:
-            log.info("flap: Approve 代币 to Portal: %s", token_name)
-            nonce = _w3.eth.get_transaction_count(_wallet_address)
-            approve_tx = token_contract.functions.approve(
-                FLAP_PORTAL, MAX_UINT256
-            ).build_transaction({
-                "from": _wallet_address, "gas": DEFAULT_GAS_APPROVE,
-                "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
-            })
-            signed = _w3.eth.account.sign_transaction(approve_tx, _private_key)
-            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-            if receipt["status"] != 1:
-                log.error("flap: 代币 Approve 失败")
-                return None
-            time.sleep(2)
-
-        # previewSell 预估收益
-        try:
-            estimated_eth = portal.functions.previewSell(token_cs, amount).call()
-            min_eth = int(estimated_eth * (1 - 15.0 / 100))  # 卖出滑点 15%
-            log.info("flap 预估卖出: %s 代币 → %s quote", amount, estimated_eth)
-        except Exception as e:
-            log.warning("flap previewSell 失败: %s, 使用 minEth=0", e)
-            min_eth = 0
-
-        # 记录卖出前余额
-        if is_erc20_quote:
-            quote_cs = Web3.to_checksum_address(quote_token)
-            quote_contract = _w3.eth.contract(address=quote_cs, abi=ERC20_ABI)
-            balance_before = quote_contract.functions.balanceOf(_wallet_address).call()
-        else:
-            balance_before = _w3.eth.get_balance(_wallet_address)
-
-        # 执行卖出
-        nonce = _w3.eth.get_transaction_count(_wallet_address)
-        tx = portal.functions.sell(
-            token_cs, amount, min_eth,
-        ).build_transaction({
-            "from": _wallet_address, "gas": DEFAULT_GAS_SWAP,
-            "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
-        })
-
-        signed = _w3.eth.account.sign_transaction(tx, _private_key)
-        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("flap 卖出 TX: %s", tx_hash.hex())
-
-        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            log.error("flap 卖出失败: %s", tx_hash.hex())
-            return None
-
-        # 计算收到的金额
-        if is_erc20_quote:
-            balance_after = quote_contract.functions.balanceOf(_wallet_address).call()
-            quote_decimals = quote_contract.functions.decimals().call()
-            received = (balance_after - balance_before) / (10 ** quote_decimals)
-            log.info("flap 卖出成功 %s [ERC20报价]: 收回 %.4f",
-                     token_name or token_address[:16], received)
-            return {
-                "tx_hash": tx_hash.hex(),
-                "usdt_received": received,  # 稳定币 ≈ USD
-            }
-        else:
-            balance_after = _w3.eth.get_balance(_wallet_address)
-            gas_cost = receipt["gasUsed"] * receipt["effectiveGasPrice"]
-            bnb_received = float(Web3.from_wei(balance_after - balance_before + gas_cost, "ether"))
-            usdt_received = bnb_received * bnb_price_usd
-            log.info("flap 卖出成功 %s [BNB报价]: 收回 %.6f BNB ($%.4f)",
-                     token_name or token_address[:16], bnb_received, usdt_received)
-            return {
-                "tx_hash": tx_hash.hex(),
-                "usdt_received": usdt_received,
-                "bnb_received": bnb_received,
-            }
+        # 所有 flap 代币统一走 Router
+        return _flap_router_sell(token_address, amount, token_name, bnb_price_usd)
 
     except Exception as e:
         log.error("flap 卖出异常 [%s]: %s", token_name or token_address[:16], e)
@@ -1149,24 +1299,36 @@ def get_token_price_usd_auto(token_address: str, bnb_price_usd: float,
                               venue: str = "") -> float | None:
     """
     自动检测交易场所并获取 USD 价格
-    优先尝试 PancakeSwap, 失败则尝试 four.meme bonding curve, 再尝试 flap
+    venue 非空时优先查对应平台, 失败后再尝试其他平台
     """
     if venue == "PANCAKE":
         price = get_token_price_bnb(token_address)
         if price is not None:
             return price * bnb_price_usd
+        # PancakeSwap 失败, 不再尝试其他 (已毕业的币不会在 bonding curve 上)
+        return None
 
     if venue == "BONDING":
         price = get_token_price_bnb_bonding(token_address)
         if price is not None:
             return price * bnb_price_usd
+        # bonding curve 失败, 尝试 PancakeSwap (可能刚毕业)
+        price = get_token_price_bnb(token_address)
+        if price is not None:
+            return price * bnb_price_usd
+        return None
 
     if venue == "FLAP":
         price = get_token_price_flap(token_address, bnb_price_usd)
         if price is not None:
             return price
+        # flap bonding curve 失败, 尝试 PancakeSwap (可能刚毕业)
+        price = get_token_price_bnb(token_address)
+        if price is not None:
+            return price * bnb_price_usd
+        return None
 
-    # 自动检测: 先试 PancakeSwap, 再试 four.meme bonding curve, 最后试 flap
+    # 无 venue 提示: 先试 PancakeSwap, 再试 four.meme bonding curve, 最后试 flap
     price = get_token_price_bnb(token_address)
     if price is not None:
         return price * bnb_price_usd
@@ -1804,6 +1966,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
         channel = tk.get("channel", "quality")  # 通道: quality / graduated
+        source = tk.get("source", "")  # 来源平台: "flap" / "four.meme"
 
         # 检查是否已有持仓
         if has_open_position(conn, addr):
@@ -1819,7 +1982,9 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         # 价格保护: 买入前查实时价格, 和精筛价格对比
         scan_price = detail.get("price", 0)
         if scan_price > 0 and max_price_deviation > 0:
-            realtime_price = get_token_price_usd_auto(addr, bnb_price_usd)
+            # 根据来源提示优先查对应平台价格, 减少无效 API 调用
+            venue_hint = "FLAP" if source == "flap" else ""
+            realtime_price = get_token_price_usd_auto(addr, bnb_price_usd, venue=venue_hint)
             if realtime_price and realtime_price > 0:
                 deviation = realtime_price / scan_price
                 if deviation > max_price_deviation:
@@ -1832,8 +1997,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
                 log.warning("跳过 %s: 无法获取实时价格, 放弃买入", name)
                 continue
 
-        # 检测交易场所
-        venue = detect_venue(addr)
+        # 检测交易场所 (传入来源提示, 减少无效 RPC 调用)
+        venue = detect_venue(addr, source_hint=source)
         log.info("代币 %s 交易场所: %s", name, venue)
 
         # 根据交易场所和报价币确定支付币种
@@ -1848,8 +2013,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
                 else:
                     log.info("代币 %s 报价币: BNB", name)
         elif venue == "FLAP":
-            # flap buy() 是 payable, 统一用 BNB 支付
-            log.info("代币 %s (flap)", name)
+            # flap: Router 统一用 BNB 支付 (不管 quote token 是什么)
+            log.info("代币 %s (flap, Router BNB)", name)
 
         # 计算买入金额 (根据支付币种选择对应余额)
         buy_usdt = calculate_buy_amount(cfg, bnb_price_usd, pay_currency)
