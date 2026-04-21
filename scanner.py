@@ -6,7 +6,7 @@ BSC Token Scanner v6 — 极速扫描, 以快致胜
 v6 架构: 极速扫描 (15 分钟一轮)
   1. 链上发现 (~1s): BSC RPC eth_getLogs → four.meme + flap 合约 TokenCreated 事件 → 新代币地址
   2. 入场筛 (~数秒): four.meme Detail API + flap.sh 页面 SSR 社交数据 + 链上 totalSupply → 淘汰无社交 / 总量≠10亿 / 币龄>5min
-  3. 淘汰检查 (~数秒): DexScreener 批量查价 + GeckoTerminal 持币数 + Detail API → 永久淘汰弃盘币
+  3. 淘汰检查 (~数秒): DexScreener 批量查价(含涨跌幅/Boost) + GeckoTerminal 持币数 + Detail API → 永久淘汰弃盘币
   3b. K线修正: 对持币≥50 的存活代币拉 GT 15min K线 → 修正 peakPrice + 记录 klineHigh/klineLow (过山车检测)
   4. 精筛 (瞬时): 潜伏型筛选, 从存活币中找蓄势待发信号 (含过山车检测: K线振幅≥3x 且回撤≥50% 排除)
   5. 仿盘检测: 本地统计同名代币数量 (零 API 调用), 有大量仿盘(≥3)则标记
