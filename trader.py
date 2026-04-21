@@ -26,7 +26,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   3. 超期清仓 (阶梯式):
      - 持仓超过48小时且仍亏损 → 卖出 (给了足够时间还亏就别等了)
      - 持仓超过72小时且盈利未达500% (5倍) → 卖出 (资金效率太低)
-  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -20%, 数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
   5. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
@@ -1811,7 +1811,7 @@ def check_sell_conditions(pos: dict, current_price: float,
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
          - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
-      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 毕业通道 -30%)
+      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -20%, 数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
@@ -1854,10 +1854,10 @@ def check_sell_conditions(pos: dict, current_price: float,
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
-    # 策略4: 兜底止损 (毕业通道用更紧的止损)
-    default_sl = trading_cfg.get("stop_loss_pct", -60)
+    # 策略4: 兜底止损 (数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
+    default_sl = trading_cfg.get("stop_loss_pct", -20)
     if channel == "graduated":
-        stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -30)
+        stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -20)
     else:
         stop_loss_pct = default_sl
     if stop_loss_pct and profit_pct <= stop_loss_pct:
