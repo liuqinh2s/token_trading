@@ -17,7 +17,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   - four.meme bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - flap bonding curve: 通过 Router 卖出, 收到 BNB (gas 较高, 需 700k)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
-  1. 暴涨止盈: 盈利达到 2000% (20倍) 立即全部卖出, 落袋为安
+  1. 回撤止盈 (中点止盈法): 涨 30% 触发止盈跟踪, 价格跌到 (买入价+最高价)/2 时卖出
   2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
      - 持币数从峰值跌 >30% (相对值)
      - 流动性从峰值跌 >30% (相对值, 仅已毕业)
@@ -1805,8 +1805,8 @@ def check_sell_conditions(pos: dict, current_price: float,
     检查是否满足卖出条件
     返回: (是否应该卖出, 卖出原因)
 
-    策略 (土狗市场专用, 宁赚一次大的不赚多次小的):
-      1. 暴涨止盈: 盈利达到 tp_moon_pct (默认 2000%=20倍) 立即全部卖出
+    策略:
+      1. 回撤止盈 (中点止盈法): 涨 30% 触发止盈跟踪, 价格跌到 (买入价+最高价)/2 时卖出
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
@@ -1817,18 +1817,26 @@ def check_sell_conditions(pos: dict, current_price: float,
     """
     trading_cfg = cfg.get("trading", {})
     buy_price = pos["buy_price_usd"]
-    max_price = pos["max_price_usd"]
+    max_price = pos["max_price_usd"] or 0
     channel = pos.get("channel", "quality")
 
     if buy_price <= 0:
         return False, ""
 
     profit_pct = (current_price - buy_price) / buy_price * 100
+    max_profit_pct = (max_price - buy_price) / buy_price * 100 if max_price > 0 else 0
 
-    # 策略1: 暴涨止盈 — 达到目标倍数立即落袋
-    tp_moon_pct = trading_cfg.get("tp_moon_pct", 2000)  # 20倍
-    if profit_pct >= tp_moon_pct:
-        return True, f"MOON_TP (盈利 {profit_pct:.0f}%, 阈值 {tp_moon_pct}%)"
+    # 策略1: 回撤止盈 (中点止盈法)
+    # 涨幅曾达到 tp_trigger_pct (默认 30%) 后激活跟踪,
+    # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出
+    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 30)
+    if max_profit_pct >= tp_trigger_pct:
+        midpoint = (buy_price + max_price) / 2
+        if current_price <= midpoint:
+            midpoint_pct = (midpoint - buy_price) / buy_price * 100
+            return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
+                          f"中点 ${midpoint:.12f} ({midpoint_pct:.0f}%), "
+                          f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
 
     # 策略2: 动能衰竭止盈 — 多指标同时恶化, 趁还有利润赶紧跑
     # 条件: ≥2 个动能指标恶化 + 当前盈利 > 0 (亏损时不触发, 留给止损兜底)

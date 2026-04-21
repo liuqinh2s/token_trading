@@ -33,7 +33,7 @@
         "buy_fraction": 0.05,
         "min_buy_usd": 1,
         "max_buy_usd": 1,
-        "tp_moon_pct": 2000,
+        "tp_trigger_pct": 30,
         "momentum_tp_enabled": true,
         "momentum_min_bad_signals": 2,
         "expire_loss_hours": 48,
