@@ -1908,21 +1908,42 @@ def check_sell_conditions(pos: dict, current_price: float,
 
 
 # ===================================================================
-#  Telegram 通知 (交易相关)
+#  钉钉通知 (交易相关)
 # ===================================================================
-def _send_trade_notify(cfg: dict, text: str):
-    """发送交易通知到 Telegram"""
+def _dingtalk_trade_sign(secret: str) -> tuple[str, str]:
+    """钉钉加签: 返回 (timestamp, sign)"""
+    import hmac
+    import hashlib
+    import base64
+    from urllib.parse import quote_plus
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(secret.encode("utf-8"),
+                         string_to_sign.encode("utf-8"),
+                         digestmod=hashlib.sha256).digest()
+    sign = quote_plus(base64.b64encode(hmac_code))
+    return timestamp, sign
+
+
+def _send_trade_notify(cfg: dict, title: str, text: str):
+    """发送交易通知到钉钉 (Markdown 格式)"""
     import requests as req
-    bot_token = cfg.get("telegram_bot_token", "")
-    chat_id = cfg.get("telegram_chat_id", "")
-    if not bot_token or not chat_id or "YOUR" in bot_token:
+    webhook = cfg.get("dingtalk_webhook", "")
+    secret = cfg.get("dingtalk_secret", "")
+    if not webhook or "YOUR" in webhook:
         log.info("[交易通知] %s", text)
         return
     try:
+        url = webhook
+        if secret:
+            ts, sign = _dingtalk_trade_sign(secret)
+            url += f"&timestamp={ts}&sign={sign}"
         req.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            url,
+            json={
+                "msgtype": "markdown",
+                "markdown": {"title": title, "text": text},
+            },
             timeout=10,
         )
     except Exception as e:
@@ -1933,26 +1954,26 @@ def notify_buy(cfg: dict, token_name: str, token_address: str,
                buy_usdt: float, buy_price_usd: float, tx_hash: str):
     """买入通知"""
     text = (
-        f"🟢 <b>买入成功</b>\n"
-        f"代币: {token_name}\n"
-        f"合约: <code>{token_address}</code>\n"
-        f"花费: {buy_usdt:.2f} USDT\n"
-        f"单价: ${buy_price_usd:.12f}\n"
-        f"TX: <a href='https://bscscan.com/tx/{tx_hash}'>查看</a>"
+        f"## 🟢 买入成功\n\n"
+        f"代币: {token_name}\n\n"
+        f"合约: `{token_address}`\n\n"
+        f"花费: {buy_usdt:.2f} USDT\n\n"
+        f"单价: ${buy_price_usd:.12f}\n\n"
+        f"TX: [查看](https://bscscan.com/tx/{tx_hash})"
     )
-    _send_trade_notify(cfg, text)
+    _send_trade_notify(cfg, "买入成功", text)
 
 
 def notify_buy_failed(cfg: dict, token_name: str, token_address: str,
                       reason: str):
     """买入失败通知"""
     text = (
-        f"🔴 <b>买入失败</b>\n"
-        f"代币: {token_name}\n"
-        f"合约: <code>{token_address}</code>\n"
+        f"## 🔴 买入失败\n\n"
+        f"代币: {token_name}\n\n"
+        f"合约: `{token_address}`\n\n"
         f"原因: {reason}"
     )
-    _send_trade_notify(cfg, text)
+    _send_trade_notify(cfg, "买入失败", text)
 
 
 def notify_sell(cfg: dict, token_name: str, token_address: str,
@@ -1963,29 +1984,29 @@ def notify_sell(cfg: dict, token_name: str, token_address: str,
     emoji = "🔴" if pnl_pct < 0 else "🟡" if pnl_pct < 50 else "🟢"
     max_pnl_pct = ((max_price - buy_price) / buy_price * 100) if (buy_price > 0 and max_price > 0) else 0
     text = (
-        f"{emoji} <b>卖出</b>\n"
-        f"代币: {token_name}\n"
-        f"合约: <code>{token_address}</code>\n"
-        f"原因: {sell_reason}\n"
-        f"盈亏: {pnl_pct:+.1f}% | 最高盈利: {max_pnl_pct:+.1f}%\n"
-        f"买入: ${buy_price:.12f}\n"
-        f"最高: ${max_price:.12f}\n"
-        f"卖出: ${sell_price:.12f}\n"
-        f"TX: <a href='https://bscscan.com/tx/{tx_hash}'>查看</a>"
+        f"## {emoji} 卖出\n\n"
+        f"代币: {token_name}\n\n"
+        f"合约: `{token_address}`\n\n"
+        f"原因: {sell_reason}\n\n"
+        f"盈亏: {pnl_pct:+.1f}% | 最高盈利: {max_pnl_pct:+.1f}%\n\n"
+        f"买入: ${buy_price:.12f}\n\n"
+        f"最高: ${max_price:.12f}\n\n"
+        f"卖出: ${sell_price:.12f}\n\n"
+        f"TX: [查看](https://bscscan.com/tx/{tx_hash})"
     )
-    _send_trade_notify(cfg, text)
+    _send_trade_notify(cfg, "卖出通知", text)
 
 
 def notify_sell_failed(cfg: dict, token_name: str, token_address: str,
                        reason: str):
     """卖出失败通知"""
     text = (
-        f"🔴 <b>卖出失败</b>\n"
-        f"代币: {token_name}\n"
-        f"合约: <code>{token_address}</code>\n"
+        f"## 🔴 卖出失败\n\n"
+        f"代币: {token_name}\n\n"
+        f"合约: `{token_address}`\n\n"
         f"原因: {reason}"
     )
-    _send_trade_notify(cfg, text)
+    _send_trade_notify(cfg, "卖出失败", text)
 
 
 # ===================================================================

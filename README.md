@@ -1,6 +1,6 @@
 # BSC Token Scanner v6 — 极速版
 
-扫描 [four.meme](https://four.meme) 和 [flap](https://flap.sh/bnb) 平台上新发行的 BSC 代币，链上发现 + 队列淘汰制 + 潜伏型精筛 + 精筛后防线，推送到 Telegram，可选自动交易。
+扫描 [four.meme](https://four.meme) 和 [flap](https://flap.sh/bnb) 平台上新发行的 BSC 代币，链上发现 + 队列淘汰制 + 潜伏型精筛 + 精筛后防线，推送到钉钉，可选自动交易。
 
 ## v6 架构：极速扫描
 
@@ -266,7 +266,7 @@ pip3 install -r requirements.txt
 cp config.example.json config.json
 ```
 
-编辑 `config.json`，填入 Telegram Bot Token 和 Chat ID。
+编辑 `config.json`，填入钉钉机器人 Webhook 地址和加签密钥（可选）。
 
 ### 3. 运行
 
@@ -278,8 +278,8 @@ python3 scanner.py
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `telegram_bot_token` | Telegram Bot Token | - |
-| `telegram_chat_id` | 推送目标 Chat ID | - |
+| `dingtalk_webhook` | 钉钉机器人 Webhook 地址 | - |
+| `dingtalk_secret` | 钉钉加签密钥 (可选) | 空 |
 | `scan_interval_minutes` | 扫描间隔（分钟） | 15 |
 | `max_push_count` | 每轮最多推送数量 | 100 |
 | `bscscan_api_key` | BSCScan API Key（精筛后防线需要） | - |

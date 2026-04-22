@@ -3246,8 +3246,9 @@ def post_quality_defense(candidates: list[dict], api_key: str) -> list[dict]:
 #  消息格式化 & 推送
 # ===================================================================
 def format_message(results: list[dict]) -> str:
+    """格式化精筛结果为钉钉 Markdown 格式"""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"🔍 <b>BSC Token Scanner v6 极速报告</b>", f"⏰ {now_str}", ""]
+    lines = [f"## 🔍 BSC Token Scanner v6 极速报告", f"⏰ {now_str}", ""]
 
     for i, item in enumerate(results, 1):
         addr = item.get("address", "")
@@ -3257,12 +3258,12 @@ def format_message(results: list[dict]) -> str:
         holders = item.get("holders", 0)
         age_min = (int(time.time() * 1000) - item.get("createdAt", 0)) / 60000
 
-        lines.append(f"<b>#{i} {name} ({symbol})</b>")
+        lines.append(f"### #{i} {name} ({symbol})")
         if item.get("isRocket"):
-            lines.append("🚀 <b>火箭通道</b> (快速起飞币)")
+            lines.append("🚀 **火箭通道** (快速起飞币)")
         if item.get("isGraduated"):
-            lines.append("🎓 <b>毕业通道</b> (刚毕业强势币)")
-        lines.append(f"📄 合约: <code>{addr}</code>")
+            lines.append("🎓 **毕业通道** (刚毕业强势币)")
+        lines.append(f"📄 合约: `{addr}`")
         lines.append(f"💰 当前价: ${price:.10f}")
         lines.append(f"👥 持币: {holders} (峰值 {item.get('peakHolders', 0)})")
         progress = item.get("progress", 0)
@@ -3306,7 +3307,7 @@ def format_message(results: list[dict]) -> str:
         lines.append(f"🔗 社交: {item.get('socialCount', 0)} 个")
         social = item.get("socialLinks", {})
         for stype, url in social.items():
-            lines.append(f"  • <a href='{url}'>{stype}</a>")
+            lines.append(f"  - [{stype}]({url})")
         lines.append(f"🕐 币龄: {age_min:.1f}min")
         cc = item.get("copycat")
         if cc and cc.get("isCopycat"):
@@ -3317,33 +3318,59 @@ def format_message(results: list[dict]) -> str:
         # 平台链接: 根据来源生成不同的链接
         is_flap = item.get("source") == "flap"
         if is_flap:
-            platform_link = f"<a href='https://flap.sh/bnb/{addr}'>Flap</a>"
+            platform_link = f"[Flap](https://flap.sh/bnb/{addr})"
         else:
-            platform_link = f"<a href='https://four.meme/token/{addr}'>four.meme</a>"
+            platform_link = f"[four.meme](https://four.meme/token/{addr})"
         lines.append(
             f"🌐 {platform_link}"
-            f" | <a href='https://bscscan.com/token/{addr}'>BscScan</a>"
-            f" | <a href='https://web3.binance.com/zh-CN/token/bsc/{addr}'>币安钱包</a>"
+            f" | [BscScan](https://bscscan.com/token/{addr})"
+            f" | [币安钱包](https://web3.binance.com/zh-CN/token/bsc/{addr})"
         )
         lines.append("")
 
     lines.append("—— BSC Token Scanner v6 ——")
-    return "\n".join(lines)
+    return "\n\n".join(lines)
 
 
-def send_telegram(bot_token: str, chat_id: str, text: str) -> bool:
+def _dingtalk_sign(secret: str) -> tuple[str, str]:
+    """钉钉加签: 返回 (timestamp, sign)"""
+    import hmac
+    import hashlib
+    import base64
+    from urllib.parse import quote_plus
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(secret.encode("utf-8"),
+                         string_to_sign.encode("utf-8"),
+                         digestmod=hashlib.sha256).digest()
+    sign = quote_plus(base64.b64encode(hmac_code))
+    return timestamp, sign
+
+
+def send_dingtalk(webhook: str, secret: str, title: str, text: str) -> bool:
+    """发送钉钉 Markdown 消息"""
     _ensure_sessions()
     try:
+        url = webhook
+        if secret:
+            ts, sign = _dingtalk_sign(secret)
+            url += f"&timestamp={ts}&sign={sign}"
         r = _fm_session.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            url,
+            json={
+                "msgtype": "markdown",
+                "markdown": {"title": title, "text": text},
+            },
             timeout=15,
         )
         r.raise_for_status()
-        return r.json().get("ok", False)
+        result = r.json()
+        if result.get("errcode", -1) == 0:
+            return True
+        log.error("钉钉返回错误: %s", result)
+        return False
     except Exception as e:
-        log.error("Telegram: %s", e)
+        log.error("钉钉: %s", e)
         return False
 
 
@@ -3851,14 +3878,14 @@ def scan_once(cfg: dict) -> None:
     msg = format_message(filtered)
     log.info("筛选通过 %d 个代币", len(filtered))
 
-    bot_token = cfg.get("telegram_bot_token", "")
-    chat_id = cfg.get("telegram_chat_id", "")
-    if not bot_token or not chat_id or "YOUR" in bot_token:
-        log.warning("Telegram 未配置, 仅打印:")
+    bot_token = cfg.get("dingtalk_webhook", "")
+    secret = cfg.get("dingtalk_secret", "")
+    if not bot_token or "YOUR" in bot_token:
+        log.warning("钉钉未配置, 仅打印:")
         print_console(msg)
     else:
-        ok = send_telegram(bot_token, chat_id, msg)
-        log.info("Telegram 推送%s", "成功" if ok else "失败")
+        ok = send_dingtalk(bot_token, secret, "BSC Token Scanner v6", msg)
+        log.info("钉钉推送%s", "成功" if ok else "失败")
 
     # 自动买入
     if _HAS_TRADER and cfg.get("trading", {}).get("enabled", False):
