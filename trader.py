@@ -491,6 +491,23 @@ def fm_get_token_info(token_address: str) -> dict | None:
         return None
 
 
+def _check_pancake_liquidity(token_address: str) -> bool:
+    """
+    检查代币在 PancakeSwap 上是否有流动性 (通过 Router 询价)
+    用极小金额 (0.0001 BNB) 询价, 能返回正数说明有流动性池
+    """
+    if not _w3:
+        return False
+    try:
+        router = _w3.eth.contract(address=PANCAKE_ROUTER_V2, abi=ROUTER_ABI)
+        token_cs = Web3.to_checksum_address(token_address)
+        test_amount = Web3.to_wei(0.0001, "ether")  # 0.0001 BNB
+        amounts = router.functions.getAmountsOut(test_amount, [WBNB, token_cs]).call()
+        return amounts[-1] > 0
+    except Exception:
+        return False
+
+
 def detect_venue(token_address: str, source_hint: str = "") -> str:
     """
     检测代币当前的交易场所
@@ -506,6 +523,11 @@ def detect_venue(token_address: str, source_hint: str = "") -> str:
                 return "PANCAKE"
             if state["status"] in (1, 2):  # Tradable / InDuel
                 return "FLAP"
+        # Portal 查不到 (毕业后数据可能被清除) → 检查 PancakeSwap 流动性
+        if state is None and _check_pancake_liquidity(token_address):
+            log.info("flap 代币 %s Portal 查不到, PancakeSwap 有流动性 → PANCAKE",
+                     token_address[:16])
+            return "PANCAKE"
         return "UNKNOWN"
 
     # 默认: 先查 four.meme, 查不到再查 flap
@@ -515,6 +537,11 @@ def detect_venue(token_address: str, source_hint: str = "") -> str:
             return "PANCAKE"
         if info["offers"] > 0:
             return "BONDING"
+        # four.meme 有记录但状态不明 → 检查 PancakeSwap
+        if _check_pancake_liquidity(token_address):
+            log.info("four.meme 代币 %s 状态不明, PancakeSwap 有流动性 → PANCAKE",
+                     token_address[:16])
+            return "PANCAKE"
         return "UNKNOWN"
 
     # four.meme 查不到, 尝试 flap
@@ -525,6 +552,12 @@ def detect_venue(token_address: str, source_hint: str = "") -> str:
         if state["status"] in (1, 2):  # Tradable / InDuel
             return "FLAP"
         return "UNKNOWN"
+
+    # 两个平台都查不到 → 最后兜底检查 PancakeSwap
+    if _check_pancake_liquidity(token_address):
+        log.info("代币 %s 平台未知, PancakeSwap 有流动性 → PANCAKE",
+                 token_address[:16])
+        return "PANCAKE"
 
     return "UNKNOWN"
 
