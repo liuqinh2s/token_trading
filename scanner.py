@@ -87,8 +87,12 @@ try:
     from trader import (init_trader, execute_buys, start_monitor, stop_monitor,
                         _sync_positions_from_wallet)
     _HAS_TRADER = True
-except ImportError:
+except Exception as _trader_err:
     _HAS_TRADER = False
+    # 启动时打印具体原因, 方便排查
+    import traceback as _tb
+    print(f"[WARN] trader 模块导入失败: {_trader_err}")
+    _tb.print_exc()
 
 # ===================================================================
 #  日志
@@ -103,6 +107,9 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+if not _HAS_TRADER:
+    log.warning("trader 模块导入失败: %s (自动交易不可用)", _trader_err)
 
 # ===================================================================
 #  配置
