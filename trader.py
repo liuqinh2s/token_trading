@@ -1910,6 +1910,18 @@ def notify_buy(cfg: dict, token_name: str, token_address: str,
     _send_trade_notify(cfg, text)
 
 
+def notify_buy_failed(cfg: dict, token_name: str, token_address: str,
+                      reason: str):
+    """买入失败通知"""
+    text = (
+        f"🔴 <b>买入失败</b>\n"
+        f"代币: {token_name}\n"
+        f"合约: <code>{token_address}</code>\n"
+        f"原因: {reason}"
+    )
+    _send_trade_notify(cfg, text)
+
+
 def notify_sell(cfg: dict, token_name: str, token_address: str,
                 sell_reason: str, pnl_pct: float, tx_hash: str,
                 buy_price: float = 0, max_price: float = 0,
@@ -1996,13 +2008,18 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
             if realtime_price and realtime_price > 0:
                 deviation = realtime_price / scan_price
                 if deviation > max_price_deviation:
-                    log.warning("跳过 %s: 价格偏离过大 (精筛 $%.2e → 实时 $%.2e, %.1f倍, 上限 %.1f倍)",
-                                name, scan_price, realtime_price, deviation, max_price_deviation)
+                    reason = (f"价格偏离过大 (精筛 ${scan_price:.2e} → "
+                              f"实时 ${realtime_price:.2e}, {deviation:.1f}倍, "
+                              f"上限 {max_price_deviation:.1f}倍)")
+                    log.warning("跳过 %s: %s", name, reason)
+                    notify_buy_failed(cfg, name, addr, reason)
                     continue
                 log.info("价格检查 %s: 精筛 $%.2e → 实时 $%.2e (%.1f倍, OK)",
                          name, scan_price, realtime_price, deviation)
             else:
-                log.warning("跳过 %s: 无法获取实时价格, 放弃买入", name)
+                reason = "无法获取实时价格, 放弃买入"
+                log.warning("跳过 %s: %s", name, reason)
+                notify_buy_failed(cfg, name, addr, reason)
                 continue
 
         # 检测交易场所 (传入来源提示, 减少无效 RPC 调用)
@@ -2027,24 +2044,38 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         # 计算买入金额 (根据支付币种选择对应余额)
         buy_usdt = calculate_buy_amount(cfg, bnb_price_usd, pay_currency)
         if buy_usdt <= 0:
-            log.warning("余额不足, 跳过 %s", name)
+            reason = f"余额不足 ({pay_currency})"
+            log.warning("%s, 跳过 %s", reason, name)
+            notify_buy_failed(cfg, name, addr, reason)
             continue
 
         result = None
-        if venue == "BONDING":
-            result = fm_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
-        elif venue == "FLAP":
-            result = flap_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
-        elif venue == "PANCAKE":
-            result = buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
-        else:
-            log.warning("跳过 %s: 无法确定交易场所", name)
+        try:
+            if venue == "BONDING":
+                result = fm_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
+            elif venue == "FLAP":
+                result = flap_buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
+            elif venue == "PANCAKE":
+                result = buy_token(addr, buy_usdt, slippage, name, bnb_price_usd)
+            else:
+                reason = f"无法确定交易场所 (venue={venue})"
+                log.warning("跳过 %s: %s", name, reason)
+                notify_buy_failed(cfg, name, addr, reason)
+                continue
+        except Exception as e:
+            reason = f"买入异常: {e}"
+            log.error("买入异常 %s [%s]: %s", name, venue, e, exc_info=True)
+            notify_buy_failed(cfg, name, addr, reason)
             continue
 
         if result:
             record_buy(conn, addr, name, result["decimals"], result, channel)
             notify_buy(cfg, name, addr, buy_usdt,
                        result["buy_price_usd"], result["tx_hash"])
+        else:
+            reason = f"交易执行失败 (venue={venue}, 金额=${buy_usdt:.2f})"
+            log.error("买入失败 %s: %s", name, reason)
+            notify_buy_failed(cfg, name, addr, reason)
 
         time.sleep(2)  # 避免 nonce 冲突
 
