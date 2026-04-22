@@ -1943,6 +1943,18 @@ def notify_sell(cfg: dict, token_name: str, token_address: str,
     _send_trade_notify(cfg, text)
 
 
+def notify_sell_failed(cfg: dict, token_name: str, token_address: str,
+                       reason: str):
+    """卖出失败通知"""
+    text = (
+        f"🔴 <b>卖出失败</b>\n"
+        f"代币: {token_name}\n"
+        f"合约: <code>{token_address}</code>\n"
+        f"原因: {reason}"
+    )
+    _send_trade_notify(cfg, text)
+
+
 # ===================================================================
 #  BNB 自动补充 (gas 费)
 # ===================================================================
@@ -1991,12 +2003,14 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         # 检查是否已有持仓
         if has_open_position(conn, addr):
             log.info("跳过 %s: 已有持仓", name)
+            notify_buy_failed(cfg, name, addr, "已有持仓, 跳过重复买入")
             continue
 
         # 检查平仓冷却期
         in_cd, cd_reason = is_in_cooldown(conn, addr, trading_cfg)
         if in_cd:
             log.info("跳过 %s: %s", name, cd_reason)
+            notify_buy_failed(cfg, name, addr, cd_reason)
             continue
 
         # 价格保护: 买入前查实时价格, 和精筛价格对比
@@ -2254,6 +2268,8 @@ def monitor_positions(cfg_loader, bnb_price_func):
                                 if remaining_value > 0.5:
                                     log.warning("卖出后仍有余额 %s: %.4f 个 (价值 $%.2f), 不关闭持仓",
                                                 name, remaining_amount, remaining_value)
+                                    notify_sell_failed(cfg, name, addr,
+                                                       f"卖出后仍有余额 {remaining_amount:.4f} 个 (价值 ${remaining_value:.2f}), 未完全卖出")
                                     continue
                         except Exception as e_check:
                             log.debug("卖出后余额检查异常 %s: %s", name, e_check)
@@ -2266,6 +2282,8 @@ def monitor_positions(cfg_loader, bnb_price_func):
                                     sell_price=current_price)
                     else:
                         log.error("卖出失败: %s", name)
+                        notify_sell_failed(cfg, name, addr,
+                                           f"交易执行失败 (venue={current_venue}, 触发原因: {reason})")
 
                 time.sleep(1)  # 避免 RPC 限流
 
