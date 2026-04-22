@@ -3872,7 +3872,14 @@ def scan_once(cfg: dict) -> None:
                 "socialLinks": item.get("socialLinks", {}),
             }
             to_buy.append((token_data, detail_data))
-        execute_buys(to_buy, cfg, bnb_usd)
+        log.info("自动买入: 准备买入 %d 个代币", len(to_buy))
+        try:
+            execute_buys(to_buy, cfg, bnb_usd)
+        except Exception as e:
+            log.error("自动买入异常: %s", e, exc_info=True)
+    else:
+        log.info("自动买入未执行 (_HAS_TRADER=%s, trading.enabled=%s)",
+                 _HAS_TRADER, cfg.get("trading", {}).get("enabled", False))
 
     log.info("本轮扫描完成 (耗时 %.1f 秒)", time.time() - _t_start)
 

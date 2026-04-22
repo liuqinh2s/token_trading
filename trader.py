@@ -1985,6 +1985,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     if not trading_cfg.get("enabled", False):
         return
 
+    log.info("执行自动买入: %d 个候选代币, BNB=$%.2f", len(tokens), bnb_price_usd)
+
     slippage = trading_cfg.get("slippage_pct", 12.0)
     # 价格保护: 实时价格偏离精筛价格的最大倍数 (默认 3 倍)
     max_price_deviation = trading_cfg.get("max_price_deviation", 3.0)
