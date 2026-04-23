@@ -26,7 +26,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   3. 超期清仓 (阶梯式):
      - 持仓超过48小时且仍亏损 → 卖出 (给了足够时间还亏就别等了)
      - 持仓超过72小时且盈利未达500% (5倍) → 卖出 (资金效率太低)
-  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -20%, 数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
+  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 土狗波动大, 给足空间)
   5. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
 """
 
@@ -1844,7 +1844,7 @@ def check_sell_conditions(pos: dict, current_price: float,
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
          - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
-      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -20%, 数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
+      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 土狗波动大, 给足空间)
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
@@ -1895,8 +1895,8 @@ def check_sell_conditions(pos: dict, current_price: float,
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
-    # 策略4: 兜底止损 (数据驱动: -20%全量回测+1736% vs -60%回测-1121%)
-    default_sl = trading_cfg.get("stop_loss_pct", -20)
+    # 策略4: 兜底止损
+    default_sl = trading_cfg.get("stop_loss_pct", -60)
     if channel == "graduated":
         stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -20)
     else:
@@ -2457,7 +2457,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
     代币地址来源 (多源合并):
       1. 数据库历史持仓记录 (OPEN + CLOSED)
       2. BSCScan tokentx API (有 key 时)
-    然后逐个查链上余额 + 询价, 筛选价值 > $1 的
+    然后逐个查链上余额 + 询价, 筛选价值 > $0.1 的
     """
     if not _w3 or not _wallet_address:
         return []
@@ -2610,7 +2610,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
 def _sync_positions_from_wallet(bnb_price_usd: float):
     """
     启动时同步: 以链上钱包实际持仓为准
-    1. 扫描钱包中价值 > $1 的代币 (排除 BNB/USDT 等)
+    1. 扫描钱包中价值 > $0.1 的代币 (排除 BNB/USDT 等)
     2. 数据库中没有 OPEN 记录的 → 新建 (用当前价作为买入价)
     3. 数据库中有 OPEN 记录但链上余额为 0 的 → 关闭
     """
@@ -2626,7 +2626,7 @@ def _sync_positions_from_wallet(bnb_price_usd: float):
     closed = 0
     for pos in old_positions:
         if pos["token_address"].lower() not in wallet_addrs:
-            log.info("同步: 关闭无余额持仓 %s (链上已无价值>$1的余额)",
+            log.info("同步: 关闭无余额持仓 %s (链上已无价值>$0.1的余额)",
                      pos["token_name"] or pos["token_address"][:16])
             close_position(conn, pos["id"], 0, "", "SYNC_NO_BALANCE", pos["buy_price_usd"])
             closed += 1
