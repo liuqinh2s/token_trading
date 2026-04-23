@@ -2300,7 +2300,13 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 if should_sell:
                     log.info("触发卖出 %s: %s", name, reason)
                     # 检测当前实际交易场所 (可能已从 bonding curve 迁移到 PancakeSwap)
-                    current_venue = detect_venue(addr)
+                    current_venue = detect_venue(addr, source_hint=pos.get("source", ""))
+                    # UNKNOWN 时回退到持仓记录的 venue (买入时确定的通道更可靠)
+                    if current_venue == "UNKNOWN":
+                        fallback_venue = pos.get("venue", "PANCAKE")
+                        log.warning("detect_venue 返回 UNKNOWN, 回退到持仓记录 venue=%s: %s",
+                                    fallback_venue, name)
+                        current_venue = fallback_venue
                     if current_venue == "BONDING":
                         sell_result = fm_sell_token(addr, token_name=name,
                                                     bnb_price_usd=bnb_price)
