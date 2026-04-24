@@ -17,7 +17,10 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   - four.meme bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - flap bonding curve: 通过 Router 卖出, 收到 BNB (gas 较高, 需 700k)
   - PancakeSwap: 卖出收到 BNB (Token → BNB)
-  1. 回撤止盈 (中点止盈法): 涨 30% 触发止盈跟踪, 价格跌到 (买入价+最高价)/2 时卖出
+  1. 阶梯式回撤止盈:
+     - 涨 15% 触发止盈跟踪
+     - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
+     - 30% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 不被好币洗出来)
   2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
      - 持币数从峰值跌 >30% (相对值)
      - 流动性从峰值跌 >30% (相对值, 仅已毕业)
@@ -26,8 +29,10 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   3. 超期清仓 (阶梯式):
      - 持仓超过48小时且仍亏损 → 卖出 (给了足够时间还亏就别等了)
      - 持仓超过72小时且盈利未达500% (5倍) → 卖出 (资金效率太低)
-  4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 土狗波动大, 给足空间)
-  5. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后48h内不再买
+  4. 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样):
+     - -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
+     - -25% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
+  5. 重买冷却: 盈利平仓后12h内不再买同一币, 亏损平仓后24h内不再买
 """
 
 from __future__ import annotations
@@ -1661,11 +1666,11 @@ def is_in_cooldown(conn: sqlite3.Connection, token_address: str,
     """
     检查该代币是否在平仓冷却期内。
     盈利平仓: 冷却 rebuy_cooldown_profit_hours (默认12h)
-    亏损平仓: 冷却 rebuy_cooldown_loss_hours (默认48h)
+    亏损平仓: 冷却 rebuy_cooldown_loss_hours (默认24h)
     返回: (是否冷却中, 原因描述)
     """
     profit_cd_h = trading_cfg.get("rebuy_cooldown_profit_hours", 12)
-    loss_cd_h = trading_cfg.get("rebuy_cooldown_loss_hours", 48)
+    loss_cd_h = trading_cfg.get("rebuy_cooldown_loss_hours", 24)
     now_ms = int(time.time() * 1000)
 
     # 查询该代币最近一次已平仓记录
@@ -1839,12 +1844,17 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 回撤止盈 (中点止盈法): 涨 30% 触发止盈跟踪, 价格跌到 (买入价+最高价)/2 时卖出
+      1. 阶梯式回撤止盈:
+         - 涨 15% 触发止盈跟踪
+         - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
+         - 30% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 不被好币洗出来)
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
          - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
-      4. 兜底止损: 亏损超过 stop_loss_pct 卖出 (默认 -60%, 土狗波动大, 给足空间)
+      4. 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样):
+         - -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
+         - -25% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
@@ -1859,17 +1869,31 @@ def check_sell_conditions(pos: dict, current_price: float,
     profit_pct = (current_price - buy_price) / buy_price * 100
     max_profit_pct = (max_price - buy_price) / buy_price * 100 if max_price > 0 else 0
 
-    # 策略1: 回撤止盈 (中点止盈法)
-    # 涨幅曾达到 tp_trigger_pct (默认 30%) 后激活跟踪,
-    # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出
-    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 30)
+    # 策略1: 阶梯式回撤止盈
+    # 涨幅曾达到 tp_trigger_pct (默认 15%) 后激活跟踪
+    tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 15)
+    tp_midpoint_pct = trading_cfg.get("tp_midpoint_pct", 30)
+    tp_drawdown_pct = trading_cfg.get("tp_drawdown_pct", 15)
+
     if max_profit_pct >= tp_trigger_pct:
-        midpoint = (buy_price + max_price) / 2
-        if current_price <= midpoint:
-            midpoint_pct = (midpoint - buy_price) / buy_price * 100
-            return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
-                          f"中点 ${midpoint:.12f} ({midpoint_pct:.0f}%), "
-                          f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        if max_profit_pct >= tp_midpoint_pct:
+            # 阶段2: 最高盈利 ≥30%, 使用中点止盈法
+            # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出
+            midpoint = (buy_price + max_price) / 2
+            if current_price <= midpoint:
+                midpoint_pct = (midpoint - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"中点 ${midpoint:.12f} ({midpoint_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        else:
+            # 阶段1: 最高盈利 15%~30%, 固定回撤 15% 止盈
+            # 从最高价回撤 tp_drawdown_pct 即卖出, 保住本金
+            drawdown_price = max_price * (1 - tp_drawdown_pct / 100)
+            if current_price <= drawdown_price:
+                drawdown_sell_pct = (drawdown_price - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (回撤止盈: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"回撤{tp_drawdown_pct}%线 ${drawdown_price:.12f} ({drawdown_sell_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
 
     # 策略2: 动能衰竭止盈 — 多指标同时恶化, 趁还有利润赶紧跑
     # 条件: ≥2 个动能指标恶化 + 当前盈利 > 0 (亏损时不触发, 留给止损兜底)
@@ -1895,14 +1919,23 @@ def check_sell_conditions(pos: dict, current_price: float,
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
-    # 策略4: 兜底止损
-    default_sl = trading_cfg.get("stop_loss_pct", -60)
-    if channel == "graduated":
-        stop_loss_pct = trading_cfg.get("grad_stop_loss_pct", -20)
-    else:
-        stop_loss_pct = default_sl
+    # 策略4: 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样)
+    # -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
+    # -25% 动能止损: 动能全部恶化时提前止损, 垃圾币早点跑
+    stop_loss_pct = trading_cfg.get("stop_loss_pct", -40)
+    momentum_stop_loss_pct = trading_cfg.get("momentum_stop_loss_pct", -25)
+
+    # 4a: 硬止损 — 亏损达到 -40% 无条件卖出
     if stop_loss_pct and profit_pct <= stop_loss_pct:
         return True, f"STOP_LOSS (亏损 {profit_pct:.0f}%, 阈值 {stop_loss_pct}%)"
+
+    # 4b: 动能恶化提前止损 — 多指标同时恶化 + 亏损达到 -25%
+    if momentum and momentum.get("bad_count", 0) >= 2:
+        if profit_pct <= momentum_stop_loss_pct:
+            signals_str = " + ".join(momentum.get("bad_signals", []))
+            return True, (f"MOMENTUM_SL (动能恶化止损: 亏损 {profit_pct:.0f}%, "
+                          f"阈值 {momentum_stop_loss_pct}%, "
+                          f"信号: {signals_str})")
 
     return False, ""
 
