@@ -20,7 +20,8 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
   1. 阶梯式回撤止盈:
      - 涨 15% 触发止盈跟踪
      - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
-     - 30% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 不被好币洗出来)
+     - 30%~300% 区间: 三分点止盈法 (价格跌到 (买入价+最高价)/3 时卖出, 给好币更多空间)
+     - 300% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 锁住大部分利润)
   2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
      - 持币数从峰值跌 >30% (相对值)
      - 流动性从峰值跌 >30% (相对值, 仅已毕业)
@@ -1847,7 +1848,8 @@ def check_sell_conditions(pos: dict, current_price: float,
       1. 阶梯式回撤止盈:
          - 涨 15% 触发止盈跟踪
          - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
-         - 30% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 不被好币洗出来)
+         - 30%~300% 区间: 三分点止盈法 (价格跌到 (买入价+最高价)/3 时卖出, 给好币更多空间)
+         - 300% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 锁住大部分利润)
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
@@ -1873,17 +1875,27 @@ def check_sell_conditions(pos: dict, current_price: float,
     # 涨幅曾达到 tp_trigger_pct (默认 15%) 后激活跟踪
     tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 15)
     tp_midpoint_pct = trading_cfg.get("tp_midpoint_pct", 30)
+    tp_full_midpoint_pct = trading_cfg.get("tp_full_midpoint_pct", 300)
     tp_drawdown_pct = trading_cfg.get("tp_drawdown_pct", 15)
 
     if max_profit_pct >= tp_trigger_pct:
-        if max_profit_pct >= tp_midpoint_pct:
-            # 阶段2: 最高盈利 ≥30%, 使用中点止盈法
-            # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出
+        if max_profit_pct >= tp_full_midpoint_pct:
+            # 阶段3: 最高盈利 ≥300%, 使用中点止盈法
+            # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出, 锁住大部分利润
             midpoint = (buy_price + max_price) / 2
             if current_price <= midpoint:
                 midpoint_pct = (midpoint - buy_price) / buy_price * 100
                 return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
                               f"中点 ${midpoint:.12f} ({midpoint_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        elif max_profit_pct >= tp_midpoint_pct:
+            # 阶段2: 最高盈利 30%~300%, 使用三分点止盈法
+            # 价格跌到 (买入价 + 最高价) / 3 时止盈卖出, 给好币更多空间
+            third_point = (buy_price + max_price) / 3
+            if current_price <= third_point:
+                third_pct = (third_point - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (三分点止盈: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"三分点 ${third_point:.12f} ({third_pct:.0f}%), "
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
         else:
             # 阶段1: 最高盈利 15%~30%, 固定回撤 15% 止盈

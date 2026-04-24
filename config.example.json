@@ -35,6 +35,7 @@
         "max_buy_usd": 1,
         "tp_trigger_pct": 15,
         "tp_midpoint_pct": 30,
+        "tp_full_midpoint_pct": 300,
         "tp_drawdown_pct": 15,
         "momentum_tp_enabled": true,
         "momentum_min_bad_signals": 2,
