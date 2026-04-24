@@ -41,11 +41,12 @@
         "expire_loss_hours": 48,
         "expire_underperform_hours": 72,
         "expire_min_profit_pct": 500,
-        "stop_loss_pct": -40,
+        "stop_loss_pct": -30,
         "momentum_stop_loss_pct": -25,
         "rebuy_cooldown_profit_hours": 12,
         "rebuy_cooldown_loss_hours": 24,
         "monitor_interval_sec": 60,
-        "max_price_deviation": 3.0
+        "max_price_deviation": 3.0,
+        "max_positions": 10
     }
 }

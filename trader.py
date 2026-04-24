@@ -2067,6 +2067,10 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     自动检测交易场所: bonding curve (PUBLISH) 或 PancakeSwap (TRADE)
     bonding curve 根据报价币 (quote) 自动选择 BNB 或 USDT 支付
     买入前检查实时价格, 偏离精筛价格过大则放弃
+
+    仓位管理:
+    - 最多同时持有 max_positions (默认 10) 个仓位, 仓位满则不开新仓
+    - 代币按加分项数量降序排序, 加分项多的优先买入
     """
     trading_cfg = cfg.get("trading", {})
     if not trading_cfg.get("enabled", False):
@@ -2077,13 +2081,39 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     slippage = trading_cfg.get("slippage_pct", 12.0)
     # 价格保护: 实时价格偏离精筛价格的最大倍数 (默认 3 倍)
     max_price_deviation = trading_cfg.get("max_price_deviation", 3.0)
+    # 仓位上限: 最多同时持有的仓位数 (默认 10)
+    max_positions = trading_cfg.get("max_positions", 10)
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
+
+    # 检查当前持仓数量
+    open_positions = get_open_positions(conn)
+    current_count = len(open_positions)
+    if current_count >= max_positions:
+        log.info("仓位已满 (%d/%d), 本轮不开新仓", current_count, max_positions)
+        conn.close()
+        return
+    available_slots = max_positions - current_count
+    log.info("当前持仓 %d/%d, 可开 %d 个新仓", current_count, max_positions, available_slots)
+
+    # 按加分项数量降序排序: 加分项多的优先买入
+    def _bonus_sort_key(item):
+        tk, detail = item
+        # _quality_bonus_tags 由 tag_filter 设置在原始代币 dict 上
+        bonus_tags = detail.get("_quality_bonus_tags") or []
+        return len(bonus_tags)
+    tokens = sorted(tokens, key=_bonus_sort_key, reverse=True)
 
     # BNB 余额检查
     _ensure_bnb_for_gas(bnb_price_usd, slippage)
 
+    bought_count = 0
     for tk, detail in tokens:
+        # 仓位上限检查
+        if bought_count >= available_slots:
+            log.info("已达本轮可开仓上限 (%d), 剩余候选跳过", available_slots)
+            break
+
         addr = tk.get("tokenAddress", "")
         name = tk.get("name", addr[:16])
         channel = tk.get("channel", "quality")  # 通道: quality / graduated
@@ -2175,6 +2205,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
             record_buy(conn, addr, name, result["decimals"], result, channel)
             notify_buy(cfg, name, addr, buy_usdt,
                        result["buy_price_usd"], result["tx_hash"])
+            bought_count += 1
         else:
             reason = f"交易执行失败 (venue={venue}, 金额=${buy_usdt:.2f})"
             log.error("买入失败 %s: %s", name, reason)
