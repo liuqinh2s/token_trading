@@ -520,7 +520,14 @@ def detect_venue(token_address: str, source_hint: str = "") -> str:
     返回: 'BONDING' (four.meme bonding curve) | 'FLAP' (flap bonding curve) |
           'PANCAKE' (已迁移到 PancakeSwap) | 'UNKNOWN'
     source_hint: 可选来源提示 ("flap" / "four.meme"), 优先查对应平台, 减少无效 RPC 调用
+
+    容错机制:
+    - Portal/Helper RPC 查询可能因网络抖动返回 None, 增加 1 次重试 (间隔 2s)
+    - 重试后仍查不到, 但 source_hint + 地址后缀能确认平台 → 信任来源, 回退到对应通道
+      (代币是从链上 TokenCreated 事件发现的, source 标记可靠)
     """
+    addr_lower = token_address.lower()
+
     if source_hint == "flap":
         # flap 代币: 只查 flap Portal, 两个平台完全独立
         state = flap_get_token_state(token_address)
@@ -529,21 +536,76 @@ def detect_venue(token_address: str, source_hint: str = "") -> str:
                 return "PANCAKE"
             if state["status"] in (1, 2):  # Tradable / InDuel
                 return "FLAP"
-        # Portal 查不到 (毕业后数据可能被清除) → 检查 PancakeSwap 流动性
-        if state is None and _check_pancake_liquidity(token_address):
+            # status=3 (Killed) 等异常状态, 不重试, 直接 UNKNOWN
+            log.warning("flap 代币 %s 状态异常 (status=%d)", token_address[:16], state["status"])
+            return "UNKNOWN"
+        # Portal 查不到 (state is None): 可能是网络抖动, 重试 1 次
+        log.info("flap 代币 %s Portal 首次查询无结果, 2s 后重试...", token_address[:16])
+        time.sleep(2)
+        state = flap_get_token_state(token_address)
+        if state is not None:
+            if state["graduated"]:
+                return "PANCAKE"
+            if state["status"] in (1, 2):
+                return "FLAP"
+            log.warning("flap 代币 %s 重试后状态异常 (status=%d)", token_address[:16], state["status"])
+            return "UNKNOWN"
+        # 重试后仍查不到 → 检查 PancakeSwap 流动性
+        if _check_pancake_liquidity(token_address):
             log.info("flap 代币 %s Portal 查不到, PancakeSwap 有流动性 → PANCAKE",
                      token_address[:16])
             return "PANCAKE"
+        # 兜底: source_hint=flap + 地址后缀确认 → 信任来源, 回退到 FLAP 通道
+        if addr_lower.endswith("7777") or addr_lower.endswith("8888"):
+            log.warning("flap 代币 %s Portal 查不到, 但地址后缀确认是 flap → 回退 FLAP 通道",
+                        token_address[:16])
+            return "FLAP"
         return "UNKNOWN"
 
-    # 默认: 先查 four.meme, 查不到再查 flap
+    if source_hint == "four.meme":
+        # four.meme 代币: 只查 four.meme Helper
+        info = fm_get_token_info(token_address)
+        if info is not None:
+            if info["liquidityAdded"]:
+                return "PANCAKE"
+            if info["offers"] > 0:
+                return "BONDING"
+            if _check_pancake_liquidity(token_address):
+                log.info("four.meme 代币 %s 状态不明, PancakeSwap 有流动性 → PANCAKE",
+                         token_address[:16])
+                return "PANCAKE"
+            return "UNKNOWN"
+        # Helper 查不到: 重试 1 次
+        log.info("four.meme 代币 %s Helper 首次查询无结果, 2s 后重试...", token_address[:16])
+        time.sleep(2)
+        info = fm_get_token_info(token_address)
+        if info is not None:
+            if info["liquidityAdded"]:
+                return "PANCAKE"
+            if info["offers"] > 0:
+                return "BONDING"
+            if _check_pancake_liquidity(token_address):
+                return "PANCAKE"
+            return "UNKNOWN"
+        # 重试后仍查不到 → 检查 PancakeSwap
+        if _check_pancake_liquidity(token_address):
+            log.info("four.meme 代币 %s Helper 查不到, PancakeSwap 有流动性 → PANCAKE",
+                     token_address[:16])
+            return "PANCAKE"
+        # 兜底: source_hint=four.meme + 地址后缀确认 → 信任来源, 回退到 BONDING 通道
+        if addr_lower.endswith("4444") or addr_lower.endswith("ffff"):
+            log.warning("four.meme 代币 %s Helper 查不到, 但地址后缀确认是 four.meme → 回退 BONDING 通道",
+                        token_address[:16])
+            return "BONDING"
+        return "UNKNOWN"
+
+    # 无 source_hint: 先查 four.meme, 查不到再查 flap
     info = fm_get_token_info(token_address)
     if info is not None:
         if info["liquidityAdded"]:
             return "PANCAKE"
         if info["offers"] > 0:
             return "BONDING"
-        # four.meme 有记录但状态不明 → 检查 PancakeSwap
         if _check_pancake_liquidity(token_address):
             log.info("four.meme 代币 %s 状态不明, PancakeSwap 有流动性 → PANCAKE",
                      token_address[:16])
