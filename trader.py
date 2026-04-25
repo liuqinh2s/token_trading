@@ -1917,7 +1917,7 @@ def check_sell_conditions(pos: dict, current_price: float,
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
          - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
       4. 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样):
-         - -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
+         - -30% 硬止损: 无论动能如何, 亏损达到 -30% 必须走
          - -25% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
@@ -1996,10 +1996,10 @@ def check_sell_conditions(pos: dict, current_price: float,
     # 策略4: 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样)
     # -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
     # -25% 动能止损: 动能全部恶化时提前止损, 垃圾币早点跑
-    stop_loss_pct = trading_cfg.get("stop_loss_pct", -40)
+    stop_loss_pct = trading_cfg.get("stop_loss_pct", -30)
     momentum_stop_loss_pct = trading_cfg.get("momentum_stop_loss_pct", -25)
 
-    # 4a: 硬止损 — 亏损达到 -40% 无条件卖出
+    # 4a: 硬止损 — 亏损达到 -30% 无条件卖出
     if stop_loss_pct and profit_pct <= stop_loss_pct:
         return True, f"STOP_LOSS (亏损 {profit_pct:.0f}%, 阈值 {stop_loss_pct}%)"
 
