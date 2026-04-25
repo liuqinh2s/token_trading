@@ -16,7 +16,7 @@
 
 ## 项目概述
 
-BSC Token Scanner v6 — 极速扫描 + 精筛后防线，扫描 four.meme 和 flap 平台上新发行的 BSC 代币，链上发现 + 队列淘汰制 + 潜伏型精筛 + 深度防线，推送到 Telegram，可选自动交易。
+BSC Token Scanner v6 — 极速扫描 + 精筛后防线，扫描 four.meme 和 flap 平台上新发行的 BSC 代币，链上发现 + 队列淘汰制 + 标签制精筛 + 深度防线，推送到钉钉，可选自动交易。
 
 - 主要语言：Python
 - 入口文件：scanner.py（扫描器）、trader.py（交易模块）
@@ -45,7 +45,7 @@ BSC Token Scanner v6 — 极速扫描 + 精筛后防线，扫描 four.meme 和 f
 
 ## 文案规范
 
-- 用户可见文案（Telegram 推送、日志）使用中文
+- 用户可见文案（钉钉推送、日志）使用中文
 - 语气统一、术语统一、格式统一
 - README.md 与实际代码行为保持同步
 
@@ -65,12 +65,11 @@ BSC Token Scanner v6 — 极速扫描 + 精筛后防线，扫描 four.meme 和 f
 
 ## 关键架构约束
 
-- v6 架构: 链上发现 + 队列淘汰制 + 潜伏型精筛 + 精筛后防线
+- v6 架构: 链上发现 + 队列淘汰制 + 标签制精筛 + 精筛后防线
 - 代币发现: BSC RPC eth_getLogs 扫链上 TokenCreated 事件, 100% 覆盖
 - 队列淘汰: 持续跟踪代币, 满足淘汰条件永久剔除
-- 精筛: 潜伏型筛选 (仅未毕业币, 持币≥50/进度30%~90%/币龄≤10h/没在崩盘)
-- 毕业通道: 刚毕业强势币 (仅已毕业币, 持币≥100/流动性≥$10k/币龄≤24h/没在崩盘)
-- 精筛后防线: Top10 持仓集中度 + 开发者行为分析 (仅对精筛通过的少量代币)
+- 精筛: 标签制 (统一通道, 基础标签AND: 持币≥30/进度≥15%或流动性≥$10k/仿盘≥5/未崩盘/社交≥1/有动能/大盘向上 + 加分项至少1个)
+- 精筛后防线: Top10 持仓集中度 + 开发者行为分析 + 假K线检测 (仅对精筛通过的少量代币)
 - DexScreener 批量查价同时提取交易量和买卖笔数 (零额外 API 调用)
 - BSCScan API 使用 Etherscan V2 (api.etherscan.io/v2/api?chainid=56)
 - API 调用需注意限流：DexScreener ~300 req/min、GeckoTerminal ~30 req/min、BSCScan ~5 req/s
@@ -97,5 +96,5 @@ BSC Token Scanner v6 — 极速扫描 + 精筛后防线，扫描 four.meme 和 f
 
 - 任何筛选策略的改动（常量阈值、淘汰条件、精筛逻辑、数据源切换等），必须同时修改 `token_trading/scanner.py` 和 `token_scanner/scripts/scan.py`
 - 修改前先对比两边当前实现，确认差异点，避免遗漏
-- 对应关系：`token_trading/scanner.py` 顶部常量区 ↔ `token_scanner/scripts/scan.py` 顶部常量区；函数名一致：`discover_on_chain`、`admission_filter`、`elimination_check`、`quality_filter`、`graduated_quality_filter`、`post_quality_defense`
+- 对应关系：`token_trading/scanner.py` 顶部常量区 ↔ `token_scanner/scripts/scan.py` 顶部常量区；函数名一致：`discover_on_chain`、`admission_filter`、`elimination_check`、`tag_filter`、`post_quality_defense`
 - 文件头注释中的淘汰条件/精筛条件描述也要同步更新
