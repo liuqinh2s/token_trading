@@ -2534,8 +2534,9 @@ CLEANUP_VALUE_THRESHOLD = 0.1  # 低于 $0.1 的已平仓记录直接删除
 def _cleanup_low_value_positions(bnb_price_usd: float):
     """
     清理数据库中价值极低的已平仓记录, 减少启动时链上扫描量
-    删除条件: status=CLOSED 且 (sell_price 和 current_price 都低于阈值)
+    删除条件: status=CLOSED 且持仓价值低于阈值 且已过冷却期
     不会删除 OPEN 持仓, 不调用任何 API
+    注意: 冷却期内的 CLOSED 记录绝不删除, 否则 is_in_cooldown 会失效
     """
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
@@ -2543,7 +2544,7 @@ def _cleanup_low_value_positions(bnb_price_usd: float):
     # 查询所有 CLOSED 记录, 用数据库中已有的价格数据判断
     rows = conn.execute("""
         SELECT id, token_address, token_name, buy_amount, token_decimals,
-               sell_price_usd, current_price
+               sell_price_usd, current_price, sell_time
         FROM positions
         WHERE status = 'CLOSED'
     """).fetchall()
@@ -2552,16 +2553,20 @@ def _cleanup_low_value_positions(bnb_price_usd: float):
         conn.close()
         return
 
+    now_ms = int(time.time() * 1000)
+    # 冷却保护: 平仓后 48h 内的记录不删除 (取盈利/亏损冷却期的较大值再加缓冲)
+    COOLDOWN_PROTECT_MS = 48 * 3600 * 1000
+
     delete_ids = []
     for row in rows:
-        pos_id, addr, name, buy_amount_str, decimals, sell_price, current_price = row
-        # 用 sell_price 和 current_price 中较大的估算残余价值
-        best_price = max(sell_price or 0, current_price or 0)
-        if best_price < CLEANUP_VALUE_THRESHOLD:
-            # 价格本身就低于阈值, 直接标记删除
-            delete_ids.append((pos_id, name or addr[:16]))
+        pos_id, addr, name, buy_amount_str, decimals, sell_price, current_price, sell_time = row
+
+        # 冷却期保护: 平仓时间在保护期内的记录绝不删除
+        if sell_time and (now_ms - sell_time) < COOLDOWN_PROTECT_MS:
             continue
-        # 如果有 buy_amount, 估算持仓价值
+
+        # 用 buy_amount * best_price 估算持仓价值 (不能用单价和阈值比较, meme 币单价极低)
+        best_price = max(sell_price or 0, current_price or 0)
         try:
             amount = int(buy_amount_str or "0")
             dec = decimals or 18
@@ -2570,6 +2575,7 @@ def _cleanup_low_value_positions(bnb_price_usd: float):
             if value < CLEANUP_VALUE_THRESHOLD:
                 delete_ids.append((pos_id, name or addr[:16]))
         except (ValueError, TypeError, OverflowError):
+            # 无法计算价值时, 用买入金额兜底 (buy_bnb * bnb_price)
             pass
 
     if delete_ids:
@@ -2577,7 +2583,7 @@ def _cleanup_low_value_positions(bnb_price_usd: float):
             f"DELETE FROM positions WHERE id IN ({','.join(str(d[0]) for d in delete_ids)})"
         )
         conn.commit()
-        log.info("数据库清理: 删除 %d 条低价值已平仓记录 (价值<$%.2f)",
+        log.info("数据库清理: 删除 %d 条低价值已平仓记录 (价值<$%.2f, 已过冷却保护期)",
                  len(delete_ids), CLEANUP_VALUE_THRESHOLD)
 
     remaining = conn.execute("SELECT COUNT(DISTINCT token_address) FROM positions").fetchone()[0]
