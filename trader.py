@@ -2057,6 +2057,12 @@ def _send_trade_notify(cfg: dict, title: str, text: str):
         log.warning("交易通知发送失败: %s", e)
 
 
+def _trade_time_str() -> str:
+    """返回当前时间字符串, 用于交易通知末尾"""
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def notify_buy(cfg: dict, token_name: str, token_address: str,
                buy_usdt: float, buy_price_usd: float, tx_hash: str):
     """买入通知"""
@@ -2066,7 +2072,8 @@ def notify_buy(cfg: dict, token_name: str, token_address: str,
         f"合约: `{token_address}`\n\n"
         f"花费: {buy_usdt:.2f} USDT\n\n"
         f"单价: ${buy_price_usd:.12f}\n\n"
-        f"TX: [查看](https://bscscan.com/tx/{tx_hash})"
+        f"TX: [查看](https://bscscan.com/tx/{tx_hash})\n\n"
+        f"时间: {_trade_time_str()}"
     )
     _send_trade_notify(cfg, "买入成功", text)
 
@@ -2078,7 +2085,8 @@ def notify_buy_failed(cfg: dict, token_name: str, token_address: str,
         f"## 🔴 买入失败\n\n"
         f"代币: {token_name}\n\n"
         f"合约: `{token_address}`\n\n"
-        f"原因: {reason}"
+        f"原因: {reason}\n\n"
+        f"时间: {_trade_time_str()}"
     )
     _send_trade_notify(cfg, "买入失败", text)
 
@@ -2087,11 +2095,11 @@ def notify_sell(cfg: dict, token_name: str, token_address: str,
                 sell_reason: str, pnl_pct: float, tx_hash: str,
                 buy_price: float = 0, max_price: float = 0,
                 sell_price: float = 0):
-    """卖出通知"""
+    """卖出成功通知"""
     emoji = "🔴" if pnl_pct < 0 else "🟡" if pnl_pct < 50 else "🟢"
     max_pnl_pct = ((max_price - buy_price) / buy_price * 100) if (buy_price > 0 and max_price > 0) else 0
     text = (
-        f"## {emoji} 卖出\n\n"
+        f"## {emoji} 卖出成功\n\n"
         f"代币: {token_name}\n\n"
         f"合约: `{token_address}`\n\n"
         f"原因: {sell_reason}\n\n"
@@ -2099,9 +2107,10 @@ def notify_sell(cfg: dict, token_name: str, token_address: str,
         f"买入: ${buy_price:.12f}\n\n"
         f"最高: ${max_price:.12f}\n\n"
         f"卖出: ${sell_price:.12f}\n\n"
-        f"TX: [查看](https://bscscan.com/tx/{tx_hash})"
+        f"TX: [查看](https://bscscan.com/tx/{tx_hash})\n\n"
+        f"时间: {_trade_time_str()}"
     )
-    _send_trade_notify(cfg, "卖出通知", text)
+    _send_trade_notify(cfg, "卖出成功", text)
 
 
 def notify_sell_failed(cfg: dict, token_name: str, token_address: str,
@@ -2111,7 +2120,8 @@ def notify_sell_failed(cfg: dict, token_name: str, token_address: str,
         f"## 🔴 卖出失败\n\n"
         f"代币: {token_name}\n\n"
         f"合约: `{token_address}`\n\n"
-        f"原因: {reason}"
+        f"原因: {reason}\n\n"
+        f"时间: {_trade_time_str()}"
     )
     _send_trade_notify(cfg, "卖出失败", text)
 
@@ -2189,7 +2199,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
             break
 
         addr = tk.get("tokenAddress", "")
-        name = tk.get("name", addr[:16])
+        name = tk.get("shortName") or tk.get("name") or addr[:16]
         channel = tk.get("channel", "quality")  # 通道: quality / graduated
         source = tk.get("source", "")  # 来源平台: "flap" / "four.meme"
 
