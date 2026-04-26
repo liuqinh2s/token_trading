@@ -1910,8 +1910,8 @@ def check_sell_conditions(pos: dict, current_price: float,
       1. 阶梯式回撤止盈:
          - 涨 15% 触发止盈跟踪
          - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
-         - 30%~300% 区间: 三分点止盈法 (价格跌到 (买入价+最高价)/3 时卖出, 给好币更多空间)
-         - 300% 以上: 中点止盈法 (价格跌到 (买入价+最高价)/2 时卖出, 锁住大部分利润)
+         - 30%~300% 区间: 三分点止盈法 (价格跌到 买入价+涨幅/3 时卖出, 保住 1/3 利润)
+         - 300% 以上: 中点止盈法 (价格跌到 买入价+涨幅/2 时卖出, 锁住 50% 利润)
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
          - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
@@ -1943,8 +1943,8 @@ def check_sell_conditions(pos: dict, current_price: float,
     if max_profit_pct >= tp_trigger_pct:
         if max_profit_pct >= tp_full_midpoint_pct:
             # 阶段3: 最高盈利 ≥300%, 使用中点止盈法
-            # 价格跌到 (买入价 + 最高价) / 2 时止盈卖出, 锁住大部分利润
-            midpoint = (buy_price + max_price) / 2
+            # 价格跌到 买入价 + 涨幅的一半 时止盈卖出, 锁住 50% 利润
+            midpoint = buy_price + (max_price - buy_price) / 2
             if current_price <= midpoint:
                 midpoint_pct = (midpoint - buy_price) / buy_price * 100
                 return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
@@ -1952,8 +1952,8 @@ def check_sell_conditions(pos: dict, current_price: float,
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
         elif max_profit_pct >= tp_midpoint_pct:
             # 阶段2: 最高盈利 30%~300%, 使用三分点止盈法
-            # 价格跌到 (买入价 + 最高价) / 3 时止盈卖出, 给好币更多空间
-            third_point = (buy_price + max_price) / 3
+            # 价格跌到 买入价 + 涨幅的三分之一 时止盈卖出, 保住 1/3 利润, 给好币更多空间
+            third_point = buy_price + (max_price - buy_price) / 3
             if current_price <= third_point:
                 third_pct = (third_point - buy_price) / buy_price * 100
                 return True, (f"TRAILING_TP (三分点止盈: 最高盈利 {max_profit_pct:.0f}%, "
