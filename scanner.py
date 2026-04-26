@@ -3454,7 +3454,7 @@ def format_message(results: list[dict]) -> str:
         holders = item.get("holders", 0)
         age_min = (int(time.time() * 1000) - item.get("createdAt", 0)) / 60000
 
-        lines.append(f"### #{i} {name} ({symbol})")
+        lines.append(f"### #{i} {symbol} ({name})")
         if item.get("isRocket"):
             lines.append("🚀 **火箭通道** (快速起飞币)")
         if item.get("isGraduated"):
