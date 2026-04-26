@@ -2065,7 +2065,7 @@ def _trade_time_str() -> str:
 
 def notify_buy(cfg: dict, token_name: str, token_address: str,
                buy_usdt: float, buy_price_usd: float, tx_hash: str):
-    """买入通知"""
+    """买入成功通知 (简洁版, 代币详情已在精筛报告中推送)"""
     text = (
         f"## 🟢 买入成功\n\n"
         f"代币: {token_name}\n\n"
@@ -2080,15 +2080,8 @@ def notify_buy(cfg: dict, token_name: str, token_address: str,
 
 def notify_buy_failed(cfg: dict, token_name: str, token_address: str,
                       reason: str):
-    """买入失败通知"""
-    text = (
-        f"## 🔴 买入失败\n\n"
-        f"代币: {token_name}\n\n"
-        f"合约: `{token_address}`\n\n"
-        f"原因: {reason}\n\n"
-        f"时间: {_trade_time_str()}"
-    )
-    _send_trade_notify(cfg, "买入失败", text)
+    """买入失败记录 (仅写日志, 不推送钉钉; 精筛报告已推送代币详情, 没有买入成功通知即表示失败)"""
+    log.info("[买入跳过] %s (%s): %s", token_name, token_address[:16], reason)
 
 
 def notify_sell(cfg: dict, token_name: str, token_address: str,
@@ -2203,13 +2196,13 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         channel = tk.get("channel", "quality")  # 通道: quality / graduated
         source = tk.get("source", "")  # 来源平台: "flap" / "four.meme"
 
-        # 检查是否已有持仓
+        # 检查是否已有持仓 (仅写日志)
         if has_open_position(conn, addr):
             log.info("跳过 %s: 已有持仓", name)
             notify_buy_failed(cfg, name, addr, "已有持仓, 跳过重复买入")
             continue
 
-        # 检查平仓冷却期
+        # 检查平仓冷却期 (仅写日志)
         in_cd, cd_reason = is_in_cooldown(conn, addr, trading_cfg)
         if in_cd:
             log.info("跳过 %s: %s", name, cd_reason)
