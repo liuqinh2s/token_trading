@@ -3,7 +3,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
 买入:
   - four.meme bonding curve: 根据报价币 (quote) 自动选择 BNB 或 USDT 直接买入
   - flap bonding curve: 统一通过 Router 合约用 BNB 买入 (Portal 有 access control)
-  - PancakeSwap: 用 BNB 直接买入 (BNB → Token)
+  - PancakeSwap: 自动检测流动性池配对, 优先 BNB→Token, 无 WBNB 池时回退 USDT→Token
   - 买入金额以 USDT 计价, BNB 报价时自动换算
 
   flap 平台交易架构:
@@ -16,7 +16,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
 卖出:
   - four.meme bonding curve: 卖出收到报价币 (BNB 或 USDT)
   - flap bonding curve: 通过 Router 卖出, 收到 BNB (gas 较高, 需 700k)
-  - PancakeSwap: 卖出收到 BNB (Token → BNB)
+  - PancakeSwap: 自动检测流动性池配对, 优先 Token→WBNB→BNB, 无 WBNB 池时回退 Token→USDT
   1. 阶梯式回撤止盈:
      - 涨 15% 触发止盈跟踪
      - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
@@ -500,18 +500,29 @@ def fm_get_token_info(token_address: str) -> dict | None:
 def _check_pancake_liquidity(token_address: str) -> bool:
     """
     检查代币在 PancakeSwap 上是否有流动性 (通过 Router 询价)
-    用极小金额 (0.0001 BNB) 询价, 能返回正数说明有流动性池
+    同时检查 WBNB 和 USDT 两个池子, 任一有流动性即返回 True
     """
     if not _w3:
         return False
+    token_cs = Web3.to_checksum_address(token_address)
+    router = _w3.eth.contract(address=PANCAKE_ROUTER_V2, abi=ROUTER_ABI)
+    # 先查 WBNB 池
     try:
-        router = _w3.eth.contract(address=PANCAKE_ROUTER_V2, abi=ROUTER_ABI)
-        token_cs = Web3.to_checksum_address(token_address)
         test_amount = Web3.to_wei(0.0001, "ether")  # 0.0001 BNB
         amounts = router.functions.getAmountsOut(test_amount, [WBNB, token_cs]).call()
-        return amounts[-1] > 0
+        if amounts[-1] > 0:
+            return True
     except Exception:
-        return False
+        pass
+    # 再查 USDT 池 (flap 毕业代币常见 Token/USDT 池)
+    try:
+        test_usdt = int(0.1 * (10 ** USDT_DECIMALS))  # 0.1 USDT
+        amounts = router.functions.getAmountsOut(test_usdt, [USDT, token_cs]).call()
+        if amounts[-1] > 0:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def detect_venue(token_address: str, source_hint: str = "") -> str:
@@ -1485,8 +1496,11 @@ def calculate_buy_amount(cfg: dict, bnb_price_usd: float,
 def buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
               token_name: str = "", bnb_price_usd: float = 600.0) -> dict | None:
     """
-    通过 PancakeSwap 买入代币 (BNB → WBNB → Token)
-    买入金额以 USDT 计价, 换算为 BNB 后直接用 BNB 支付
+    通过 PancakeSwap 买入代币
+    自动检测流动性池配对:
+      - 优先 BNB → WBNB → Token (swapExactETHForTokens)
+      - WBNB 池无流动性时回退 USDT → Token (swapExactTokensForTokens)
+    买入金额以 USDT 计价
     返回: {"tx_hash": ..., "token_amount": ..., "price_usd": ...} 或 None
     """
     if not _w3 or not _wallet_address or not _private_key:
@@ -1496,79 +1510,170 @@ def buy_token(token_address: str, buy_usdt: float, slippage_pct: float = 12.0,
     token_cs = Web3.to_checksum_address(token_address)
 
     try:
-        # 将 USDT 计价金额换算为 BNB
-        buy_bnb = buy_usdt / bnb_price_usd
-        buy_bnb_wei = Web3.to_wei(buy_bnb, "ether")
-        log.info("PancakeSwap 买入: $%.2f → %.6f BNB (BNB价格 $%.2f)",
-                 buy_usdt, buy_bnb, bnb_price_usd)
-
-        # 检查 BNB 余额是否足够 (买入金额 + gas 预留)
-        bnb_balance = get_bnb_balance()
-        gas_reserve = 0.002  # 预留 gas
-        if bnb_balance < buy_bnb + gas_reserve:
-            log.error("BNB 余额不足: 需要 %.6f BNB (买入 %.6f + gas), 当前 %.6f BNB",
-                      buy_bnb + gas_reserve, buy_bnb, bnb_balance)
-            return None
-
         router = _w3.eth.contract(address=PANCAKE_ROUTER_V2, abi=ROUTER_ABI)
         token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
-
         deadline = int(time.time()) + 120
-        path = [WBNB, token_cs]
 
-        # 询价: BNB → Token
+        # --- 自动检测流动性池: 先尝试 WBNB 路径, 失败则回退 USDT 路径 ---
+        use_usdt_path = False
+        buy_bnb = buy_usdt / bnb_price_usd
+        buy_bnb_wei = Web3.to_wei(buy_bnb, "ether")
+        path_wbnb = [WBNB, token_cs]
+
         try:
-            amounts = router.functions.getAmountsOut(buy_bnb_wei, path).call()
+            amounts = router.functions.getAmountsOut(buy_bnb_wei, path_wbnb).call()
             expected_out = amounts[-1]
+            if expected_out <= 0:
+                raise ValueError("WBNB 池询价返回 0")
             amount_out_min = int(expected_out * (1 - slippage_pct / 100))
-        except Exception:
-            amount_out_min = 0
-            log.warning("询价失败, 使用 amountOutMin=0")
+            log.info("PancakeSwap 买入 [WBNB路径]: $%.2f → %.6f BNB (BNB价格 $%.2f)",
+                     buy_usdt, buy_bnb, bnb_price_usd)
+        except Exception as e_wbnb:
+            log.info("WBNB 路径询价失败 (%s), 尝试 USDT 路径: %s", e_wbnb, token_name)
+            # 尝试 USDT → Token 路径
+            path_usdt = [USDT, token_cs]
+            buy_usdt_wei = int(buy_usdt * (10 ** USDT_DECIMALS))
+            try:
+                amounts = router.functions.getAmountsOut(buy_usdt_wei, path_usdt).call()
+                expected_out = amounts[-1]
+                if expected_out <= 0:
+                    raise ValueError("USDT 池询价返回 0")
+                amount_out_min = int(expected_out * (1 - slippage_pct / 100))
+                use_usdt_path = True
+                log.info("PancakeSwap 买入 [USDT路径]: $%.2f USDT", buy_usdt)
+            except Exception as e_usdt:
+                log.error("WBNB 和 USDT 路径均无流动性 [%s]: WBNB=%s, USDT=%s",
+                          token_name, e_wbnb, e_usdt)
+                return None
 
-        # 获取买入前余额
-        balance_before = token_contract.functions.balanceOf(_wallet_address).call()
+        if use_usdt_path:
+            # === USDT → Token 路径 ===
+            # 检查 USDT 余额
+            usdt_contract = _w3.eth.contract(address=USDT, abi=ERC20_ABI)
+            usdt_balance = usdt_contract.functions.balanceOf(_wallet_address).call()
+            if usdt_balance < buy_usdt_wei:
+                log.error("USDT 余额不足: 需要 %.2f USDT, 当前 %.2f USDT",
+                          buy_usdt, usdt_balance / (10 ** USDT_DECIMALS))
+                return None
 
-        # 构建交易: BNB → Token (通过 WBNB)
-        nonce = _w3.eth.get_transaction_count(_wallet_address)
-        tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            amount_out_min, path, _wallet_address, deadline,
-        ).build_transaction({
-            "from": _wallet_address, "value": buy_bnb_wei,
-            "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
-            "nonce": nonce, "chainId": BSC_CHAIN_ID,
-        })
+            # Approve USDT 给 Router
+            allowance = usdt_contract.functions.allowance(
+                _wallet_address, PANCAKE_ROUTER_V2
+            ).call()
+            if allowance < buy_usdt_wei:
+                log.info("Approve USDT to PancakeSwap Router...")
+                nonce = _w3.eth.get_transaction_count(_wallet_address)
+                approve_tx = usdt_contract.functions.approve(
+                    PANCAKE_ROUTER_V2, MAX_UINT256
+                ).build_transaction({
+                    "from": _wallet_address, "gas": DEFAULT_GAS_APPROVE,
+                    "gasPrice": _w3.eth.gas_price, "nonce": nonce, "chainId": BSC_CHAIN_ID,
+                })
+                signed = _w3.eth.account.sign_transaction(approve_tx, _private_key)
+                tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+                receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt["status"] != 1:
+                    log.error("USDT Approve 失败")
+                    return None
+                log.info("USDT Approve 成功")
+                time.sleep(2)
 
-        signed = _w3.eth.account.sign_transaction(tx, _private_key)
-        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("买入 TX 已发送: %s", tx_hash.hex())
+            # 获取买入前余额
+            balance_before = token_contract.functions.balanceOf(_wallet_address).call()
 
-        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            log.error("买入交易失败: %s", tx_hash.hex())
-            return None
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            tx = router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                buy_usdt_wei, amount_out_min, path_usdt, _wallet_address, deadline,
+            ).build_transaction({
+                "from": _wallet_address, "value": 0,
+                "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
+                "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
 
-        balance_after = token_contract.functions.balanceOf(_wallet_address).call()
-        actual_received = balance_after - balance_before
-        decimals = token_contract.functions.decimals().call()
+            signed = _w3.eth.account.sign_transaction(tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            log.info("买入 TX [USDT路径] 已发送: %s", tx_hash.hex())
 
-        if actual_received <= 0:
-            log.error("买入异常: TX 成功但未收到代币 %s (TX: %s)",
-                      token_name or token_address[:16], tx_hash.hex())
-            return None
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("买入交易失败 [USDT路径]: %s", tx_hash.hex())
+                return None
 
-        buy_price_usd = buy_usdt / (actual_received / 10**decimals)
+            balance_after = token_contract.functions.balanceOf(_wallet_address).call()
+            actual_received = balance_after - balance_before
+            decimals = token_contract.functions.decimals().call()
 
-        log.info("买入成功 %s: $%.2f (%.6f BNB) → %s 代币, 单价 $%.12f",
-                 token_name or token_address[:16], buy_usdt, buy_bnb, actual_received, buy_price_usd)
+            if actual_received <= 0:
+                log.error("买入异常: TX 成功但未收到代币 %s (TX: %s)",
+                          token_name or token_address[:16], tx_hash.hex())
+                return None
 
-        return {
-            "tx_hash": tx_hash.hex(),
-            "token_amount": str(actual_received),
-            "decimals": decimals,
-            "buy_price_usd": buy_price_usd,
-            "buy_bnb": buy_bnb,
-            "venue": "PANCAKE",
-        }
+            buy_price_usd = buy_usdt / (actual_received / 10**decimals)
+
+            log.info("买入成功 %s [USDT路径]: $%.2f USDT → %s 代币, 单价 $%.12f",
+                     token_name or token_address[:16], buy_usdt, actual_received, buy_price_usd)
+
+            return {
+                "tx_hash": tx_hash.hex(),
+                "token_amount": str(actual_received),
+                "decimals": decimals,
+                "buy_price_usd": buy_price_usd,
+                "buy_bnb": 0.0,
+                "venue": "PANCAKE",
+            }
+        else:
+            # === BNB → WBNB → Token 路径 (原逻辑) ===
+            # 检查 BNB 余额
+            bnb_balance = get_bnb_balance()
+            gas_reserve = 0.002
+            if bnb_balance < buy_bnb + gas_reserve:
+                log.error("BNB 余额不足: 需要 %.6f BNB (买入 %.6f + gas), 当前 %.6f BNB",
+                          buy_bnb + gas_reserve, buy_bnb, bnb_balance)
+                return None
+
+            # 获取买入前余额
+            balance_before = token_contract.functions.balanceOf(_wallet_address).call()
+
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            tx = router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                amount_out_min, path_wbnb, _wallet_address, deadline,
+            ).build_transaction({
+                "from": _wallet_address, "value": buy_bnb_wei,
+                "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
+                "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
+
+            signed = _w3.eth.account.sign_transaction(tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            log.info("买入 TX 已发送: %s", tx_hash.hex())
+
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("买入交易失败: %s", tx_hash.hex())
+                return None
+
+            balance_after = token_contract.functions.balanceOf(_wallet_address).call()
+            actual_received = balance_after - balance_before
+            decimals = token_contract.functions.decimals().call()
+
+            if actual_received <= 0:
+                log.error("买入异常: TX 成功但未收到代币 %s (TX: %s)",
+                          token_name or token_address[:16], tx_hash.hex())
+                return None
+
+            buy_price_usd = buy_usdt / (actual_received / 10**decimals)
+
+            log.info("买入成功 %s: $%.2f (%.6f BNB) → %s 代币, 单价 $%.12f",
+                     token_name or token_address[:16], buy_usdt, buy_bnb, actual_received, buy_price_usd)
+
+            return {
+                "tx_hash": tx_hash.hex(),
+                "token_amount": str(actual_received),
+                "decimals": decimals,
+                "buy_price_usd": buy_price_usd,
+                "buy_bnb": buy_bnb,
+                "venue": "PANCAKE",
+            }
 
     except Exception as e:
         log.error("买入异常 [%s]: %s", token_name or token_address[:16], e)
@@ -1582,7 +1687,10 @@ def sell_token(token_address: str, amount: int | None = None,
                slippage_pct: float = 15.0, token_name: str = "",
                bnb_price_usd: float = 600.0) -> dict | None:
     """
-    通过 PancakeSwap 卖出代币 (Token → WBNB → BNB)
+    通过 PancakeSwap 卖出代币
+    自动检测流动性池配对:
+      - 优先 Token → WBNB → BNB (swapExactTokensForETH)
+      - WBNB 池无流动性时回退 Token → USDT (swapExactTokensForTokens)
     amount=None 表示卖出全部持仓
     返回: {"tx_hash": ..., "usdt_received": ...} 或 None
     """
@@ -1624,52 +1732,107 @@ def sell_token(token_address: str, amount: int | None = None,
             log.info("Approve 成功")
             time.sleep(2)
 
-        # 询价: Token → WBNB (→ BNB)
-        path = [token_cs, WBNB]
         deadline = int(time.time()) + 120
+
+        # --- 自动检测流动性池: 先尝试 WBNB 路径, 失败则回退 USDT 路径 ---
+        use_usdt_path = False
+        path_wbnb = [token_cs, WBNB]
         try:
-            amounts = router.functions.getAmountsOut(amount, path).call()
+            amounts = router.functions.getAmountsOut(amount, path_wbnb).call()
             expected_bnb = amounts[-1]
+            if expected_bnb <= 0:
+                raise ValueError("WBNB 池询价返回 0")
             amount_out_min = int(expected_bnb * (1 - slippage_pct / 100))
-        except Exception:
-            amount_out_min = 0
-            log.warning("卖出询价失败, 使用 amountOutMin=0")
+            log.info("卖出询价 [WBNB路径]: %s → %.6f BNB",
+                     token_name or token_address[:16],
+                     float(Web3.from_wei(expected_bnb, "ether")))
+        except Exception as e_wbnb:
+            log.info("WBNB 路径询价失败 (%s), 尝试 USDT 路径: %s", e_wbnb, token_name)
+            # 尝试 Token → USDT 路径
+            path_usdt = [token_cs, USDT]
+            try:
+                amounts = router.functions.getAmountsOut(amount, path_usdt).call()
+                expected_usdt = amounts[-1]
+                if expected_usdt <= 0:
+                    raise ValueError("USDT 池询价返回 0")
+                amount_out_min = int(expected_usdt * (1 - slippage_pct / 100))
+                use_usdt_path = True
+                log.info("卖出询价 [USDT路径]: %s → %.4f USDT",
+                         token_name or token_address[:16],
+                         expected_usdt / (10 ** USDT_DECIMALS))
+            except Exception as e_usdt:
+                log.error("WBNB 和 USDT 路径均无流动性 [%s]: WBNB=%s, USDT=%s",
+                          token_name, e_wbnb, e_usdt)
+                return None
 
-        # 获取卖出前 BNB 余额
-        bnb_before = _w3.eth.get_balance(_wallet_address)
+        if use_usdt_path:
+            # === Token → USDT 路径 ===
+            usdt_contract = _w3.eth.contract(address=USDT, abi=ERC20_ABI)
+            usdt_before = usdt_contract.functions.balanceOf(_wallet_address).call()
 
-        # 构建卖出交易: Token → WBNB → BNB
-        nonce = _w3.eth.get_transaction_count(_wallet_address)
-        tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            amount, amount_out_min, path, _wallet_address, deadline,
-        ).build_transaction({
-            "from": _wallet_address, "value": 0,
-            "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
-            "nonce": nonce, "chainId": BSC_CHAIN_ID,
-        })
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            tx = router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                amount, amount_out_min, path_usdt, _wallet_address, deadline,
+            ).build_transaction({
+                "from": _wallet_address, "value": 0,
+                "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
+                "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
 
-        signed = _w3.eth.account.sign_transaction(tx, _private_key)
-        tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("卖出 TX 已发送: %s", tx_hash.hex())
+            signed = _w3.eth.account.sign_transaction(tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            log.info("卖出 TX [USDT路径] 已发送: %s", tx_hash.hex())
 
-        receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if receipt["status"] != 1:
-            log.error("卖出交易失败: %s", tx_hash.hex())
-            return None
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("卖出交易失败 [USDT路径]: %s", tx_hash.hex())
+                return None
 
-        bnb_after = _w3.eth.get_balance(_wallet_address)
-        gas_cost = receipt["gasUsed"] * receipt["effectiveGasPrice"]
-        bnb_received = float(Web3.from_wei(bnb_after - bnb_before + gas_cost, "ether"))
-        usdt_received = bnb_received * bnb_price_usd
+            usdt_after = usdt_contract.functions.balanceOf(_wallet_address).call()
+            usdt_received = (usdt_after - usdt_before) / (10 ** USDT_DECIMALS)
 
-        log.info("卖出成功 %s: 收回 %.6f BNB ($%.4f)",
-                 token_name or token_address[:16], bnb_received, usdt_received)
+            log.info("卖出成功 %s [USDT路径]: 收回 %.4f USDT",
+                     token_name or token_address[:16], usdt_received)
 
-        return {
-            "tx_hash": tx_hash.hex(),
-            "usdt_received": usdt_received,
-            "bnb_received": bnb_received,
-        }
+            return {
+                "tx_hash": tx_hash.hex(),
+                "usdt_received": usdt_received,
+            }
+        else:
+            # === Token → WBNB → BNB 路径 (原逻辑) ===
+            bnb_before = _w3.eth.get_balance(_wallet_address)
+
+            nonce = _w3.eth.get_transaction_count(_wallet_address)
+            tx = router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
+                amount, amount_out_min, path_wbnb, _wallet_address, deadline,
+            ).build_transaction({
+                "from": _wallet_address, "value": 0,
+                "gas": DEFAULT_GAS_SWAP, "gasPrice": _w3.eth.gas_price,
+                "nonce": nonce, "chainId": BSC_CHAIN_ID,
+            })
+
+            signed = _w3.eth.account.sign_transaction(tx, _private_key)
+            tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+            log.info("卖出 TX 已发送: %s", tx_hash.hex())
+
+            receipt = _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] != 1:
+                log.error("卖出交易失败: %s", tx_hash.hex())
+                return None
+
+            bnb_after = _w3.eth.get_balance(_wallet_address)
+            gas_cost = receipt["gasUsed"] * receipt["effectiveGasPrice"]
+            bnb_received = float(Web3.from_wei(bnb_after - bnb_before + gas_cost, "ether"))
+            usdt_received = bnb_received * bnb_price_usd
+
+            log.info("卖出成功 %s: 收回 %.6f BNB ($%.4f)",
+                     token_name or token_address[:16], bnb_received, usdt_received)
+
+            return {
+                "tx_hash": tx_hash.hex(),
+                "usdt_received": usdt_received,
+                "bnb_received": bnb_received,
+            }
 
     except Exception as e:
         log.error("卖出异常 [%s]: %s", token_name or token_address[:16], e)

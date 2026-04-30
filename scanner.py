@@ -25,6 +25,7 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 持币地址从 ≥30 跌破 10
   - 持币数从峰值跌 70%+ (峰值≥50, 清理僵尸币)
   - 无社交媒体 (four.meme 通过 detail API, flap 通过 flap.sh 页面 SSR 提取, 统一淘汰)
+  - flap 社交补查超时: 入场时社交抓取失败给 2 轮缓冲, 超时仍无社交则淘汰 (避免低质量 flap 币长期占位)
   - 流动性从 >$1k 跌破 $100 (仅已毕业代币)
   - 进度 < 1% 且币龄 > 2h (four.meme + flap, 均通过链上数据获取进度, flap 用 Portal getTokenV5)
   - 进度 < 5% 且币龄 > 4h
@@ -43,7 +44,7 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 未崩盘 (近三期最高点跌幅 < 35%)
   - 社交 ≥ 1 (flap 豁免: 持币≥50 且 进度≥30%/已毕业 时跳过社交要求)
   - 单动能触发: 持币数比上轮增长 或 价格比上轮上涨 (任一即可)
-    首轮豁免: 首轮入队无历史数据时, 持币≥100 + 进度≥50%(未毕业)/流动性≥$15k(已毕业) 视为有动能
+    首轮豁免: 首轮入队无历史数据时, 持币≥50 + 进度≥30%(未毕业)/流动性≥$10k(已毕业) 视为有动能
 """
 
 from __future__ import annotations
@@ -183,7 +184,7 @@ TOTAL_SUPPLY = 1_000_000_000           # 10亿
 #   4. 未崩盘 (近三期最高点跌幅 < 35%)
 #   5. 社交 ≥ 1 (flap 豁免: 持币≥50 且 进度≥30%/已毕业 时跳过社交要求)
 #   6. 单动能触发: 持币数比上轮增长 或 价格比上轮上涨 (任一即可)
-#      首轮豁免: 首轮入队无历史数据时, 持币≥100 + 进度≥50%/流动性≥$15k 视为有动能
+#      首轮豁免: 首轮入队无历史数据时, 持币≥50 + 进度≥30%/流动性≥$10k 视为有动能
 #   (大盘情绪: Gas指数仍计算并记录, 仅用于数据分析, 不作为精筛条件)
 TAG_BASE_MIN_HOLDERS = 20              # 基础: 持币数 ≥ 20 (从30降低, 更早发现)
 TAG_BASE_MIN_PROGRESS = 0.15           # 基础: 进度 ≥ 15% (仅未毕业币)
@@ -195,11 +196,16 @@ TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
 # 数据支撑: 1053轮扫描, 6 个 flap 好币 (peakProg≥30%+peakH≥50) 仅因无社交被拦
 TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 50   # flap 社交豁免: 持币数 ≥ 50
 TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.30  # flap 社交豁免: 进度 ≥ 30% (未毕业)
+# flap 社交 pending 模式: 入场时社交抓取失败的 flap 代币标记为 pending, 给 2 轮缓冲补查
+# 超过 2 轮仍未获取到社交数据则淘汰 (避免大量低质量 flap 币长期占位)
+FLAP_SOCIAL_PENDING_MAX_ROUNDS = 2    # flap 社交 pending 最大缓冲轮数
 # 单动能: 持币数比上轮增长 或 价格比上轮上涨 (回测: 单动能多捕获19个翻倍币, 净赚多26%)
 # 首轮豁免: 首轮入队无历史数据算不出动能, 但自身数据足够强时豁免动能要求
-TAG_FIRST_ROUND_MIN_HOLDERS = 100     # 首轮豁免: 持币数 ≥ 100
-TAG_FIRST_ROUND_MIN_PROGRESS = 0.50   # 首轮豁免: 进度 ≥ 50% (未毕业)
-TAG_FIRST_ROUND_MIN_LIQUIDITY = 15000 # 首轮豁免: 流动性 ≥ $15k (已毕业)
+# v8→v9 优化: 首轮豁免从 持币≥100+进度≥50%/流动性≥$15k 降至 持币≥50+进度≥30%/流动性≥$10k
+#   原门槛过高导致新币首轮几乎不可能被选中, 必须等第二轮有历史数据, 延迟15分钟
+TAG_FIRST_ROUND_MIN_HOLDERS = 50      # 首轮豁免: 持币数 ≥ 50 (从100降低, 更早捕获首轮强势币)
+TAG_FIRST_ROUND_MIN_PROGRESS = 0.30   # 首轮豁免: 进度 ≥ 30% (从50%降低, 减少15分钟延迟)
+TAG_FIRST_ROUND_MIN_LIQUIDITY = 10000 # 首轮豁免: 流动性 ≥ $10k (从$15k降低, 与基础阈值对齐)
 COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记 (仅标记, 不排除)
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
 # Gas 大盘指数: ETH/BSC gasUsedRatio + SOL TPS, 反映多链整体活跃度
@@ -2467,10 +2473,11 @@ def admission_filter(new_tokens: list[dict], existing_addrs: set[str]) -> tuple[
                 social_count = len(social_links)
                 social_desc = flap_meta.get("description", "")
             else:
-                # flap.sh 页面抓取失败, 容错: 假设社交存在, 先进队列, 后续淘汰检查再补查
-                log.warning("flap 社交抓取失败, 容错放行: %s", t["address"][:16])
+                # flap.sh 页面抓取失败, pending 模式: 标记待补查, 给 2 轮缓冲时间
+                # socialCount=0 会触发淘汰检查中的补查逻辑, 超过缓冲轮数仍无社交则淘汰
+                log.warning("flap 社交抓取失败, pending 放行: %s", t["address"][:16])
                 social_links = {}
-                social_count = 1  # 假设有社交, 避免因临时网络问题永久错过好币
+                social_count = 0  # 标记为待补查, 不再假设有社交
                 social_desc = ""
             flap_detail = {
                 "holders": 0,
@@ -2486,6 +2493,7 @@ def admission_filter(new_tokens: list[dict], existing_addrs: set[str]) -> tuple[
                 "liquidity": ds.get("liquidity", 0),
                 "raisedAmount": flap_state.get("reserve", 0),
                 "launchTime": 0,
+                "_socialPendingRounds": 0 if social_count == 0 else -1,  # 0=pending待补查, -1=已有社交
             }
             admitted.append({"token": t, "detail": flap_detail})
 
@@ -2753,8 +2761,17 @@ def elimination_check(queue: list[dict], now_ms: int,
                 if social_links:
                     t["socialCount"] = len(social_links)
                     t["socialLinks"] = social_links
+                    t["_socialPendingRounds"] = -1  # 补查成功, 清除 pending 状态
                     log.info("  flap社交补查 %s: %d 个链接",
                              t.get("name") or t["address"][:16], len(social_links))
+                else:
+                    # 补查成功但确认无社交, 递增 pending 轮数
+                    pending_rounds = t.get("_socialPendingRounds", 0)
+                    t["_socialPendingRounds"] = pending_rounds + 1
+            else:
+                # 补查失败 (网络问题), 递增 pending 轮数
+                pending_rounds = t.get("_socialPendingRounds", 0)
+                t["_socialPendingRounds"] = pending_rounds + 1
         if ds:
             t["name"] = ds.get("name") or t.get("name", "")
             t["symbol"] = ds.get("symbol") or t.get("symbol", "")
@@ -2837,6 +2854,12 @@ def elimination_check(queue: list[dict], now_ms: int,
         # 3. 无社交媒体 (four.meme + flap 统一淘汰)
         if not elim_reason and detail and detail["socialCount"] < MIN_SOCIAL_COUNT:
             elim_reason = "无社交媒体"
+
+        # 3b. flap 社交 pending 超时: 入场时社交抓取失败, 补查超过 2 轮仍无社交则淘汰
+        if not elim_reason and is_flap:
+            pending_rounds = t.get("_socialPendingRounds", -1)
+            if pending_rounds >= FLAP_SOCIAL_PENDING_MAX_ROUNDS and t.get("socialCount", 0) < MIN_SOCIAL_COUNT:
+                elim_reason = f"flap社交补查超时 ({pending_rounds}轮未获取到社交)"
 
         # 4. 流动性从 >$1k 跌破 $100 (仅已毕业代币, 未毕业流动性数据不准确)
         if not elim_reason and is_graduated:
@@ -3184,7 +3207,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
       4. 未崩盘 (近三期最高点跌幅 < 35%)
       5. 社交 ≥ 1 (flap 豁免: 持币≥50 且 进度≥30%/已毕业 时跳过社交要求)
       6. 单动能触发: 持币数比上轮增长 或 价格比上轮上涨 (任一即可)
-         首轮豁免: 首轮入队无历史数据时, 持币≥100 + 进度≥50%/流动性≥$15k 视为有动能
+         首轮豁免: 首轮入队无历史数据时, 持币≥50 + 进度≥30%/流动性≥$10k 视为有动能
 
     回测数据 (1046轮, 73769代币):
       旧策略(双动能h20+cc3):  买入242, 胜率73.1%, 翻倍37, 净赚220
@@ -3733,6 +3756,8 @@ def scan_once(cfg: dict) -> None:
                 "lastPrice": detail["price"],
                 "priceHistory": [detail["price"]],
                 "holdersHistory": [detail["holders"]],
+                # flap 社交 pending: 入场时社交抓取失败, 标记待补查轮数 (0=pending, -1=已有社交)
+                "_socialPendingRounds": detail.get("_socialPendingRounds", -1),
             })
 
     log.info("入队后: %d 个代币", len(queue_state["tokens"]))

@@ -95,6 +95,7 @@ K线同时记录 klineHigh/klineLow，用于精筛的过山车检测（振幅过
 | 2 | 持币地址从 ≥30 跌破 10 | 大量抛售 |
 | 3 | 持币数从峰值跌 70%+ (峰值≥50) | 僵尸币清理 |
 | 4 | 无社交媒体 | 无运营意愿 (four.meme 通过 Detail API, flap 通过 flap.sh 页面 SSR 提取, 统一淘汰) |
+| 4b | flap 社交补查超时 (2轮) | flap 入场时社交抓取失败, 给 2 轮缓冲补查, 超时仍无社交则淘汰 |
 | 5 | 流动性从 >$1k 跌破 $100 (仅已毕业) | 流动性枯竭 |
 | 6 | 进度 < 1% 且币龄 > 2h | bonding curve 上的死币 |
 | 6b | 进度 < 5% 且币龄 > 4h | 进度停滞 |
@@ -121,7 +122,7 @@ K线同时记录 klineHigh/klineLow，用于精筛的过山车检测（振幅过
 | 仿盘数 | ≥ 3 | 市场有一定关注度 |
 | 未崩盘 | 近三期最高点跌幅 < 35% | 不追正在崩盘的币 |
 | 社交 | ≥ 1 | 有基本运营 |
-| 单动能 | 持币数比上轮增长 或 价格比上轮上涨（任一即可） | 确认增长趋势，过滤静态达标的僵尸币。首轮豁免：首轮入队无历史数据时，持币≥100 + 进度≥50%/流动性≥$15k 视为有动能 |
+| 单动能 | 持币数比上轮增长 或 价格比上轮上涨（任一即可） | 确认增长趋势，过滤静态达标的僵尸币。首轮豁免：首轮入队无历史数据时，持币≥50 + 进度≥30%/流动性≥$10k 视为有动能 |
 
 > 大盘情绪（Gas指数）仍在每轮计算并记录，仅用于数据分析，不作为精筛阻断条件。
 
@@ -282,9 +283,10 @@ python3 scanner.py
 | `TAG_BASE_MIN_SOCIAL` | 1 | 基础: 社交 ≥ 1（flap 豁免: 持币≥50 且 进度≥30%/已毕业） |
 | `TAG_FLAP_SOCIAL_EXEMPT_HOLDERS` | 50 | flap 社交豁免: 持币数 ≥ 50 |
 | `TAG_FLAP_SOCIAL_EXEMPT_PROGRESS` | 0.30 | flap 社交豁免: 进度 ≥ 30%（未毕业） |
-| `TAG_FIRST_ROUND_MIN_HOLDERS` | 100 | 首轮豁免: 持币数 ≥ 100 |
-| `TAG_FIRST_ROUND_MIN_PROGRESS` | 0.50 | 首轮豁免: 进度 ≥ 50%（未毕业） |
-| `TAG_FIRST_ROUND_MIN_LIQUIDITY` | 15000 | 首轮豁免: 流动性 ≥ $15k（已毕业） |
+| `FLAP_SOCIAL_PENDING_MAX_ROUNDS` | 2 | flap 社交 pending 最大缓冲轮数（超时淘汰） |
+| `TAG_FIRST_ROUND_MIN_HOLDERS` | 50 | 首轮豁免: 持币数 ≥ 50 |
+| `TAG_FIRST_ROUND_MIN_PROGRESS` | 0.30 | 首轮豁免: 进度 ≥ 30%（未毕业） |
+| `TAG_FIRST_ROUND_MIN_LIQUIDITY` | 10000 | 首轮豁免: 流动性 ≥ $10k（已毕业） |
 | **大盘情绪 (Gas趋势)** | | |
 | `GAS_INDEX_ETH_WEIGHT` | 0.4 | Gas指数: ETH权重 |
 | `GAS_INDEX_BSC_WEIGHT` | 0.4 | Gas指数: BSC权重 |
