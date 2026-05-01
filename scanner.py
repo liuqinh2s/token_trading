@@ -20,6 +20,8 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - RPC Transfer 日志持币数 (bonding curve 阶段不产生标准 Transfer, 不准确)
 
 淘汰条件 (永久剔除):
+  - 诈骗代币黑名单 (已确认的诈骗代币合约地址, 入场即拒)
+  - 诈骗开发者黑名单 (已确认的连续发诈骗币的开发者钱包地址, 其所有代币入场即拒)
   - 蹭名币 (symbol/name 命中主流币种黑名单, 如 USDT/BTC/ETH 等)
   - 价格从峰值跌 90%+ (保护: 当前价格<1e-7 视为 API 异常, 跳过)
   - 持币地址从 ≥30 跌破 10
@@ -250,6 +252,21 @@ SOL_RPC = "https://api.mainnet-beta.solana.com"
 ETH_RPC = "https://ethereum-rpc.publicnode.com"
 MIN_SOCIAL_COUNT = 1                   # 入场筛/淘汰: 最少关联社交媒体数 (入场门槛不变)
 
+# 诈骗开发者黑名单: creator 地址命中即拒绝入场 (小写)
+# 已确认的连续发诈骗币的开发者钱包地址, 其部署的所有代币一律拦截
+DEPLOYER_BLACKLIST: set[str] = set()
+
+# 诈骗代币黑名单: 代币合约地址命中即拒绝入场 (小写)
+# 已确认的诈骗代币, 直接拦截
+TOKEN_BLACKLIST = {
+    "0x11ddf7dabff8c29a72be469154bd6494fa184444",  # 诈骗币 (关联 twitter.com/zhaocaidev)
+}
+
+# 开发者画像: 自动收集阈值
+DEPLOYER_SCAM_DROP_PCT = 0.80          # 一轮内价格暴跌 80% 视为诈骗 (lastPrice→price)
+DEPLOYER_SCAM_MIN_TOKENS = 2           # 开发者发过 ≥2 个诈骗币才加入黑名单 (避免误杀)
+DEPLOYER_QUALITY_GAIN_X = 10           # 涨幅 ≥ 10x 视为优质 (peakPrice / addedPrice)
+
 # 蹭名币黑名单: symbol 或 name 命中即拒绝入场 (小写匹配)
 # 这些是知名主流币种的名称/符号, 在 meme 平台上发行的同名代币 100% 是蹭热度的假币
 FAKE_NAME_BLACKLIST = {
@@ -426,6 +443,96 @@ def save_queue(queue: dict):
             name_idx[key]["addrs"] = addrs[-200:]
     with open(QUEUE_FILE, "w", encoding="utf-8") as f:
         json.dump(queue, f, ensure_ascii=False, indent=2)
+
+
+def update_deployer_reputation(queue_state: dict,
+                                survivors: list[dict],
+                                eliminated: list[dict]) -> None:
+    """
+    更新开发者画像: 从本轮数据中自动收集诈骗/优质开发者地址
+    诈骗判定: 一轮内价格暴跌 80%+ (lastPrice→当前price, 说明开发者砸盘/撤池子)
+    优质判定: 峰值价格 / 入队价格 ≥ 10x (说明代币有真实增长)
+    """
+    now_ms = int(time.time() * 1000)
+    blacklist = queue_state.setdefault("deployerBlacklist", {})
+    whitelist = queue_state.setdefault("deployerWhitelist", {})
+
+    # --- 诈骗开发者收集: 从被淘汰的代币中找一轮内暴跌 80%+ 的 ---
+    for t in eliminated:
+        creator = (t.get("creator") or "").lower()
+        if not creator or creator == ZERO_ADDRESS:
+            continue
+        last_price = t.get("lastPrice", 0)
+        current_price = t.get("price", 0)
+        # lastPrice 是上一轮的价格, price 是本轮更新后的价格
+        # 一轮内暴跌 80%+ = 开发者砸盘/撤池子
+        if (last_price > 0 and current_price > 0
+                and current_price < last_price * (1 - DEPLOYER_SCAM_DROP_PCT)):
+            addr = t.get("address", "")
+            if creator not in blacklist:
+                blacklist[creator] = {"count": 0, "tokens": [], "firstSeen": now_ms, "lastSeen": now_ms}
+            entry = blacklist[creator]
+            if addr and addr not in entry["tokens"]:
+                entry["tokens"].append(addr)
+                entry["count"] = len(entry["tokens"])
+                entry["lastSeen"] = now_ms
+                drop_pct = (1 - current_price / last_price) * 100
+                log.info("🚨 诈骗开发者记录: %s — %s 一轮暴跌%.0f%% (累计%d个诈骗币)",
+                         creator[:16], t.get("name") or addr[:16], drop_pct, entry["count"])
+
+    # --- 诈骗开发者收集: 从存活代币中找一轮内暴跌 80%+ 的 (还没被淘汰但已经暴跌) ---
+    for t in survivors:
+        creator = (t.get("creator") or "").lower()
+        if not creator or creator == ZERO_ADDRESS:
+            continue
+        last_price = t.get("lastPrice", 0)
+        current_price = t.get("price", 0)
+        if (last_price > 0 and current_price > 0
+                and current_price < last_price * (1 - DEPLOYER_SCAM_DROP_PCT)):
+            addr = t.get("address", "")
+            if creator not in blacklist:
+                blacklist[creator] = {"count": 0, "tokens": [], "firstSeen": now_ms, "lastSeen": now_ms}
+            entry = blacklist[creator]
+            if addr and addr not in entry["tokens"]:
+                entry["tokens"].append(addr)
+                entry["count"] = len(entry["tokens"])
+                entry["lastSeen"] = now_ms
+                drop_pct = (1 - current_price / last_price) * 100
+                log.info("🚨 诈骗开发者记录: %s — %s 一轮暴跌%.0f%% (累计%d个诈骗币)",
+                         creator[:16], t.get("name") or addr[:16], drop_pct, entry["count"])
+
+    # --- 优质开发者收集: 从存活+突破代币中找涨幅 ≥ 10x 的 ---
+    for t in survivors:
+        creator = (t.get("creator") or "").lower()
+        if not creator or creator == ZERO_ADDRESS:
+            continue
+        added_price = t.get("addedPrice", 0)
+        peak_price = t.get("peakPrice", 0)
+        if (added_price > 0 and peak_price > 0
+                and peak_price >= added_price * DEPLOYER_QUALITY_GAIN_X):
+            addr = t.get("address", "")
+            if creator not in whitelist:
+                whitelist[creator] = {"count": 0, "tokens": [], "firstSeen": now_ms, "lastSeen": now_ms}
+            entry = whitelist[creator]
+            if addr and addr not in entry["tokens"]:
+                entry["tokens"].append(addr)
+                entry["count"] = len(entry["tokens"])
+                entry["lastSeen"] = now_ms
+                gain_x = peak_price / added_price
+                log.info("⭐ 优质开发者记录: %s — %s 涨幅%.1fx (累计%d个优质币)",
+                         creator[:16], t.get("name") or addr[:16], gain_x, entry["count"])
+
+    # 更新全局黑名单集合 (供 admission_filter 使用)
+    # 只有发过 ≥ DEPLOYER_SCAM_MIN_TOKENS 个诈骗币的开发者才加入运行时黑名单
+    DEPLOYER_BLACKLIST.clear()
+    for creator, info in blacklist.items():
+        if info["count"] >= DEPLOYER_SCAM_MIN_TOKENS:
+            DEPLOYER_BLACKLIST.add(creator)
+
+    if DEPLOYER_BLACKLIST:
+        log.info("开发者黑名单: %d 个地址 (诈骗币≥%d)", len(DEPLOYER_BLACKLIST), DEPLOYER_SCAM_MIN_TOKENS)
+    if whitelist:
+        log.info("开发者白名单: %d 个地址 (涨幅≥%dx)", len(whitelist), DEPLOYER_QUALITY_GAIN_X)
 
 
 def update_name_index(queue: dict, tokens: list[dict]):
@@ -2478,6 +2585,19 @@ def admission_filter(new_tokens: list[dict], existing_addrs: set[str]) -> tuple[
 
     # 逐个判断入场条件
     for t in fresh:
+        # 入场条件: 代币黑名单 (已确认的诈骗代币, 直接拒绝)
+        if t["address"].lower() in TOKEN_BLACKLIST:
+            rejected.append({"token": t, "detail": None,
+                             "reason": "诈骗代币黑名单"})
+            continue
+
+        # 入场条件: 开发者黑名单 (已确认的诈骗开发者, 其所有代币一律拒绝)
+        t_creator = (t.get("creator") or "").lower()
+        if t_creator and t_creator in DEPLOYER_BLACKLIST:
+            rejected.append({"token": t, "detail": None,
+                             "reason": f"诈骗开发者黑名单 ({t_creator[:10]}...)"})
+            continue
+
         # 入场条件: 蹭名币黑名单 (symbol 或 name 精确匹配知名币种, 直接拒绝)
         t_symbol = (t.get("symbol") or "").strip().lower()
         t_name = (t.get("name") or "").strip().lower()
@@ -3786,6 +3906,15 @@ def scan_once(cfg: dict) -> None:
     # 加载队列
     queue_state = load_queue()
 
+    # 从持久化数据恢复开发者黑名单
+    _bl = queue_state.get("deployerBlacklist", {})
+    DEPLOYER_BLACKLIST.clear()
+    for creator, info in _bl.items():
+        if info.get("count", 0) >= DEPLOYER_SCAM_MIN_TOKENS:
+            DEPLOYER_BLACKLIST.add(creator)
+    if DEPLOYER_BLACKLIST:
+        log.info("开发者黑名单: 加载 %d 个地址", len(DEPLOYER_BLACKLIST))
+
     # 迁移: 旧版 breakthrough 冻结快照 → 回归 tokens 列表 (一次性)
     old_bt = queue_state.pop("breakthrough", [])
     if old_bt:
@@ -3912,6 +4041,9 @@ def scan_once(cfg: dict) -> None:
         "eliminatedAt": now_ms,
         "createdAt": r["token"].get("createdAt", 0),
     } for r in rejected_at_entry if r["token"].get("address")])
+
+    # Step 3b: 更新开发者画像 (诈骗/优质开发者自动收集)
+    update_deployer_reputation(queue_state, survivors, eliminated)
 
     log.info("淘汰后: %d 个存活, %d 个淘汰, %d 个突破", len(survivors), len(eliminated), len(breakthrough_tokens))
 

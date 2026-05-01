@@ -2070,21 +2070,18 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 阶梯式回撤止盈 (涨得越多, 锁利越紧):
+      1. 阶梯式回撤止盈 (v12: 简化为3档, 80%以上锁90%):
          - 涨 15% 触发止盈跟踪
          - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
-         - 30%~100% 区间: 二分点止盈法 (价格跌到 买入价+涨幅/2 时卖出, 锁住 50% 利润)
-         - 100%~200% 区间: 锁住 60% 利润
-         - 200%~300% 区间: 锁住 70% 利润
-         - 300%~400% 区间: 锁住 80% 利润
-         - 400% 以上: 锁住 90% 利润
+         - 30%~80% 区间: 锁住 60% 利润
+         - 80% 以上: 锁住 90% 利润 (低胜率策略, 到手的不能跑)
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
-         - 持仓超过 expire_loss_hours (36h) 且仍亏损 → 卖出
-         - 持仓超过 expire_underperform_hours (48h) 且盈利未达 expire_min_profit_pct (100%) → 卖出
+         - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
+         - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct → 卖出
       4. 阶梯止损 + 动能保护:
          - -20% 硬止损: 无论动能如何, 亏损达到 -20% 必须走
-         - -15% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
+         - -15% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
@@ -2109,48 +2106,24 @@ def check_sell_conditions(pos: dict, current_price: float,
     if max_profit_pct >= tp_trigger_pct:
         gain = max_price - buy_price  # 绝对涨幅
 
-        if max_profit_pct >= 400:
-            # 阶段5: 最高盈利 ≥400%, 锁住 90% 利润
+        if max_profit_pct >= tp_high_pct:
+            # 最高盈利 ≥80%: 锁住 90% 利润 (低胜率策略, 到手的利润不能跑)
             lock_price = buy_price + gain * 0.9
             if current_price <= lock_price:
                 lock_pct = (lock_price - buy_price) / buy_price * 100
                 return True, (f"TRAILING_TP (锁利90%: 最高盈利 {max_profit_pct:.0f}%, "
                               f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
-        elif max_profit_pct >= tp_ultra_pct:
-            # 阶段4: 最高盈利 300%~400%, 锁住 80% 利润
-            lock_price = buy_price + gain * 0.8
-            if current_price <= lock_price:
-                lock_pct = (lock_price - buy_price) / buy_price * 100
-                return True, (f"TRAILING_TP (锁利80%: 最高盈利 {max_profit_pct:.0f}%, "
-                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
-                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
-        elif max_profit_pct >= 200:
-            # 阶段3: 最高盈利 200%~300%, 锁住 70% 利润
-            lock_price = buy_price + gain * 0.7
-            if current_price <= lock_price:
-                lock_pct = (lock_price - buy_price) / buy_price * 100
-                return True, (f"TRAILING_TP (锁利70%: 最高盈利 {max_profit_pct:.0f}%, "
-                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
-                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
-        elif max_profit_pct >= tp_high_pct:
-            # 阶段2b: 最高盈利 100%~200%, 锁住 60% 利润
+        elif max_profit_pct >= tp_midpoint_pct:
+            # 最高盈利 30%~80%: 锁住 60% 利润
             lock_price = buy_price + gain * 0.6
             if current_price <= lock_price:
                 lock_pct = (lock_price - buy_price) / buy_price * 100
                 return True, (f"TRAILING_TP (锁利60%: 最高盈利 {max_profit_pct:.0f}%, "
                               f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
-        elif max_profit_pct >= tp_midpoint_pct:
-            # 阶段2: 最高盈利 30%~100%, 二分点止盈法, 锁住 50% 利润
-            midpoint = buy_price + gain * 0.5
-            if current_price <= midpoint:
-                mid_pct = (midpoint - buy_price) / buy_price * 100
-                return True, (f"TRAILING_TP (二分点止盈: 最高盈利 {max_profit_pct:.0f}%, "
-                              f"二分点 ${midpoint:.12f} ({mid_pct:.0f}%), "
-                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
         else:
-            # 阶段1: 最高盈利 15%~30%, 固定回撤 15% 止盈, 保住本金
+            # 最高盈利 15%~30%: 固定回撤 15% 止盈, 保住本金
             drawdown_price = max_price * (1 - tp_drawdown_pct / 100)
             if current_price <= drawdown_price:
                 drawdown_sell_pct = (drawdown_price - buy_price) / buy_price * 100
@@ -2692,6 +2665,34 @@ def monitor_positions(cfg_loader, bnb_price_func):
                         notify_sell(cfg, name, addr, reason, pnl, sell_result["tx_hash"],
                                     buy_price=buy_price, max_price=max_price,
                                     sell_price=current_price)
+                        # 诈骗开发者记录: 亏损 80%+ 的代币, 记录 creator 到黑名单
+                        if pnl <= -80:
+                            try:
+                                from scanner import load_queue, save_queue, ZERO_ADDRESS, DEPLOYER_BLACKLIST, DEPLOYER_SCAM_MIN_TOKENS
+                                _qs = load_queue()
+                                _bl = _qs.setdefault("deployerBlacklist", {})
+                                # 从队列中找到该代币的 creator
+                                _creator = ""
+                                for _t in _qs.get("tokens", []) + _qs.get("eliminated", []):
+                                    if isinstance(_t, dict) and _t.get("address", "").lower() == addr.lower():
+                                        _creator = (_t.get("creator") or "").lower()
+                                        break
+                                if _creator and _creator != ZERO_ADDRESS:
+                                    if _creator not in _bl:
+                                        _bl[_creator] = {"count": 0, "tokens": [], "firstSeen": int(time.time() * 1000), "lastSeen": int(time.time() * 1000)}
+                                    _entry = _bl[_creator]
+                                    if addr.lower() not in _entry["tokens"]:
+                                        _entry["tokens"].append(addr.lower())
+                                        _entry["count"] = len(_entry["tokens"])
+                                        _entry["lastSeen"] = int(time.time() * 1000)
+                                        save_queue(_qs)
+                                        # 更新运行时黑名单
+                                        if _entry["count"] >= DEPLOYER_SCAM_MIN_TOKENS:
+                                            DEPLOYER_BLACKLIST.add(_creator)
+                                        log.info("🚨 诈骗开发者记录 (交易亏损%.0f%%): %s — %s (累计%d个诈骗币)",
+                                                 pnl, _creator[:16], name, _entry["count"])
+                            except Exception as _e:
+                                log.debug("诈骗开发者记录失败: %s", _e)
                     else:
                         log.error("卖出失败: %s", name)
                         notify_sell_failed(cfg, name, addr,
