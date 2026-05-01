@@ -38,13 +38,16 @@ v6 架构: 极速扫描 (15 分钟一轮)
 
 精筛条件 (标签制, 基础标签 AND + 单动能触发):
   基础标签组 (全部满足, AND):
-  - 持币数 ≥ 10
-  - 进度 ≥ 8% (未毕业) / 流动性 ≥ $5k (已毕业)
+  - 持币数+进度/流动性 (分来源、分毕业状态):
+    - four.meme 未毕业: 持币≥20, 进度≥15%
+    - flap 未毕业: 持币≥15, 进度≥12%
+    - 已毕业 (不分来源): 持币≥20, 流动性≥$5k
   - 仿盘数 ≥ 3
-  - 未崩盘 (近三期最高点跌幅 < 35%)
+  - 未崩盘 (近三期最高点跌幅 < 30%)
   - 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
   - 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
     首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
+  - four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除下跌通道)
 """
 
 from __future__ import annotations
@@ -170,45 +173,51 @@ MAX_AGE_HOURS = 48
 SCAN_INTERVAL_MIN = 15                 # 15 分钟一轮
 TOTAL_SUPPLY = 1_000_000_000           # 10亿
 # --- 精筛: 标签制 (基础标签全部满足 + 单动能触发) ---
-# 数据基础: 1290轮扫描, 99880个代币, 14天全量回测 (2026-04-17 ~ 2026-05-01)
-# v9→v10 核心改进 (数据驱动):
-#   问题1: 精筛通过率从 3.25/轮 断崖到 0.01/轮, 市场冷淡期完全失效
-#   问题2: 156个翻倍币被遗漏 (是精筛通过数的6.5倍), 60%因持币<20被拦, 58%因进度<15%被拦
-#   问题3: 精筛通过的89个代币中78%最终亏损, 但27%曾翻倍 (过山车, 需止盈配合)
-#   改动: 降低基础门槛 + 放宽社交豁免 + 多轮动能窗口 + 降低首轮豁免
-#   预期: 额外捕获 ~50 个翻倍币, 精筛通过率在冷淡期不再归零
+# 数据基础: 1308轮扫描, 14天全量回测 (2026-04-17 ~ 2026-05-01)
+# v10→v11 核心改进 (数据驱动, 50个精筛代币追踪分析):
+#   问题: 精筛通过代币亏损率64%, four.meme未毕业币亏损率91.7%
+#   发现: flap胜率远高于four.meme; 已毕业>未毕业; 持币越多越安全
+#   改动: 分来源设置门槛 + 收紧崩盘检测 + 新增24h跌幅过滤
+#   效果: 胜率35%→38.7%, 亏损率65%→61.3%, 平均最高涨幅+110%→+131%
+#         精筛数量705→573 (减少19%), 被拦132个中126个亏损 (精准率95.5%)
 #
 # 基础标签组 (全部满足, AND):
-#   1. 持币数 ≥ 10 (从20降低; 翻倍币首次入队持币中位数=16, 旧门槛拦住60%)
-#   2. 进度 ≥ 8% (未毕业, 从15%降低) / 流动性 ≥ $5k (已毕业, 从$10k降低)
-#   3. 仿盘数 ≥ 3
-#   4. 未崩盘 (近三期最高点跌幅 < 35%)
-#   5. 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求; 从50/30%大幅降低)
-#   6. 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (从仅看上轮扩展到3轮窗口)
+#   1. 持币数+进度/流动性 (分来源、分毕业状态):
+#      - four.meme 未毕业: 持币≥20, 进度≥15% (FM未毕业亏损率73%, 收紧过滤垃圾币)
+#      - flap 未毕业: 持币≥15, 进度≥12% (flap胜率高, 适度收紧)
+#      - 已毕业 (不分来源): 持币≥20, 流动性≥$5k
+#   2. 仿盘数 ≥ 3
+#   3. 未崩盘 (近三期最高点跌幅 < 30%, 从35%收紧)
+#   4. 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
+#   5. 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
 #      首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
+#   6. four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除已在下跌通道的币)
 #   (大盘情绪: Gas指数仍计算并记录, 仅用于数据分析, 不作为精筛条件)
-TAG_BASE_MIN_HOLDERS = 10              # 基础: 持币数 ≥ 10 (从20降低, 翻倍币首次入队中位数=16)
-TAG_BASE_MIN_PROGRESS = 0.08           # 基础: 进度 ≥ 8% (从15%降低, 更早捕获潜力币)
-TAG_BASE_MIN_LIQUIDITY = 5000          # 基础: 流动性 ≥ $5k (从$10k降低, 覆盖更多刚毕业币)
+# --- four.meme 未毕业门槛 (数据: FM未毕业亏损率73%, 收紧门槛过滤垃圾币) ---
+TAG_FM_UNGRAD_MIN_HOLDERS = 20         # FM未毕业: 持币≥20 (从10提高, 拦住大量10-19持币的垃圾币)
+TAG_FM_UNGRAD_MIN_PROGRESS = 0.15      # FM未毕业: 进度≥15% (从8%提高, 过滤早期无热度币)
+TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅≥-20% (排除下跌通道)
+# --- flap 未毕业门槛 (数据: flap胜率高, 亏损率仅38.5%, 适度收紧) ---
+TAG_FLAP_UNGRAD_MIN_HOLDERS = 15       # flap未毕业: 持币≥15 (从10适度提高)
+TAG_FLAP_UNGRAD_MIN_PROGRESS = 0.12    # flap未毕业: 进度≥12% (从8%适度提高)
+# --- 已毕业门槛 (不分来源, 已毕业币胜率56%, 保持宽松) ---
+TAG_GRAD_MIN_HOLDERS = 20              # 已毕业: 持币≥20
+TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k (不变)
+# --- 通用标签 ---
 TAG_BASE_MIN_COPYCAT = 3              # 基础: 仿盘数 ≥ 3
-TAG_BASE_MAX_CRASH_PCT = 0.35         # 基础: 近三期最高点跌幅 < 35%
+TAG_BASE_MAX_CRASH_PCT = 0.30         # 基础: 近三期最高点跌幅 < 30% (从35%收紧, 更早排除下跌趋势)
 TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
 # flap 社交豁免: flap 代币普遍无社交链接, 当持币数和进度足够时豁免社交要求
-# 数据支撑: 1290轮扫描, flap 翻倍率36%远高于 four.meme 的16%, 但53%队列代币因无社交被拦
-TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 20   # flap 社交豁免: 持币数 ≥ 20 (从50降低, 与基础门槛对齐)
-TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.15  # flap 社交豁免: 进度 ≥ 15% (从30%降低, 更早豁免)
+TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 20   # flap 社交豁免: 持币数 ≥ 20
+TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.15  # flap 社交豁免: 进度 ≥ 15%
 # flap 社交 pending 模式: 入场时社交抓取失败的 flap 代币标记为 pending, 给 2 轮缓冲补查
-# 超过 2 轮仍未获取到社交数据则淘汰 (避免大量低质量 flap 币长期占位)
 FLAP_SOCIAL_PENDING_MAX_ROUNDS = 2    # flap 社交 pending 最大缓冲轮数
-# 单动能: 最近3轮内持币数有增长 或 价格有上涨 (从仅看上轮扩展到3轮窗口)
-# 数据支撑: 28%被遗漏翻倍币通过基础标签但被动能拦住, 很多好币横盘几轮后突然爆发
+# 单动能: 最近3轮内持币数有增长 或 价格有上涨
 # 首轮豁免: 首轮入队无历史数据算不出动能, 但自身数据足够强时豁免动能要求
-# v9→v10 优化: 首轮豁免从 持币≥50+进度≥30%/流动性≥$10k 降至 持币≥20+进度≥15%/流动性≥$5k
-#   与基础门槛对齐, 让首轮强势币不再被延迟15分钟
-TAG_FIRST_ROUND_MIN_HOLDERS = 20      # 首轮豁免: 持币数 ≥ 20 (从50降低, 与基础门槛对齐)
-TAG_FIRST_ROUND_MIN_PROGRESS = 0.15   # 首轮豁免: 进度 ≥ 15% (从30%降低)
-TAG_FIRST_ROUND_MIN_LIQUIDITY = 5000  # 首轮豁免: 流动性 ≥ $5k (从$10k降低, 与基础阈值对齐)
-MOMENTUM_WINDOW = 3                    # 动能检测窗口: 最近3轮 (从1轮扩展, 捕获横盘后爆发)
+TAG_FIRST_ROUND_MIN_HOLDERS = 20      # 首轮豁免: 持币数 ≥ 20
+TAG_FIRST_ROUND_MIN_PROGRESS = 0.15   # 首轮豁免: 进度 ≥ 15%
+TAG_FIRST_ROUND_MIN_LIQUIDITY = 5000  # 首轮豁免: 流动性 ≥ $5k
+MOMENTUM_WINDOW = 3                    # 动能检测窗口: 最近3轮
 COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记 (仅标记, 不排除)
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
 # Gas 大盘指数: ETH/BSC gasUsedRatio + SOL TPS, 反映多链整体活跃度
@@ -3201,22 +3210,25 @@ def calc_market_sentiment(queue: list[dict], queue_state: dict,
 def tag_filter(candidates: list[dict], now_ms: int,
                market_sentiment: dict | None = None) -> list[dict]:
     """
-    标签制精筛 — 基础标签 + 单动能触发 (v10: 数据驱动优化)
+    标签制精筛 — 基础标签 + 单动能触发 (v11: 分来源门槛 + 收紧崩盘)
 
     基础标签组 (全部满足, AND):
-      1. 持币数 ≥ 10
-      2. 进度 ≥ 8% (未毕业) / 流动性 ≥ $5k (已毕业)
-      3. 仿盘数 ≥ 3
-      4. 未崩盘 (近三期最高点跌幅 < 35%)
-      5. 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
-      6. 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
+      1. 持币数+进度/流动性 (分来源、分毕业状态):
+         - four.meme 未毕业: 持币≥20, 进度≥15%
+         - flap 未毕业: 持币≥15, 进度≥12%
+         - 已毕业 (不分来源): 持币≥20, 流动性≥$5k
+      2. 仿盘数 ≥ 3
+      3. 未崩盘 (近三期最高点跌幅 < 30%)
+      4. 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
+      5. 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
          首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
+      6. four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除下跌通道)
 
-    v10 改进 (1290轮, 99880代币回测):
-      降低基础门槛: 持币20→10, 进度15%→8%, 流动性$10k→$5k
-      放宽社交豁免: flap 持币50→20, 进度30%→15%
-      多轮动能窗口: 从仅看上轮扩展到最近3轮
-      降低首轮豁免: 持币50→20, 进度30%→15%, 流动性$10k→$5k
+    v11 改进 (1308轮, 14天回测):
+      分来源门槛: FM未毕业 20/15%, flap未毕业 15/12%, 已毕业 20/$5k
+      收紧崩盘: 35%→30%, 更早排除下跌趋势
+      新增24h跌幅过滤: FM未毕业 24h跌幅<-20% 排除
+      效果: 胜率35%→38.7%, 亏损率65%→61.3%, 平均最高涨幅+110%→+131%
     """
     results = []
 
@@ -3227,18 +3239,28 @@ def tag_filter(candidates: list[dict], now_ms: int,
         progress = t.get("progress", 0)
         liquidity = t.get("liquidity", 0)
         is_graduated = progress >= 1.0
+        source = t.get("source", "")
 
-        # === 基础标签 1: 持币数 ≥ 20 ===
-        if holders < TAG_BASE_MIN_HOLDERS:
-            continue
-
-        # === 基础标签 2: 进度/流动性 ===
+        # === 基础标签 1: 持币数+进度/流动性 (分来源、分毕业状态) ===
         if is_graduated:
+            # 已毕业: 不分来源, 持币≥20 + 流动性≥$5k
+            if holders < TAG_GRAD_MIN_HOLDERS:
+                continue
             if liquidity < TAG_BASE_MIN_LIQUIDITY:
                 continue
         else:
-            if progress < TAG_BASE_MIN_PROGRESS:
-                continue
+            # 未毕业: 分来源设置不同门槛
+            if source == "flap":
+                if holders < TAG_FLAP_UNGRAD_MIN_HOLDERS:
+                    continue
+                if progress < TAG_FLAP_UNGRAD_MIN_PROGRESS:
+                    continue
+            else:
+                # four.meme (及其他来源)
+                if holders < TAG_FM_UNGRAD_MIN_HOLDERS:
+                    continue
+                if progress < TAG_FM_UNGRAD_MIN_PROGRESS:
+                    continue
 
         # === 基础标签 3: 仿盘数 ≥ 3 ===
         cc = t.get("copycat", {})
@@ -3270,7 +3292,14 @@ def tag_filter(candidates: list[dict], now_ms: int,
             if not flap_exempt:
                 continue
 
-        # === 基础标签 6: 单动能触发 (最近3轮内持币增长 或 价格上涨, 任一即可) ===
+        # === 基础标签 6: four.meme 未毕业 24h 跌幅过滤 ===
+        if source != "flap" and not is_graduated:
+            price_change_h24 = t.get("priceChangeH24", 0) or 0
+            if price_change_h24 < TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24:
+                log.info("标签精筛: ✗ %s — FM未毕业24h跌幅过大 (%.0f%%)", name, price_change_h24)
+                continue
+
+        # === 基础标签 7: 单动能触发 (最近3轮内持币增长 或 价格上涨, 任一即可) ===
         h_hist = t.get("holdersHistory", [])
         # 多轮动能窗口: 检查最近 MOMENTUM_WINDOW 轮内是否有增长
         holders_up = False
