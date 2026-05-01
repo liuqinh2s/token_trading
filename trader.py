@@ -2546,6 +2546,29 @@ def monitor_positions(cfg_loader, bnb_price_func):
                 addr = pos["token_address"]
                 name = pos["token_name"] or addr[:16]
 
+                # --- 链上余额检查: 检测手动卖出 ---
+                try:
+                    token_cs = Web3.to_checksum_address(addr)
+                    token_contract = _w3.eth.contract(address=token_cs, abi=ERC20_ABI)
+                    on_chain_balance = token_contract.functions.balanceOf(_wallet_address).call()
+                    if on_chain_balance == 0:
+                        log.info("监控: %s 链上余额为 0, 判定为手动卖出, 自动关闭持仓", name)
+                        # 尝试获取当前价格用于记录盈亏
+                        venue = pos.get("venue", "PANCAKE")
+                        last_price = get_token_price_usd_auto(addr, bnb_price, venue)
+                        if last_price is None:
+                            last_price = pos.get("current_price", 0) or 0
+                        buy_price = pos["buy_price_usd"]
+                        close_position(conn, pos["id"], last_price, "", "MANUAL_SELL", buy_price)
+                        pnl = ((last_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+                        notify_sell(cfg, name, addr, "手动卖出 (链上余额归零)", pnl, "",
+                                    buy_price=buy_price,
+                                    max_price=pos.get("max_price_usd", 0),
+                                    sell_price=last_price)
+                        continue
+                except Exception as e_bal:
+                    log.debug("监控: 链上余额查询失败 %s: %s", name, e_bal)
+
                 # 获取当前价格 (自动检测交易场所)
                 venue = pos.get("venue", "PANCAKE")
                 current_price = get_token_price_usd_auto(addr, bnb_price, venue)
