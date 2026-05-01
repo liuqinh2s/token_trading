@@ -39,14 +39,14 @@ v6 架构: 极速扫描 (15 分钟一轮)
 精筛条件 (标签制, 基础标签 AND + 单动能触发):
   基础标签组 (全部满足, AND):
   - 持币数+进度/流动性 (分来源、分毕业状态):
-    - four.meme 未毕业: 持币≥20, 进度≥15%
-    - flap 未毕业: 持币≥15, 进度≥12%
-    - 已毕业 (不分来源): 持币≥20, 流动性≥$5k
+    - four.meme 未毕业: 持币≥75, 进度≥50% (极高门槛, 回测验证非负期望)
+    - flap 未毕业: 持币≥30, 进度≥20%
+    - 已毕业 (不分来源): 持币≥20, 流动性≥$10k
   - 仿盘数 ≥ 3
   - 未崩盘 (近三期最高点跌幅 < 30%)
-  - 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
+  - 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥20%/已毕业 时跳过社交要求)
   - 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
-    首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
+    首轮豁免: 首轮入队无历史数据时, 持币≥30 + 进度≥20%/流动性≥$10k 视为有动能
   - four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除下跌通道)
 """
 
@@ -193,30 +193,30 @@ TOTAL_SUPPLY = 1_000_000_000           # 10亿
 #      首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
 #   6. four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除已在下跌通道的币)
 #   (大盘情绪: Gas指数仍计算并记录, 仅用于数据分析, 不作为精筛条件)
-# --- four.meme 未毕业门槛 (数据: FM未毕业亏损率73%, 收紧门槛过滤垃圾币) ---
-TAG_FM_UNGRAD_MIN_HOLDERS = 20         # FM未毕业: 持币≥20 (从10提高, 拦住大量10-19持币的垃圾币)
-TAG_FM_UNGRAD_MIN_PROGRESS = 0.15      # FM未毕业: 进度≥15% (从8%提高, 过滤早期无热度币)
-TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅≥-20% (排除下跌通道)
-# --- flap 未毕业门槛 (数据: flap胜率高, 亏损率仅38.5%, 适度收紧) ---
-TAG_FLAP_UNGRAD_MIN_HOLDERS = 15       # flap未毕业: 持币≥15 (从10适度提高)
-TAG_FLAP_UNGRAD_MIN_PROGRESS = 0.12    # flap未毕业: 进度≥12% (从8%适度提高)
-# --- 已毕业门槛 (不分来源, 已毕业币胜率56%, 保持宽松) ---
-TAG_GRAD_MIN_HOLDERS = 20              # 已毕业: 持币≥20
-TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k (不变)
+# --- four.meme 未毕业: 极高门槛 (回测数据: FM≥75/50% 胜率34.8%, 翻倍率16%, 非负期望) ---
+TAG_FM_UNGRAD_MIN_HOLDERS = 75         # FM未毕业: 持币≥75 (回测验证, 低于此值为负期望)
+TAG_FM_UNGRAD_MIN_PROGRESS = 0.50      # FM未毕业: 进度≥50% (回测验证, 低于此值为负期望)
+TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅过滤 (保留, 虽然不会触发)
+# --- flap 未毕业门槛 (回测数据: flap≥30/20% 在纯flap策略下 ROI=+7.4%) ---
+TAG_FLAP_UNGRAD_MIN_HOLDERS = 30       # flap未毕业: 持币≥30 (从15提高, 回测验证)
+TAG_FLAP_UNGRAD_MIN_PROGRESS = 0.20    # flap未毕业: 进度≥20% (从12%提高, 回测验证)
+# --- 已毕业门槛 (回测数据: 已毕业+流动性≥$10k, ROI=+25.5%) ---
+TAG_GRAD_MIN_HOLDERS = 20              # 已毕业: 持币≥20 (不变, 已毕业币持币数普遍≥20)
+TAG_BASE_MIN_LIQUIDITY = 10000         # 已毕业: 流动性 ≥ $10k (从$5k提高, 回测验证)
 # --- 通用标签 ---
 TAG_BASE_MIN_COPYCAT = 3              # 基础: 仿盘数 ≥ 3
 TAG_BASE_MAX_CRASH_PCT = 0.30         # 基础: 近三期最高点跌幅 < 30% (从35%收紧, 更早排除下跌趋势)
 TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
 # flap 社交豁免: flap 代币普遍无社交链接, 当持币数和进度足够时豁免社交要求
-TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 20   # flap 社交豁免: 持币数 ≥ 20
-TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.15  # flap 社交豁免: 进度 ≥ 15%
+TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 30   # flap 社交豁免: 持币数 ≥ 30 (与精筛门槛对齐)
+TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.20  # flap 社交豁免: 进度 ≥ 20% (与精筛门槛对齐)
 # flap 社交 pending 模式: 入场时社交抓取失败的 flap 代币标记为 pending, 给 2 轮缓冲补查
 FLAP_SOCIAL_PENDING_MAX_ROUNDS = 2    # flap 社交 pending 最大缓冲轮数
 # 单动能: 最近3轮内持币数有增长 或 价格有上涨
 # 首轮豁免: 首轮入队无历史数据算不出动能, 但自身数据足够强时豁免动能要求
-TAG_FIRST_ROUND_MIN_HOLDERS = 20      # 首轮豁免: 持币数 ≥ 20
-TAG_FIRST_ROUND_MIN_PROGRESS = 0.15   # 首轮豁免: 进度 ≥ 15%
-TAG_FIRST_ROUND_MIN_LIQUIDITY = 5000  # 首轮豁免: 流动性 ≥ $5k
+TAG_FIRST_ROUND_MIN_HOLDERS = 30      # 首轮豁免: 持币数 ≥ 30 (与精筛门槛对齐)
+TAG_FIRST_ROUND_MIN_PROGRESS = 0.20   # 首轮豁免: 进度 ≥ 20% (与精筛门槛对齐)
+TAG_FIRST_ROUND_MIN_LIQUIDITY = 10000 # 首轮豁免: 流动性 ≥ $10k (与精筛门槛对齐)
 MOMENTUM_WINDOW = 3                    # 动能检测窗口: 最近3轮
 COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记 (仅标记, 不排除)
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
@@ -1332,6 +1332,40 @@ def bscscan_top_holders(token_address: str, api_key: str,
     if d and d.get("status") == "1" and d.get("result"):
         return d["result"]
     return []
+
+
+def bscscan_top_holders_batch(addresses: list[str], api_key: str,
+                               top_n: int = 10) -> dict[str, list[dict]]:
+    """
+    批量查询代币 Top Holders (用于入队时采集数据)
+    返回: {address: [{"addr": "0x...", "balance": 123}, ...]}
+    每个代币返回 top_n 个持仓地址及其余额
+    限流: BSCScan ~5 req/s, 串行查询, 每次间隔 0.25s
+    """
+    if not api_key or not addresses:
+        return {}
+    result = {}
+    for token_addr in addresses:
+        try:
+            raw = bscscan_top_holders(token_addr, api_key, offset=top_n)
+            if not raw:
+                continue
+            holders_list = []
+            for h in raw:
+                holder_addr = (h.get("TokenHolderAddress") or "").lower()
+                if not holder_addr or holder_addr in BURN_ADDRESSES:
+                    continue
+                balance = int(h.get("TokenHolderQuantity", 0) or 0)
+                holders_list.append({
+                    "addr": holder_addr,
+                    "balance": balance,
+                })
+            if holders_list:
+                result[token_addr] = holders_list[:top_n]
+            time.sleep(0.25)  # 限流: 4 req/s, 留余量
+        except Exception as e:
+            log.debug("Top Holders 查询失败 %s: %s", token_addr[:16], e)
+    return result
 
 
 # ===================================================================
@@ -3807,6 +3841,20 @@ def scan_once(cfg: dict) -> None:
             })
 
     log.info("入队后: %d 个代币", len(queue_state["tokens"]))
+
+    # Step 2b: 新入队代币 Top Holders 采集 (数据积累, 供后续分析)
+    bscscan_key = cfg.get("bscscan_api_key", "")
+    if admitted and bscscan_key:
+        new_addrs = [item["token"]["address"] for item in admitted]
+        log.info("Top Holders 采集: 查询 %d 个新入队代币...", len(new_addrs))
+        top_holders_map = bscscan_top_holders_batch(new_addrs, bscscan_key, top_n=10)
+        # 写入队列数据
+        for t in queue_state["tokens"]:
+            th = top_holders_map.get(t["address"])
+            if th is not None:
+                t["topHolders"] = th
+        if top_holders_map:
+            log.info("Top Holders 采集: %d/%d 个代币有数据", len(top_holders_map), len(new_addrs))
 
     # Step 3: 淘汰检查 (v6: 返回 survivors, eliminated, breakthrough)
     log.info("\n--- Step 3: 淘汰检查 ---")

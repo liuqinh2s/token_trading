@@ -2070,18 +2070,21 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     策略:
-      1. 阶梯式回撤止盈:
+      1. 阶梯式回撤止盈 (涨得越多, 锁利越紧):
          - 涨 15% 触发止盈跟踪
          - 15%~30% 区间: 固定回撤 15% 止盈 (从最高价回撤 15% 即卖出, 保住本金)
-         - 30%~300% 区间: 三分点止盈法 (价格跌到 买入价+涨幅/3 时卖出, 保住 1/3 利润)
-         - 300% 以上: 中点止盈法 (价格跌到 买入价+涨幅/2 时卖出, 锁住 50% 利润)
+         - 30%~100% 区间: 二分点止盈法 (价格跌到 买入价+涨幅/2 时卖出, 锁住 50% 利润)
+         - 100%~200% 区间: 锁住 60% 利润
+         - 200%~300% 区间: 锁住 70% 利润
+         - 300%~400% 区间: 锁住 80% 利润
+         - 400% 以上: 锁住 90% 利润
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
       3. 超期清仓 (阶梯式):
-         - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
-         - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct (500%) → 卖出
-      4. 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样):
-         - -30% 硬止损: 无论动能如何, 亏损达到 -30% 必须走
-         - -25% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
+         - 持仓超过 expire_loss_hours (36h) 且仍亏损 → 卖出
+         - 持仓超过 expire_underperform_hours (48h) 且盈利未达 expire_min_profit_pct (100%) → 卖出
+      4. 阶梯止损 + 动能保护:
+         - -20% 硬止损: 无论动能如何, 亏损达到 -20% 必须走
+         - -15% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损, 垃圾币早点跑
 
     momentum: calc_momentum_signals() 的返回值, 包含动能衰竭信号
     """
@@ -2096,35 +2099,58 @@ def check_sell_conditions(pos: dict, current_price: float,
     profit_pct = (current_price - buy_price) / buy_price * 100
     max_profit_pct = (max_price - buy_price) / buy_price * 100 if max_price > 0 else 0
 
-    # 策略1: 阶梯式回撤止盈
-    # 涨幅曾达到 tp_trigger_pct (默认 15%) 后激活跟踪
+    # 策略1: 阶梯式回撤止盈 (涨得越多, 锁利越紧)
     tp_trigger_pct = trading_cfg.get("tp_trigger_pct", 15)
     tp_midpoint_pct = trading_cfg.get("tp_midpoint_pct", 30)
-    tp_full_midpoint_pct = trading_cfg.get("tp_full_midpoint_pct", 300)
+    tp_high_pct = trading_cfg.get("tp_high_pct", 100)
+    tp_ultra_pct = trading_cfg.get("tp_ultra_pct", 300)
     tp_drawdown_pct = trading_cfg.get("tp_drawdown_pct", 15)
 
     if max_profit_pct >= tp_trigger_pct:
-        if max_profit_pct >= tp_full_midpoint_pct:
-            # 阶段3: 最高盈利 ≥300%, 使用中点止盈法
-            # 价格跌到 买入价 + 涨幅的一半 时止盈卖出, 锁住 50% 利润
-            midpoint = buy_price + (max_price - buy_price) / 2
-            if current_price <= midpoint:
-                midpoint_pct = (midpoint - buy_price) / buy_price * 100
-                return True, (f"TRAILING_TP (中点止盈: 最高盈利 {max_profit_pct:.0f}%, "
-                              f"中点 ${midpoint:.12f} ({midpoint_pct:.0f}%), "
+        gain = max_price - buy_price  # 绝对涨幅
+
+        if max_profit_pct >= 400:
+            # 阶段5: 最高盈利 ≥400%, 锁住 90% 利润
+            lock_price = buy_price + gain * 0.9
+            if current_price <= lock_price:
+                lock_pct = (lock_price - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (锁利90%: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        elif max_profit_pct >= tp_ultra_pct:
+            # 阶段4: 最高盈利 300%~400%, 锁住 80% 利润
+            lock_price = buy_price + gain * 0.8
+            if current_price <= lock_price:
+                lock_pct = (lock_price - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (锁利80%: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        elif max_profit_pct >= 200:
+            # 阶段3: 最高盈利 200%~300%, 锁住 70% 利润
+            lock_price = buy_price + gain * 0.7
+            if current_price <= lock_price:
+                lock_pct = (lock_price - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (锁利70%: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
+                              f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
+        elif max_profit_pct >= tp_high_pct:
+            # 阶段2b: 最高盈利 100%~200%, 锁住 60% 利润
+            lock_price = buy_price + gain * 0.6
+            if current_price <= lock_price:
+                lock_pct = (lock_price - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (锁利60%: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"锁利线 ${lock_price:.12f} ({lock_pct:.0f}%), "
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
         elif max_profit_pct >= tp_midpoint_pct:
-            # 阶段2: 最高盈利 30%~300%, 使用三分点止盈法
-            # 价格跌到 买入价 + 涨幅的三分之一 时止盈卖出, 保住 1/3 利润, 给好币更多空间
-            third_point = buy_price + (max_price - buy_price) / 3
-            if current_price <= third_point:
-                third_pct = (third_point - buy_price) / buy_price * 100
-                return True, (f"TRAILING_TP (三分点止盈: 最高盈利 {max_profit_pct:.0f}%, "
-                              f"三分点 ${third_point:.12f} ({third_pct:.0f}%), "
+            # 阶段2: 最高盈利 30%~100%, 二分点止盈法, 锁住 50% 利润
+            midpoint = buy_price + gain * 0.5
+            if current_price <= midpoint:
+                mid_pct = (midpoint - buy_price) / buy_price * 100
+                return True, (f"TRAILING_TP (二分点止盈: 最高盈利 {max_profit_pct:.0f}%, "
+                              f"二分点 ${midpoint:.12f} ({mid_pct:.0f}%), "
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
         else:
-            # 阶段1: 最高盈利 15%~30%, 固定回撤 15% 止盈
-            # 从最高价回撤 tp_drawdown_pct 即卖出, 保住本金
+            # 阶段1: 最高盈利 15%~30%, 固定回撤 15% 止盈, 保住本金
             drawdown_price = max_price * (1 - tp_drawdown_pct / 100)
             if current_price <= drawdown_price:
                 drawdown_sell_pct = (drawdown_price - buy_price) / buy_price * 100
@@ -2133,7 +2159,6 @@ def check_sell_conditions(pos: dict, current_price: float,
                               f"当前 ${current_price:.12f} ({profit_pct:.0f}%))")
 
     # 策略2: 动能衰竭止盈 — 多指标同时恶化, 趁还有利润赶紧跑
-    # 条件: ≥2 个动能指标恶化 + 当前盈利 > 0 (亏损时不触发, 留给止损兜底)
     if momentum and trading_cfg.get("momentum_tp_enabled", True):
         min_bad = trading_cfg.get("momentum_min_bad_signals", 2)
         if momentum.get("bad_count", 0) >= min_bad and profit_pct > 0:
@@ -2146,27 +2171,25 @@ def check_sell_conditions(pos: dict, current_price: float,
     hold_hours = hold_ms / (3600 * 1000)
 
     # 3a: 超过 expire_loss_hours 且仍亏损 → 卖出
-    expire_loss_hours = trading_cfg.get("expire_loss_hours", 48)
+    expire_loss_hours = trading_cfg.get("expire_loss_hours", 36)
     if hold_hours >= expire_loss_hours and profit_pct < 0:
         return True, f"EXPIRE_LOSS (持仓 {hold_hours:.0f}h, 亏损 {profit_pct:.0f}%)"
 
     # 3b: 超过 expire_underperform_hours 且盈利未达 expire_min_profit_pct → 卖出
-    expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 72)
-    expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 500)
+    expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 48)
+    expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 100)
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
-    # 策略4: 阶梯止损 + 动能保护 (统一, quality 和 graduated 都一样)
-    # -40% 硬止损: 无论动能如何, 亏损达到 -40% 必须走
-    # -25% 动能止损: 动能全部恶化时提前止损, 垃圾币早点跑
-    stop_loss_pct = trading_cfg.get("stop_loss_pct", -30)
-    momentum_stop_loss_pct = trading_cfg.get("momentum_stop_loss_pct", -25)
+    # 策略4: 阶梯止损 + 动能保护
+    stop_loss_pct = trading_cfg.get("stop_loss_pct", -20)
+    momentum_stop_loss_pct = trading_cfg.get("momentum_stop_loss_pct", -15)
 
-    # 4a: 硬止损 — 亏损达到 -30% 无条件卖出
+    # 4a: 硬止损 — 亏损达到 -20% 无条件卖出
     if stop_loss_pct and profit_pct <= stop_loss_pct:
         return True, f"STOP_LOSS (亏损 {profit_pct:.0f}%, 阈值 {stop_loss_pct}%)"
 
-    # 4b: 动能恶化提前止损 — 多指标同时恶化 + 亏损达到 -25%
+    # 4b: 动能恶化提前止损 — 多指标同时恶化 + 亏损达到 -15%
     if momentum and momentum.get("bad_count", 0) >= 2:
         if profit_pct <= momentum_stop_loss_pct:
             signals_str = " + ".join(momentum.get("bad_signals", []))
