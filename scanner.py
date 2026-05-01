@@ -256,6 +256,10 @@ MIN_SOCIAL_COUNT = 1                   # 入场筛/淘汰: 最少关联社交媒
 # 已确认的连续发诈骗币的开发者钱包地址, 其部署的所有代币一律拦截
 DEPLOYER_BLACKLIST: set[str] = set()
 
+# 优质开发者白名单: creator 地址命中则精筛加分 (小写)
+# 发过 10x+ 涨幅代币的开发者, 运行时从 queue.json 恢复
+DEPLOYER_WHITELIST: set[str] = set()
+
 # 诈骗代币黑名单: 代币合约地址命中即拒绝入场 (小写)
 # 已确认的诈骗代币, 直接拦截
 TOKEN_BLACKLIST = {
@@ -533,6 +537,10 @@ def update_deployer_reputation(queue_state: dict,
         log.info("开发者黑名单: %d 个地址 (诈骗币≥%d)", len(DEPLOYER_BLACKLIST), DEPLOYER_SCAM_MIN_TOKENS)
     if whitelist:
         log.info("开发者白名单: %d 个地址 (涨幅≥%dx)", len(whitelist), DEPLOYER_QUALITY_GAIN_X)
+
+    # 更新全局白名单集合 (供 tag_filter 使用)
+    DEPLOYER_WHITELIST.clear()
+    DEPLOYER_WHITELIST.update(whitelist.keys())
 
 
 def update_name_index(queue: dict, tokens: list[dict]):
@@ -3505,6 +3513,11 @@ def tag_filter(candidates: list[dict], now_ms: int,
         # === 全部通过 ===
         # 收集信号标签 (仅用于展示, 不影响筛选)
         signal_tags = []
+        # 优质开发者标签 (发过 10x+ 代币的开发者)
+        creator = (t.get("creator") or "").lower()
+        if creator and creator in DEPLOYER_WHITELIST:
+            signal_tags.append("优质开发者")
+            t["_isQualityDeployer"] = True
         boosts = t.get("boosts", 0)
         if boosts > 0:
             signal_tags.append(f"Boost({boosts})")
@@ -3914,6 +3927,13 @@ def scan_once(cfg: dict) -> None:
             DEPLOYER_BLACKLIST.add(creator)
     if DEPLOYER_BLACKLIST:
         log.info("开发者黑名单: 加载 %d 个地址", len(DEPLOYER_BLACKLIST))
+
+    # 从持久化数据恢复开发者白名单
+    _wl = queue_state.get("deployerWhitelist", {})
+    DEPLOYER_WHITELIST.clear()
+    DEPLOYER_WHITELIST.update(_wl.keys())
+    if DEPLOYER_WHITELIST:
+        log.info("开发者白名单: 加载 %d 个地址", len(DEPLOYER_WHITELIST))
 
     # 迁移: 旧版 breakthrough 冻结快照 → 回归 tokens 列表 (一次性)
     old_bt = queue_state.pop("breakthrough", [])
