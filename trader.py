@@ -2076,9 +2076,10 @@ def check_sell_conditions(pos: dict, current_price: float,
          - 30%~80% 区间: 锁住 60% 利润
          - 80% 以上: 锁住 90% 利润 (低胜率策略, 到手的不能跑)
       2. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化 (≥2个) 且当前盈利 → 止盈
-      3. 超期清仓 (阶梯式):
-         - 持仓超过 expire_loss_hours (48h) 且仍亏损 → 卖出
-         - 持仓超过 expire_underperform_hours (72h) 且盈利未达 expire_min_profit_pct → 卖出
+      3. 超期清仓 (阶梯式, v13: 大幅缩短):
+         - 持仓超过 6h 且仍亏损 → 卖出 (数据: 大涨币都在前几小时爆发, 6h不涨基本没戏)
+         - 持仓超过 12h 且从峰值回撤 > 30% → 卖出 (给了机会没抓住, 别耗了)
+         - 持仓超过 24h 且盈利未达 50% → 卖出 (资金效率太低)
       4. 阶梯止损 + 动能保护:
          - -20% 硬止损: 无论动能如何, 亏损达到 -20% 必须走
          - -15% 动能止损: 动能全部恶化 (≥2个信号) 时提前止损
@@ -2139,18 +2140,25 @@ def check_sell_conditions(pos: dict, current_price: float,
             return True, (f"MOMENTUM_TP (盈利 {profit_pct:.0f}%, "
                           f"{momentum['bad_count']}个动能衰竭: {signals_str})")
 
-    # 策略3: 超期清仓 — 资金回收
+    # 策略3: 超期清仓 — 资金回收 (v13: 大幅缩短期)
     hold_ms = int(time.time() * 1000) - pos["buy_time"]
     hold_hours = hold_ms / (3600 * 1000)
 
-    # 3a: 超过 expire_loss_hours 且仍亏损 → 卖出
-    expire_loss_hours = trading_cfg.get("expire_loss_hours", 36)
+    # 3a: 超过 6h 且仍亏损 → 止损出局 (数据: 大涨币都在前几小时爆发)
+    expire_loss_hours = trading_cfg.get("expire_loss_hours", 6)
     if hold_hours >= expire_loss_hours and profit_pct < 0:
         return True, f"EXPIRE_LOSS (持仓 {hold_hours:.0f}h, 亏损 {profit_pct:.0f}%)"
 
-    # 3b: 超过 expire_underperform_hours 且盈利未达 expire_min_profit_pct → 卖出
-    expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 48)
-    expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 100)
+    # 3b: 超过 12h 且从最高点回撤 > 30% → 拿到过利润但回吐了, 别再等了
+    expire_drawdown_hours = trading_cfg.get("expire_drawdown_hours", 12)
+    if hold_hours >= expire_drawdown_hours and max_price > 0:
+        drawdown = (max_price - current_price) / max_price * 100
+        if drawdown >= 30:
+            return True, f"EXPIRE_DRAWDOWN (持仓 {hold_hours:.0f}h, 从最高 ${max_price:.12f} 回撤 {drawdown:.0f}%)"
+
+    # 3c: 超过 24h 且盈利未达 50% → 资金效率太低
+    expire_underperform_hours = trading_cfg.get("expire_underperform_hours", 24)
+    expire_min_profit_pct = trading_cfg.get("expire_min_profit_pct", 50)
     if hold_hours >= expire_underperform_hours and profit_pct < expire_min_profit_pct:
         return True, f"EXPIRE_UNDERPERFORM (持仓 {hold_hours:.0f}h, 盈利 {profit_pct:.0f}% < {expire_min_profit_pct}%)"
 
