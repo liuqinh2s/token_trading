@@ -2187,15 +2187,20 @@ def _trade_time_str() -> str:
 
 
 def notify_buy(cfg: dict, token_name: str, token_address: str,
-               buy_usdt: float, buy_price_usd: float, tx_hash: str):
-    """买入成功通知 (简洁版, 代币详情已在精筛报告中推送)"""
+               buy_usdt: float, buy_price_usd: float, tx_hash: str,
+               bonus_tags: list | None = None):
+    """买入成功通知"""
+    bonus_str = ""
+    if bonus_tags:
+        bonus_str = f"\n\n加分项: {' | '.join(bonus_tags)}"
     text = (
         f"## 🟢 买入成功\n\n"
         f"代币: {token_name}\n\n"
         f"合约: `{token_address}`\n\n"
         f"花费: {buy_usdt:.2f} USDT\n\n"
         f"单价: ${buy_price_usd:.12f}\n\n"
-        f"TX: [查看](https://bscscan.com/tx/{tx_hash})\n\n"
+        f"TX: [查看](https://bscscan.com/tx/{tx_hash})"
+        f"{bonus_str}\n\n"
         f"时间: {_trade_time_str()}"
     )
     _send_trade_notify(cfg, "买入成功", text)
@@ -2299,8 +2304,7 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
     # 按加分项数量降序排序: 加分项多的优先买入
     def _bonus_sort_key(item):
         tk, detail = item
-        # _quality_bonus_tags 由 tag_filter 设置在原始代币 dict 上
-        bonus_tags = detail.get("_quality_bonus_tags") or []
+        bonus_tags = detail.get("_bonus_tags") or []
         return len(bonus_tags)
     tokens = sorted(tokens, key=_bonus_sort_key, reverse=True)
 
@@ -2404,7 +2408,8 @@ def execute_buys(tokens: list[tuple[dict, dict]], cfg: dict,
         if result:
             record_buy(conn, addr, name, result["decimals"], result, channel)
             notify_buy(cfg, name, addr, buy_usdt,
-                       result["buy_price_usd"], result["tx_hash"])
+                       result["buy_price_usd"], result["tx_hash"],
+                       bonus_tags=detail.get("_bonus_tags"))
             bought_count += 1
         else:
             reason = f"交易执行失败 (venue={venue}, 金额=${buy_usdt:.2f})"

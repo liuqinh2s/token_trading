@@ -320,15 +320,15 @@ BONUS_HOLDERS_1K = 1000          # 持币数 ≥ 1000 → 加分
 # --- 加分标签: 流动性 ≥30k ---
 BONUS_LIQUIDITY_30K = 30000     # 流动性 ≥ $30k → 加分
 
-# --- 加分标签权重 ---
+# --- 加分标签权重 (所有加分项权重相同) ---
 BONUS_WEIGHT_COPYCAT = 1
-BONUS_WEIGHT_SOCIAL_QUALITY = 2
-BONUS_WEIGHT_BUY_PRESSURE = 2
+BONUS_WEIGHT_SOCIAL_QUALITY = 1
+BONUS_WEIGHT_BUY_PRESSURE = 1
 BONUS_WEIGHT_VOLUME = 1
-BONUS_WEIGHT_QUALITY_DEPLOYER = 3
+BONUS_WEIGHT_QUALITY_DEPLOYER = 1
 BONUS_WEIGHT_BOOST = 1
-BONUS_WEIGHT_HOLDERS_1K = 2      # 持币≥1k
-BONUS_WEIGHT_LIQUIDITY_30K = 2   # 流动性≥$30k
+BONUS_WEIGHT_HOLDERS_1K = 1      # 持币≥1k
+BONUS_WEIGHT_LIQUIDITY_30K = 1   # 流动性≥$30k
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
 # Gas 大盘指数: ETH/BSC gasUsedRatio + SOL TPS, 反映多链整体活跃度
 # gasUsedRatio: 0~1, 越高=区块越满=链上越活跃; SOL TPS 归一化到 0~1
@@ -3909,6 +3909,11 @@ def tag_filter(candidates: list[dict], now_ms: int,
         t["_age_hours"] = age_hours
         t["_min_holders"] = min_holders
         t["isGraduated"] = is_graduated
+
+        # 至少一个加分项才能通过精筛
+        if bonus_score <= 0:
+            continue
+
         results.append(t)
 
         grad_str = "毕业" if is_graduated else f"进度{progress*100:.0f}%"
@@ -4678,6 +4683,10 @@ def scan_once(cfg: dict) -> None:
                 "_bonus_tags": item.get("_bonus_tags", []),
                 "_bonus_score": item.get("_bonus_score", 0),
             }
+            bonus_str = " | ".join(detail_data["_bonus_tags"]) if detail_data["_bonus_tags"] else "无"
+            log.info("  📦 %s [%s] 加分(%d): %s",
+                     token_data["shortName"] or token_data["name"],
+                     token_data["source"], detail_data["_bonus_score"], bonus_str)
             to_buy.append((token_data, detail_data))
         log.info("自动买入: 准备买入 %d 个代币", len(to_buy))
         try:
