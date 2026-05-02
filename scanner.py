@@ -205,6 +205,7 @@ TOTAL_SUPPLY = 1_000_000_000
 # 币龄越长持币数要求越高, 反映热度 & 共识程度
 # 注: 持币数可造假, 不是决定性因素, 过关即可
 TAG_HOLDERS_TIERS = [
+    (0,    3),    # <15min:   ≥3 (刚出生, 有基本关注即可)
     (0.25, 10),   # ≥15min:  ≥10
     (0.5,  20),   # ≥30min:  ≥20
     (1.0,  50),   # ≥1h:     ≥50
@@ -217,6 +218,7 @@ TAG_HOLDERS_TIERS = [
 # --- 基础标签: 进度 (未毕业, age → min_progress) ---
 # 进度反映项目方实力, 迟迟不涨说明项目方实力不够
 TAG_PROGRESS_TIERS = [
+    (0,    0.005), # <15min:   ≥0.5% (刚出生, 有起步资金即可)
     (0.25, 0.02),  # ≥15min:  ≥2%
     (0.5,  0.05),  # ≥30min:  ≥5%
     (1.0,  0.08),  # ≥1h:     ≥8%
@@ -229,6 +231,7 @@ TAG_PROGRESS_TIERS = [
 # --- 基础标签: 流动性 (已毕业, age → min_liquidity) ---
 # 币龄越长流动性要求越高, 反映项目方实力
 TAG_LIQUIDITY_TIERS = [
+    (0,    500),   # <15min:   ≥$500
     (0.25, 1000),  # ≥15min:  ≥$1k
     (0.5,  2000),  # ≥30min:  ≥$2k
     (1.0,  3000),  # ≥1h:     ≥$3k
@@ -240,11 +243,45 @@ TAG_LIQUIDITY_TIERS = [
 # --- 基础标签: K线 (防追高, age → max_price_change) ---
 # 涨幅过大说明可能追高或正在崩盘途中
 TAG_KLINE_TIERS = [
+    (0,    1.5),   # <15min:  涨幅 ≤ 150% (刚出生更严格)
     (0.25, 2.0),   # ≥15min:  涨幅 ≤ 200%
     (1.0,  4.0),   # ≥1h:     涨幅 ≤ 400%
     (4.0,  8.0),   # ≥4h:     涨幅 ≤ 800%
     (8.0,  10.0),  # ≥8h:     涨幅 ≤ 1000%
 ]
+
+# --- 基础标签: 1h买卖数 (age → min_buys, 且 buys > sells) ---
+# 交易笔数反映散户圈热度, 有真实换手 vs 刷量
+TAG_BUYS_TIERS = [
+    (0,    5),     # <15min:   1h买入 ≥ 5
+    (0.25, 20),    # ≥15min:  1h买入 ≥ 20
+    (0.5,  40),    # ≥30min:  1h买入 ≥ 40
+    (1.0,  80),    # ≥1h:     1h买入 ≥ 80
+    (2.0,  100),   # ≥2h:     1h买入 ≥ 100
+    (4.0,  200),   # ≥4h:     1h买入 ≥ 200
+    (8.0,  300),   # ≥8h:     1h买入 ≥ 300
+    (16.0, 400),   # ≥16h:    1h买入 ≥ 400
+]
+
+# --- 基础标签: 成交额 (age → min_volume_usd) ---
+# 成交额是少数真实指标, 无成交额的币不可信
+TAG_VOLUME_TIERS = [
+    (0,    100),    # <15min:   ≥$100
+    (0.25, 300),    # ≥15min:  ≥$300
+    (0.5,  500),    # ≥30min:  ≥$500
+    (1.0,  1000),   # ≥1h:     ≥$1000
+    (2.0,  1500),   # ≥2h:     ≥$1500
+    (4.0,  4000),   # ≥4h:     ≥$4000
+    (8.0,  8000),   # ≥8h:     ≥$8000
+    (16.0, 15000),  # ≥16h:    ≥$15000
+]
+
+# --- 基础标签: 波动充足 (近3轮振幅有至少一根≥20%) ---
+TAG_AMPLITUDE_MIN_RATIO = 0.20    # 振幅 ≥ 20%
+TAG_AMPLITUDE_WINDOW = 3          # 检测最近3轮
+
+# --- 基础标签: 趋势向上 (当前价格 ≥ 4轮前价格) ---
+TAG_TREND_WINDOW = 4              # 检测最近4轮 (≈1h)
 
 # --- 基础标签: 关联社交媒体 ---
 TAG_SOCIAL_MIN_AGE = 0.25        # 币龄≥15min 才检查社交
@@ -348,6 +385,7 @@ ELIM_HOLDERS_PEAK_MIN = 30            # 持币数曾达到 30 才触发跌破淘
 ELIM_HOLDERS_DROP_PCT = 0.70          # 持币数从峰值跌 70% 淘汰 (清理僵尸币, 数据显示 99 个僵尸币占位)
 ELIM_HOLDERS_DROP_PEAK_MIN = 50       # 持币数曾达到 50 才触发跌幅淘汰 (避免误杀小币)
 ELIM_LIQ_FLOOR = 1000                 # 流动性跌破 $1k (仅已毕业)
+ELIM_LIQ_PEAK_MIN = 2000              # 流动性曾达到 $2k 才触发流动性枯竭淘汰 (避免误杀小币)
 ELIM_PROGRESS_DROP_ABS = 0.40         # 进度从峰值跌 40 个百分点淘汰 (加减法, 无币龄要求)
 # 进度阶梯淘汰 (币龄越长, 容忍度越高)
 ELIM_PROGRESS_TIERS = [
@@ -3636,28 +3674,25 @@ def tag_filter(candidates: list[dict], now_ms: int,
     """
     标签制精筛 — v15: 基础标签(AND) + 加分标签(优先级排序)
 
-    基础标签 (全部满足才通过, 目标 ~30/天):
-      1. 持币合格: 币龄阶梯持币数检查
-      2. 进度/流动性合格: 未毕业看进度阶梯, 已毕业看流动性阶梯
-      3. K线合格: 币龄阶梯涨幅检查 (防追高)
-      4. 社交合格: 币龄≥15min 后至少 1 个社交媒体
-      5. 创建者/代币合格: 不在诈骗黑名单 (入场筛已过滤)
-      6. 币龄合格: ≤ 48h
+    基础标签 (全部满足才通过):
+      大盘向上: 近1h平均GAS ≥ 近12hGAS
+      基本面: 持币 + 进度/流动性 + 1h买卖数 + 成交额 + 社交 + 创建者/代币 + 币龄
+      未追高: K线币龄阶梯涨幅检查
+      波动充足: 近3轮振幅有至少一根 ≥ 20%
+      趋势向上: 当前价格 ≥ 4轮前价格 (≈1h)
 
     加分标签 (通过基础标签后计算, 排优先级):
-      - 仿盘加分
-      - 社交质量: 推特账号(非推文) / TG群 + 关注≥100额外加分
-      - 1h买压
-      - 成交额
-      - Top10持仓占比合理
-      - 优质开发者 (发过 10x+ 代币)
-      - 持币≥1k
-      - 流动性≥$30k
-      - Boost推广
+      - 仿盘加分 / 社交质量 / 1h买压 / 成交额
+      - Top10持仓占比合理 / 优质开发者 / 持币≥1k / 流动性≥$30k / Boost
 
     返回按加分总分降序排列的精筛结果
     """
     results = []
+
+    # 大盘是否向上
+    is_bullish = True
+    if market_sentiment:
+        is_bullish = market_sentiment.get("is_bullish", True)
 
     for t in candidates:
         addr = t.get("address", "")
@@ -3678,13 +3713,18 @@ def tag_filter(candidates: list[dict], now_ms: int,
         basic_pass = True
         basic_fail_reasons = []
 
-        # ==================== 基础标签 1: 持币合格 ====================
+        # ==================== 基础标签 1: 大盘向上 ====================
+        if not is_bullish:
+            basic_fail_reasons.append("大盘向下(近1hGAS<近12hGAS)")
+            basic_pass = False
+
+        # ==================== 基本面: 持币合格 ====================
         min_holders = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
         if holders < min_holders:
             basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{age_hours:.1f}h)")
             basic_pass = False
 
-        # ==================== 基础标签 2: 进度/流动性合格 ====================
+        # ==================== 基本面: 进度/流动性合格 ====================
         if is_graduated:
             min_liquidity = _age_tier_match(age_hours, TAG_LIQUIDITY_TIERS)
             if liquidity < min_liquidity:
@@ -3696,15 +3736,26 @@ def tag_filter(candidates: list[dict], now_ms: int,
                 basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{age_hours:.1f}h)")
                 basic_pass = False
 
-        # ==================== 基础标签 3: K线合格 (防追高) ====================
-        if peak_price > 0 and current_price > 0:
-            price_change = current_price / peak_price - 1
-            max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
-            if price_change > max_change:
-                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{age_hours:.1f}h)")
+        # ==================== 基本面: 1h买卖数合格 ====================
+        buys_h1 = t.get("buysH1", 0)
+        sells_h1 = t.get("sellsH1", 0)
+        min_buys = _age_tier_match(age_hours, TAG_BUYS_TIERS)
+        if buys_h1 > 0 or sells_h1 > 0:
+            if buys_h1 < min_buys:
+                basic_fail_reasons.append(f"1h买入{buys_h1}<{min_buys}(币龄{age_hours:.1f}h)")
+                basic_pass = False
+            elif buys_h1 <= sells_h1:
+                basic_fail_reasons.append(f"1h买入{buys_h1}≤卖出{sells_h1}")
                 basic_pass = False
 
-        # ==================== 基础标签 4: 社交合格 ====================
+        # ==================== 基本面: 成交额合格 ====================
+        volume_h1 = t.get("volumeH1", 0)
+        min_volume = _age_tier_match(age_hours, TAG_VOLUME_TIERS)
+        if volume_h1 > 0 and volume_h1 < min_volume:
+            basic_fail_reasons.append(f"成交额${volume_h1:.0f}<${min_volume}(币龄{age_hours:.1f}h)")
+            basic_pass = False
+
+        # ==================== 基本面: 社交合格 ====================
         social_count = t.get("socialCount", 0)
         if age_hours >= TAG_SOCIAL_MIN_AGE and social_count < TAG_SOCIAL_MIN_COUNT:
             flap_exempt = (is_flap
@@ -3714,17 +3765,49 @@ def tag_filter(candidates: list[dict], now_ms: int,
                 basic_fail_reasons.append(f"无社交媒体(币龄{age_hours:.1f}h)")
                 basic_pass = False
 
-        # ==================== 基础标签 5: 创建者/代币合格 ====================
-        # 入场筛已过滤黑名单, 此处仅确认
+        # ==================== 基本面: 创建者/代币合格 ====================
         creator = (t.get("creator") or "").lower()
         if creator and creator in DEPLOYER_BLACKLIST:
             basic_fail_reasons.append(f"创建者在黑名单")
             basic_pass = False
 
-        # ==================== 基础标签 6: 币龄合格 ====================
+        # ==================== 基本面: 币龄合格 ====================
         if age_hours > MAX_AGE_HOURS:
             basic_fail_reasons.append(f"币龄{age_hours:.1f}h>{MAX_AGE_HOURS}h")
             basic_pass = False
+
+        # ==================== 基础标签: 未追高 (K线) ====================
+        if peak_price > 0 and current_price > 0:
+            price_change = current_price / peak_price - 1
+            max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
+            if price_change > max_change:
+                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{age_hours:.1f}h)")
+                basic_pass = False
+
+        # ==================== 基础标签: 波动充足 (近3轮振幅≥20%) ====================
+        price_hist = t.get("priceHistory", [])
+        if price_hist and len(price_hist) >= 2:
+            window = price_hist[-TAG_AMPLITUDE_WINDOW:]
+            has_amplitude = False
+            for i in range(1, len(window)):
+                prev = window[i - 1]
+                curr = window[i]
+                if prev > 0 and curr > 0:
+                    amp = abs(curr - prev) / prev
+                    if amp >= TAG_AMPLITUDE_MIN_RATIO:
+                        has_amplitude = True
+                        break
+            if not has_amplitude:
+                if len(price_hist) >= TAG_AMPLITUDE_WINDOW:
+                    basic_fail_reasons.append(f"波动不足(近{min(len(window),TAG_AMPLITUDE_WINDOW)}轮振幅<20%)")
+                    basic_pass = False
+
+        # ==================== 基础标签: 趋势向上 (当前价≥4轮前价) ====================
+        if price_hist and len(price_hist) >= TAG_TREND_WINDOW:
+            price_4_ago = price_hist[-TAG_TREND_WINDOW]
+            if price_4_ago > 0 and current_price < price_4_ago:
+                basic_fail_reasons.append(f"趋势向下(当前{current_price:.2e}<{TAG_TREND_WINDOW}轮前{price_4_ago:.2e})")
+                basic_pass = False
 
         if not basic_pass:
             continue
@@ -4459,13 +4542,12 @@ def scan_once(cfg: dict) -> None:
             if (t.get("peakLiquidity", 0) >= ELIM_LIQ_PEAK_MIN
                     and current_liq < ELIM_LIQ_FLOOR):
                 elim_reason = f"流动性 ${t.get('peakLiquidity', 0):.0f}→${current_liq:.0f}"
-        # 进度淘汰 (four.meme + flap, 均有进度数据)
+        # 进度阶梯淘汰
         if not elim_reason:
-            if age_hours > ELIM_PROGRESS_AGE_HOURS and current_progress < ELIM_PROGRESS_MIN:
-                elim_reason = f"进度{current_progress * 100:.2f}% 币龄{age_hours:.1f}h"
-        if not elim_reason:
-            if age_hours > ELIM_PROGRESS_AGE_HOURS_MID and current_progress < ELIM_PROGRESS_MIN_MID:
-                elim_reason = f"进度{current_progress * 100:.2f}% 币龄{age_hours:.1f}h"
+            for age_h, min_prog in ELIM_PROGRESS_TIERS:
+                if age_hours > age_h and current_progress < min_prog:
+                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{age_hours:.1f}h (阈值{min_prog*100:.0f}%)"
+                    break
         # 早期/中期持币数不足
         if not elim_reason:
             if age_hours > ELIM_EARLY_AGE_MIN and t.get("peakHolders", 0) < ELIM_EARLY_PEAK_HOLDERS:
