@@ -270,6 +270,7 @@ TOKEN_BLACKLIST = {
 DEPLOYER_SCAM_DROP_PCT = 0.80          # 一轮内价格暴跌 80% 视为诈骗 (lastPrice→price)
 DEPLOYER_SCAM_MIN_TOKENS = 2           # 开发者发过 ≥2 个诈骗币才加入黑名单 (避免误杀)
 DEPLOYER_QUALITY_GAIN_X = 10           # 涨幅 ≥ 10x 视为优质 (peakPrice / addedPrice)
+DEPLOYER_QUALITY_MIN_PEAK_PRICE = 0.000003  # 起始价格必须 ≥ 0.000003 才算真正大涨 (过滤起始价接近零的假币)
 
 # 蹭名币黑名单: symbol 或 name 命中即拒绝入场 (小写匹配)
 # 这些是知名主流币种的名称/符号, 在 meme 平台上发行的同名代币 100% 是蹭热度的假币
@@ -436,15 +437,21 @@ def load_queue() -> dict:
 
 def save_queue(queue: dict):
     """保存队列状态"""
-    # 只保留最近 1000 条淘汰记录
     if len(queue.get("eliminated", [])) > 1000:
         queue["eliminated"] = queue["eliminated"][-1000:]
-    # nameIndex 地址列表上限: 每个 key 最多保留 200 个地址 (仿盘检测只需知道数量级)
     name_idx = queue.get("nameIndex", {})
-    for key in name_idx:
+    now_ms = int(time.time() * 1000)
+    max_age_ms = MAX_AGE_HOURS * 3600 * 1000
+    for key in list(name_idx.keys()):
         addrs = name_idx[key].get("addrs", [])
         if len(addrs) > 200:
             name_idx[key]["addrs"] = addrs[-200:]
+        elif len(addrs) <= 1:
+            del name_idx[key]
+            continue
+        last_seen = name_idx[key].get("lastSeen", 0)
+        if last_seen > 0 and now_ms - last_seen > max_age_ms:
+            del name_idx[key]
     with open(QUEUE_FILE, "w", encoding="utf-8") as f:
         json.dump(queue, f, ensure_ascii=False, indent=2)
 
@@ -466,9 +473,9 @@ def update_deployer_reputation(queue_state: dict,
         creator = (t.get("creator") or "").lower()
         if not creator or creator == ZERO_ADDRESS:
             continue
-        last_price = t.get("lastPrice", 0)
+        last_price = t.get("prevPrice", 0) or t.get("lastPrice", 0)
         current_price = t.get("price", 0)
-        # lastPrice 是上一轮的价格, price 是本轮更新后的价格
+        # prevPrice 是上一轮的价格, price 是本轮更新后的价格
         # 一轮内暴跌 80%+ = 开发者砸盘/撤池子
         if (last_price > 0 and current_price > 0
                 and current_price < last_price * (1 - DEPLOYER_SCAM_DROP_PCT)):
@@ -489,7 +496,7 @@ def update_deployer_reputation(queue_state: dict,
         creator = (t.get("creator") or "").lower()
         if not creator or creator == ZERO_ADDRESS:
             continue
-        last_price = t.get("lastPrice", 0)
+        last_price = t.get("prevPrice", 0) or t.get("lastPrice", 0)
         current_price = t.get("price", 0)
         if (last_price > 0 and current_price > 0
                 and current_price < last_price * (1 - DEPLOYER_SCAM_DROP_PCT)):
@@ -513,6 +520,7 @@ def update_deployer_reputation(queue_state: dict,
         added_price = t.get("addedPrice", 0)
         peak_price = t.get("peakPrice", 0)
         if (added_price > 0 and peak_price > 0
+                and added_price >= DEPLOYER_QUALITY_MIN_PEAK_PRICE
                 and peak_price >= added_price * DEPLOYER_QUALITY_GAIN_X):
             addr = t.get("address", "")
             if creator not in whitelist:
@@ -545,9 +553,10 @@ def update_deployer_reputation(queue_state: dict,
 
 def update_name_index(queue: dict, tokens: list[dict]):
     """
-    更新名称索引: 记录所有见过的 name/symbol 及其不同地址数量
+    更新名称索引: 记录近48小时内见过的 name/symbol 及其不同地址数量
     用于仿盘检测, 不受 eliminated 1000 条上限影响
     """
+    now_ms = int(time.time() * 1000)
     idx = queue.setdefault("nameIndex", {})
     for t in tokens:
         addr = (t.get("address") or "").lower()
@@ -556,9 +565,10 @@ def update_name_index(queue: dict, tokens: list[dict]):
         for field in ("symbol", "name"):
             key = _normalize(t.get(field) or "")
             if key and len(key) >= 2:
-                entry = idx.setdefault(key, {"addrs": []})
+                entry = idx.setdefault(key, {"addrs": [], "lastSeen": now_ms})
                 if addr not in entry["addrs"]:
                     entry["addrs"].append(addr)
+                entry["lastSeen"] = now_ms
 
 
 # ===================================================================
@@ -3003,6 +3013,7 @@ def elimination_check(queue: list[dict], now_ms: int,
             t["consecDrops"] = t.get("consecDrops", 0) + 1
         else:
             t["consecDrops"] = 0
+        t["prevPrice"] = t.get("lastPrice", 0)
         t["lastPrice"] = current_price
 
         # --- 价格突破标记: 峰值 ≥ 0.0001 → 标记为已突破, 跳过常规淘汰条件 ---
