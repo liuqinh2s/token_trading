@@ -28,15 +28,13 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 持币数从峰值跌 70%+ (峰值≥50, 清理僵尸币)
   - 无社交媒体 (four.meme 通过 detail API, flap 通过 flap.sh 页面 SSR 提取, 统一淘汰)
   - flap 社交补查超时: 入场时社交抓取失败给 2 轮缓冲, 超时仍无社交则淘汰 (避免低质量 flap 币长期占位)
-  - 流动性从 >$1k 跌破 $100 (仅已毕业代币)
-  - 进度 < 1% 且币龄 > 2h (four.meme + flap, 均通过链上数据获取进度, flap 用 Portal getTokenV5)
-  - 进度 < 5% 且币龄 > 4h
-  - 进度从峰值跌 20 个百分点+ 且币龄 > 6h (热度消退, 加减法; 峰值持币≥50 的社区币放宽到 30 个百分点)
+  - 流动性跌破 $1k (仅已毕业代币)
+  - 进度阶梯淘汰: 币龄>1h进度<3%, >2h<7%, >4h<10%, >8h<15%
+  - 进度从峰值跌 40 个百分点 (加减法, 无币龄要求)
   - 币龄 > 15min 且最高持币数 < 3
   - 币龄 > 1h 且最高持币数 < 5
   - 币龄 > 2h 且最高持币数 < 8 (清理僵尸币)
   - 币龄 > 48h
-  - 价格突破: 峰值价格 ≥ 0.0001 → 标记为已突破, 跳过常规淘汰条件, 仅受币龄>48h淘汰
 
 精筛条件 (标签制, v14: 双动能驱动):
   基于 129 个 ≥3x 代币暴涨前信号剖解:
@@ -48,7 +46,7 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 双动能 (同一轮内): holders > 上一轮 AND price > 上一轮
   - 持币 ≥ 20 (过滤散户盘)
   - 仿盘 ≥ 3 (近48h内, 热门概念)
-  - 未崩盘 (近三期跌幅 < 30%)
+  - 未崩盘 (历史峰值跌幅 < 70%)
   - 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业 时跳过)
   - 首轮豁免: 无历史数据时, 持币≥30 + 进度≥30%/流动性≥$10k 视为有动能
   - 已毕业: 持币≥50 + 流动性≥$5k + 仿盘≥3 + 未崩盘 + 有动能
@@ -209,7 +207,7 @@ TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅过滤
 TAG_GRAD_MIN_HOLDERS = 50              # 已毕业: 持币≥50
 TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k
 # --- 通用标签 ---
-TAG_BASE_MAX_CRASH_PCT = 0.30         # 基础: 近三期最高点跌幅 < 30%
+TAG_BASE_MAX_CRASH_PCT = 0.70         # 基础: 历史峰值跌幅 < 70%
 TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
 # flap 社交豁免: flap 代币普遍无社交链接, 当持币数和进度足够时豁免社交要求
 TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 30   # flap 社交豁免: 持币数 ≥ 30
@@ -278,15 +276,15 @@ ELIM_HOLDERS_FLOOR = 10               # 持币数跌破 10
 ELIM_HOLDERS_PEAK_MIN = 30            # 持币数曾达到 30 才触发跌破淘汰
 ELIM_HOLDERS_DROP_PCT = 0.70          # 持币数从峰值跌 70% 淘汰 (清理僵尸币, 数据显示 99 个僵尸币占位)
 ELIM_HOLDERS_DROP_PEAK_MIN = 50       # 持币数曾达到 50 才触发跌幅淘汰 (避免误杀小币)
-ELIM_LIQ_FLOOR = 100                  # 流动性跌破 $100
-ELIM_LIQ_PEAK_MIN = 1000              # 流动性曾达到 $1000 才触发跌破淘汰
-ELIM_PROGRESS_MIN = 0.01              # 进度 < 1%
-ELIM_PROGRESS_AGE_HOURS = 2           # 进度<1%淘汰的币龄门槛
-ELIM_PROGRESS_MIN_MID = 0.05          # 进度 < 5%
-ELIM_PROGRESS_AGE_HOURS_MID = 4       # 进度<5%淘汰的币龄门槛
-ELIM_PROGRESS_DROP_ABS = 0.20         # 进度从峰值跌 20 个百分点淘汰 (热度消退, 加减法)
-ELIM_PROGRESS_DROP_ABS_RELAXED = 0.30 # 进度从峰值跌 30 个百分点淘汰 (峰值持币≥50 的社区币, 给更多缓冲)
-ELIM_PROGRESS_DROP_AGE_HOURS = 6      # 进度跌幅淘汰的币龄门槛 (给新币缓冲时间)
+ELIM_LIQ_FLOOR = 1000                 # 流动性跌破 $1k (仅已毕业)
+ELIM_PROGRESS_DROP_ABS = 0.40         # 进度从峰值跌 40 个百分点淘汰 (加减法, 无币龄要求)
+# 进度阶梯淘汰 (币龄越长, 容忍度越高)
+ELIM_PROGRESS_TIERS = [
+    (1.0, 0.03),    # 币龄 > 1h, 进度 < 3%
+    (2.0, 0.07),    # 币龄 > 2h, 进度 < 7%
+    (4.0, 0.10),    # 币龄 > 4h, 进度 < 10%
+    (8.0, 0.15),    # 币龄 > 8h, 进度 < 15%
+]
 ELIM_EARLY_PEAK_HOLDERS = 3           # 币龄>15min 最高持币数 < 3 淘汰
 ELIM_EARLY_AGE_MIN = 0.25             # 15 分钟 = 0.25h
 ELIM_MID_PEAK_HOLDERS = 5             # 币龄>1h 最高持币数 < 5 淘汰
@@ -294,10 +292,6 @@ ELIM_MID_AGE_HOURS = 1                # 1 小时
 ELIM_LATE_PEAK_HOLDERS = 8            # 币龄>2h 最高持币数 < 8 淘汰 (数据验证: 峰值持币8~9的代币偶有后续增长, 留出缓冲)
 ELIM_LATE_AGE_HOURS = 2               # 2 小时
 ELIM_PRICE_DROP_MIN_PRICE = 1e-7      # 价格暴跌保护: 当前价格低于此值视为 API 异常, 跳过价格跌幅淘汰
-
-# 价格突破阈值 (标记为已突破, 保留在队列中继续跟踪, 跳过常规淘汰条件, 仅受币龄>48h淘汰)
-# 已突破代币仍在队列中参与每轮数据更新, 前端同时出现在队列存活和已突破 tab
-BREAKTHROUGH_PRICE = 0.0001           # 峰值价格 ≥ 0.0001 标记为已突破
 
 # flap quote token 分类 (用于价格换算)
 # 零地址 = 原生 BNB, 需乘 BNB/USD; 稳定币 = 已是 USD 计价, 无需换算; 其他 = 非标代币计价
@@ -2727,15 +2721,13 @@ def elimination_check(queue: list[dict], now_ms: int,
     """
     淘汰检查: 对队列中代币定期检查, 永久淘汰弃盘币
     持币数: BSCScan 网页爬取 (已毕业 + detail返回0的) > detail API (未毕业) > 缓存
-    返回: (survivors, eliminated, breakthrough)
-      - breakthrough: 峰值价格突破 0.0001 的代币, 跳过常规淘汰条件, 仅受币龄>48h淘汰
+    返回: (survivors, eliminated)
     """
     survivors = []
     eliminated = []
-    breakthrough = []
 
     if not queue:
-        return survivors, eliminated, breakthrough
+        return survivors, eliminated
 
     # 1. 币龄淘汰 (无需 API)
     max_age_ms = MAX_AGE_HOURS * 3600 * 1000
@@ -2754,7 +2746,7 @@ def elimination_check(queue: list[dict], now_ms: int,
         log.info("淘汰: 币龄>%dh %d 个", MAX_AGE_HOURS, over_age_count)
 
     if not age_filtered:
-        return survivors, eliminated, breakthrough
+        return survivors, eliminated
 
     # 1b. 本地预淘汰: 用已有数据快速剔除明显垃圾币 (零 API 调用)
     # 注意: peakHolders==0 但进度>0 说明有真实买盘但 API 持币数据不准, 跳过预淘汰
@@ -2789,7 +2781,7 @@ def elimination_check(queue: list[dict], now_ms: int,
         log.info("淘汰: 本地预淘汰 %d 个 (持币数不足)", pre_elim_count)
 
     if not pre_filtered:
-        return survivors, eliminated, breakthrough
+        return survivors, eliminated
 
     # 2. DexScreener + four.meme detail + 已毕业代币持币数 并行查询
     addrs = [t["address"] for t in pre_filtered]
@@ -3001,28 +2993,8 @@ def elimination_check(queue: list[dict], now_ms: int,
         t["prevPrice"] = t.get("lastPrice", 0)
         t["lastPrice"] = current_price
 
-        # --- 价格突破标记: 峰值 ≥ 0.0001 → 标记为已突破, 跳过常规淘汰条件 ---
-        is_breakthrough = t.get("peakPrice", 0) >= BREAKTHROUGH_PRICE
-        if is_breakthrough:
-            if not t.get("breakthroughAt"):
-                t["breakthroughAt"] = now_ms
-                log.info("  🚀 价格突破 %s — 峰值 %.2e (标记, 保留队列)",
-                         t.get("name") or t["address"][:16], t["peakPrice"])
-            t["isBreakthrough"] = True
-            breakthrough.append(t)
-
         # --- 淘汰条件 ---
-        # 已突破代币仅受币龄 >48h 淘汰, 其他条件跳过
         elim_reason = None
-
-        if is_breakthrough:
-            if age_hours > MAX_AGE_HOURS:
-                elim_reason = f"币龄>{MAX_AGE_HOURS}h (已突破)"
-            if elim_reason:
-                eliminated.append({**t, "eliminatedAt": now_ms, "elimReason": elim_reason})
-            else:
-                survivors.append(t)
-            continue
 
         # 1. 价格从峰值跌 90%+ (增加异常值保护: 价格<1e-7 视为 API 垃圾数据, 跳过)
         peak = t.get("peakPrice", 0)
@@ -3048,21 +3020,17 @@ def elimination_check(queue: list[dict], now_ms: int,
             if pending_rounds >= FLAP_SOCIAL_PENDING_MAX_ROUNDS and t.get("socialCount", 0) < MIN_SOCIAL_COUNT:
                 elim_reason = f"flap社交补查超时 ({pending_rounds}轮未获取到社交)"
 
-        # 4. 流动性从 >$1k 跌破 $100 (仅已毕业代币, 未毕业流动性数据不准确)
+        # 4. 流动性跌破 $1k (仅已毕业)
         if not elim_reason and is_graduated:
-            if (t.get("peakLiquidity", 0) >= ELIM_LIQ_PEAK_MIN
-                    and current_liq < ELIM_LIQ_FLOOR):
-                elim_reason = f"流动性 ${t.get('peakLiquidity', 0):.0f}→${current_liq:.0f}"
+            if current_liq < ELIM_LIQ_FLOOR:
+                elim_reason = f"流动性跌破 $1k (${current_liq:.0f})"
 
-        # 5. 进度 < 1% 且币龄 > 2h (four.meme + flap, 均有进度数据)
+        # 5. 进度阶梯淘汰 (币龄越长, 容忍度越高)
         if not elim_reason:
-            if age_hours > ELIM_PROGRESS_AGE_HOURS and current_progress < ELIM_PROGRESS_MIN:
-                elim_reason = f"进度{current_progress * 100:.2f}% 币龄{age_hours:.1f}h"
-
-        # 5b. 进度 < 5% 且币龄 > 4h (four.meme + flap)
-        if not elim_reason:
-            if age_hours > ELIM_PROGRESS_AGE_HOURS_MID and current_progress < ELIM_PROGRESS_MIN_MID:
-                elim_reason = f"进度{current_progress * 100:.2f}% 币龄{age_hours:.1f}h"
+            for age_h, min_prog in ELIM_PROGRESS_TIERS:
+                if age_hours > age_h and current_progress < min_prog:
+                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{age_hours:.1f}h (阈值{min_prog*100:.0f}%)"
+                    break
 
         # 6. 币龄>15min 最高持币数 < 3
         if not elim_reason:
@@ -3092,16 +3060,11 @@ def elimination_check(queue: list[dict], now_ms: int,
                 elim_reason = (f"持币数跌{(1 - current_holders / peak_h) * 100:.0f}% "
                                f"({peak_h}→{current_holders})")
 
-        # 10. 进度从峰值跌 20/30 个百分点且币龄 > 6h (热度消退, four.meme + flap, 加减法)
-        #     峰值持币≥50 的社区币用宽松阈值 30 个百分点, 其他用 20 个百分点
+        # 10. 进度从峰值跌 40 个百分点 (加减法, 无币龄要求)
         if not elim_reason:
             peak_prog = t.get("peakProgress", 0)
-            peak_h = t.get("peakHolders", 0)
-            drop_abs = ELIM_PROGRESS_DROP_ABS_RELAXED if peak_h >= ELIM_HOLDERS_DROP_PEAK_MIN else ELIM_PROGRESS_DROP_ABS
             prog_diff = peak_prog - current_progress
-            if (age_hours > ELIM_PROGRESS_DROP_AGE_HOURS
-                    and peak_prog > 0.10
-                    and prog_diff >= drop_abs):
+            if prog_diff >= ELIM_PROGRESS_DROP_ABS:
                 elim_reason = (f"进度跌{prog_diff * 100:.0f}个百分点 "
                                f"({peak_prog * 100:.1f}%→{current_progress * 100:.1f}%)")
 
@@ -3115,10 +3078,7 @@ def elimination_check(queue: list[dict], now_ms: int,
         log.info("淘汰: 条件淘汰 %d 个", elim_count)
         for e in eliminated[-elim_count:]:
             log.info("  ✗ %s — %s", e.get("name") or e["address"][:16], e["elimReason"])
-    if breakthrough:
-        log.info("价格突破: %d 个代币 (保留队列, 仅受币龄淘汰)", len(breakthrough))
-
-    return survivors, eliminated, breakthrough
+    return survivors, eliminated
 
 
 # ===================================================================
@@ -3394,7 +3354,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
 
     v14 条件 (全部满足, AND):
       1. 仿盘 ≥ 3 (近48h内)
-      2. 未崩盘 (近三期跌幅 < 30%)
+      2. 未崩盘 (历史峰值跌幅 < 70%)
       3. 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业)
       4a. 未毕业: 双动能 (holders > 上一轮 AND price > 上一轮)
       4b. 已毕业: 持币≥50 + 流动性≥$5k
@@ -3418,16 +3378,11 @@ def tag_filter(candidates: list[dict], now_ms: int,
         if cc_count < TAG_DM_MIN_COPYCAT:
             continue
 
-        # === 未崩盘 ===
+        # === 未崩盘 (历史峰值跌幅 < 70%) ===
         if current_price <= 0:
             continue
-        price_hist = t.get("priceHistory", [])
-        recent_prices = [current_price]
-        for p in price_hist[-2:]:
-            if p and p > 0:
-                recent_prices.append(p)
-        recent_high = max(recent_prices)
-        crash_pct = 1 - current_price / recent_high if recent_high > 0 else 0
+        peak_price = t.get("peakPrice", 0)
+        crash_pct = 1 - current_price / peak_price if peak_price > 0 else 0
         if crash_pct >= TAG_BASE_MAX_CRASH_PCT:
             continue
 
@@ -4002,10 +3957,10 @@ def scan_once(cfg: dict) -> None:
         if top_holders_map:
             log.info("Top Holders 采集: %d/%d 个代币有数据", len(top_holders_map), len(new_addrs))
 
-    # Step 3: 淘汰检查 (v6: 返回 survivors, eliminated, breakthrough)
+    # Step 3: 淘汰检查
     log.info("\n--- Step 3: 淘汰检查 ---")
     bscscan_key = cfg.get("bscscan_api_key", "")
-    survivors, eliminated, breakthrough_tokens = elimination_check(queue_state["tokens"], now_ms, bscscan_key)
+    survivors, eliminated = elimination_check(queue_state["tokens"], now_ms, bscscan_key)
     queue_state["tokens"] = survivors
     queue_state["eliminated"].extend([{
         "address": e["address"], "name": e.get("name", ""),
@@ -4013,28 +3968,6 @@ def scan_once(cfg: dict) -> None:
         "elimReason": e["elimReason"], "eliminatedAt": e["eliminatedAt"],
         "createdAt": e.get("createdAt", 0),
     } for e in eliminated])
-
-    # 突破代币已保留在 survivors 中, 持币数在淘汰检查中已更新
-    # 提取突破代币用于前端展示 (同时出现在队列存活和已突破 tab)
-    # 新突破代币持币数刷新: 刚毕业时 detail API 返回 holders=0, 用 BSCScan 补查
-    new_bt = [t for t in breakthrough_tokens if not t.get("_bt_persisted")]
-    if new_bt:
-        bt_addrs = [t["address"] for t in new_bt]
-        log.info("新突破代币持币数刷新: BSCScan 查询 %d 个代币...", len(new_bt))
-        bt_holders = graduated_holder_counts(bt_addrs)
-        for t in new_bt:
-            rh = bt_holders.get(t["address"])
-            if rh is not None and rh > 0:
-                old_h = t.get("holders", 0)
-                t["holders"] = rh
-                t["peakHolders"] = max(t.get("peakHolders", 0), rh)
-                if rh != old_h:
-                    log.info("  突破持币数刷新 %s: %d→%d (BSCScan)",
-                             t.get("name") or t["address"][:16], old_h, rh)
-            elif t.get("holders", 0) == 0 and t.get("peakHolders", 0) > 0:
-                t["holders"] = t["peakHolders"]
-                log.info("  突破持币数兜底 %s: 0→%d (用 peakHolders)",
-                         t.get("name") or t["address"][:16], t["peakHolders"])
 
     # 入场被拒的代币也记入 eliminated (避免重复入场筛)
     queue_state["eliminated"].extend([{
@@ -4049,7 +3982,7 @@ def scan_once(cfg: dict) -> None:
     # Step 3b: 更新开发者画像 (诈骗/优质开发者自动收集)
     update_deployer_reputation(queue_state, survivors, eliminated)
 
-    log.info("淘汰后: %d 个存活, %d 个淘汰, %d 个突破", len(survivors), len(eliminated), len(breakthrough_tokens))
+    log.info("淘汰后: %d 个存活, %d 个淘汰", len(survivors), len(eliminated))
 
     # Step 4: 仿盘检测 + 精筛
     log.info("\n--- Step 4: 仿盘检测 + 精筛 ---")
