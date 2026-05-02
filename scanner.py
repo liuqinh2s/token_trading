@@ -3,13 +3,18 @@ BSC Token Scanner v6 — 极速扫描, 以快致胜
 数据源: BSC RPC (链上事件) + four.meme API (详情) + DexScreener (价格/涨跌幅/Boost) + GeckoTerminal (持币数)
 代币来源: four.meme + flap (BSC 链上两大代币发射平台, 均使用 bonding curve 机制)
 
-v6 架构: 极速扫描 (15 分钟一轮)
+v15 架构: 标签制精筛 (基础标签 AND + 加分标签排优先级)
   1. 链上发现 (~1s): BSC RPC eth_getLogs → four.meme + flap 合约 TokenCreated 事件 → 新代币地址
   2. 入场筛 (~数秒): four.meme Detail API + flap.sh 页面 SSR 社交数据 + 链上 totalSupply → 淘汰无社交 / 总量≠10亿 / 币龄>5min
   3. 淘汰检查 (~数秒): DexScreener 批量查价(含涨跌幅/Boost) + GeckoTerminal 持币数 + Detail API → 永久淘汰弃盘币
   3b. K线修正: 对持币≥50 的存活代币拉 GT 15min K线 → 修正 peakPrice + 记录 klineHigh/klineLow (过山车检测)
-  4. 精筛 (瞬时): 潜伏型筛选, 从存活币中找蓄势待发信号 (含过山车检测: K线振幅≥3x 且回撤≥50% 排除)
-  5. 仿盘检测: 本地统计同名代币数量 (零 API 调用), 有大量仿盘(≥3)则标记
+  4. 精筛 (瞬时): 标签制精筛, 基础标签全部满足(AND) + 加分标签排优先级
+  5. 仿盘检测: 本地统计同名代币数量 (零 API 调用)
+
+v15 精筛策略 (标签制: 基础标签 + 加分标签):
+  每个维度按币龄精细化分层, 币龄越长要求越高
+  基础标签: 持币数/进度/流动性/K线/社交/创建者/币龄 — 全部满足才通过, 目标 ~30/天
+  加分标签: 仿盘/社交质量/买压/成交额/持仓占比/优质开发者/持币≥1k/流动性≥30k/Boost — 排优先级
 
 砍掉的慢环节 (v5 → v6):
   - GeckoTerminal K线 (每个代币 2s+)
@@ -36,20 +41,24 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 币龄 > 2h 且最高持币数 < 8 (清理僵尸币)
   - 币龄 > 48h
 
-精筛条件 (标签制, v14: 双动能驱动):
-  基于 129 个 ≥3x 代币暴涨前信号剖解:
-    核心发现: "双动能"是唯一强区分信号 — 同一轮内 holders↑ + price↑ 同时发生
-    89/129 winner (69%) 在暴涨前出现双动能信号, 且 87.6% 的信号后续有更大涨幅
-    仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
-    价格信号比持币信号更领先 — winner 往往先拉盘、后吸引持币
-  双动能条件 (全部满足, AND):
-  - 双动能 (同一轮内): holders > 上一轮 AND price > 上一轮
-  - 持币 ≥ 20 (过滤散户盘)
-  - 仿盘 ≥ 3 (近48h内, 热门概念)
-  - 未崩盘 (历史峰值跌幅 < 70%)
-  - 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业 时跳过)
-  - 首轮豁免: 无历史数据时, 持币≥30 + 进度≥30%/流动性≥$10k 视为有动能
-  - 已毕业: 持币≥50 + 流动性≥$5k + 仿盘≥3 + 未崩盘 + 有动能
+精筛条件 (v15: 标签制 — 基础标签 AND + 加分标签排优先级):
+
+  基础标签 (全部满足, AND, 每个维度均按币龄精细化分层):
+  - 持币合格 (币龄阶梯): 15min≥10 → 30min≥20 → 1h≥50 → 2h≥80 → 4h≥120 → 8h≥150 → 16h≥200
+  - 进度合格 (币龄阶梯, 未毕业): 15min≥2% → 30min≥5% → 1h≥8% → 2h≥15% → 4h≥30% → 8h≥50% → 16h≥70%
+  - 流动性合格 (已毕业, 币龄阶梯): 15min≥$1k → 30min≥$2k → 1h≥$3k → 4h≥$5k → 8h≥$8k → 16h≥$10k
+  - K线合格 (币龄阶梯, 防追高): 15min≤200% → 1h≤400% → 4h≤800% → 8h≤1000%
+  - 社交合格: 币龄≥15min 后 ≥1
+  - 创建者合格: 不在黑名单
+  - 币龄合格: ≤48h
+
+  加分标签 (通过基础后计算, 排优先级):
+  - 仿盘加分: ≥2h且仿盘≥3(+1) → ≥8h且仿盘≥5(+2)
+  - 社交质量: 推特账号(非推文)+1, TG群+1
+  - 1h买压: 强买压(买/卖≥2x)+2, 强卖压(买/卖≤0.5x)-2
+  - 成交额: ≥$10k(+1), ≥$5k(+0.5)
+  - 持仓合理: 20%≤Top10≤85%(+2)
+  - 优质开发者+3, Boost推广+1
 """
 
 from __future__ import annotations
@@ -170,57 +179,119 @@ BINANCE_HEADERS = {
     "User-Agent": "binance-web3/1.1 (Skill)",
 }
 
-# 精筛阈值 (标签制: 基础标签 AND + 单动能触发)
+# ================================================================
+#  精筛阈值 — 标签制 (基础标签 AND + 加分标签排优先级)
+#
+#  v15 架构: 每个数据维度按币龄精细化分层, 币龄越长要求越高
+#  基础标签: 全部满足才通过精筛, 目标每天~30个 (AND 逻辑)
+#  加分标签: 给通过基础标签的代币排优先级, 高优先级优先买入
+#  持仓队列: 最多 10 个, 每仓 1%
+#
+#  v14 核心发现 (129 个 ≥3x 代币暴涨前信号剖解):
+#    "双动能"(holders↑+price↑同一轮)是唯一强区分信号
+#    89/129 (69%) winner 暴涨前出现双动能
+#    价格信号比持币信号更领先 — winner 往往先拉盘、后吸引持币
+#
+#  阈值设定方法论:
+#    每个维度都与币龄正相关 — 币龄越长, 要求越高
+#    同一 tier 内的条件取最严格的匹配 (max age where condition applies)
+#    币龄<15m 的代币不做任何基础标签检查 (给刚出生的代币缓冲期)
+# ================================================================
 MAX_AGE_HOURS = 48
-SCAN_INTERVAL_MIN = 15                 # 15 分钟一轮
-TOTAL_SUPPLY = 1_000_000_000           # 10亿
-# --- 精筛: 标签制 (基础标签全部满足 + 单动能触发) ---
-# 数据基础: 1308轮扫描, 14天全量回测 (2026-04-17 ~ 2026-05-01)
-# v10→v11 核心改进 (数据驱动, 50个精筛代币追踪分析):
-#   问题: 精筛通过代币亏损率64%, four.meme未毕业币亏损率91.7%
-#   发现: flap胜率远高于four.meme; 已毕业>未毕业; 持币越多越安全
-#   改动: 分来源设置门槛 + 收紧崩盘检测 + 新增24h跌幅过滤
-#   效果: 胜率35%→38.7%, 亏损率65%→61.3%, 平均最高涨幅+110%→+131%
-#         精筛数量705→573 (减少19%), 被拦132个中126个亏损 (精准率95.5%)
-#
-# v14 精筛策略 (数据驱动, 基于 129 个 ≥3x 代币暴涨前信号剖解):
-#   核心发现: "双动能"(holders↑+price↑同一轮)是唯一强区分信号
-#   89/129 (69%) winner 暴涨前出现双动能, 87.6%的信号后续有更大涨幅
-#   仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
-#   价格信号比持币信号更领先 — winner 往往先拉盘、后吸引持币
-#
-# 精筛条件 (v14: 双动能驱动):
-#   - 仿盘 ≥ 3 (近48h内)
-#   - 未崩盘 (近三期跌幅 < 30%)
-#   - 社交 ≥ 1 (flap 豁免)
-#   - 双动能: holders > 上一轮 AND price > 上一轮 (首轮豁免)
-#   - 持币 ≥ 20
-#   - 已毕业: 持币≥50 + 流动性≥$5k
-#   - FM未毕业: 24h跌幅 ≥ -20%
-#
-# --- 未毕业门槛 (v14: 双动能驱动) ---
-# 核心: 同一轮内 holders↑ AND price↑ 同时发生
-TAG_DM_MIN_HOLDERS = 20               # 双动能: 最低持币数 (过滤散户盘)
-TAG_DM_MIN_COPYCAT = 3                # 双动能: 最低仿盘数 (近48h内, 热门概念)
-TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅过滤
-# --- 已毕业门槛 (v13保持) ---
-TAG_GRAD_MIN_HOLDERS = 50              # 已毕业: 持币≥50
-TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k
-# --- 通用标签 ---
-TAG_BASE_MAX_CRASH_PCT = 0.70         # 基础: 历史峰值跌幅 < 70%
-TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
-# flap 社交豁免: flap 代币普遍无社交链接, 当持币数和进度足够时豁免社交要求
-TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 30   # flap 社交豁免: 持币数 ≥ 30
-TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.30  # flap 社交豁免: 进度 ≥ 30% (与精筛门槛对齐)
-# flap 社交 pending 模式: 入场时社交抓取失败的 flap 代币标记为 pending, 给 2 轮缓冲补查
+SCAN_INTERVAL_MIN = 15
+TOTAL_SUPPLY = 1_000_000_000
+
+# --- 基础标签: 持币数 (age → min_holders) ---
+# 币龄越长持币数要求越高, 反映热度 & 共识程度
+# 注: 持币数可造假, 不是决定性因素, 过关即可
+TAG_HOLDERS_TIERS = [
+    (0.25, 10),   # ≥15min:  ≥10
+    (0.5,  20),   # ≥30min:  ≥20
+    (1.0,  50),   # ≥1h:     ≥50
+    (2.0,  80),   # ≥2h:     ≥80
+    (4.0,  120),  # ≥4h:     ≥120
+    (8.0,  150),  # ≥8h:     ≥150
+    (16.0, 200),  # ≥16h:    ≥200
+]
+
+# --- 基础标签: 进度 (未毕业, age → min_progress) ---
+# 进度反映项目方实力, 迟迟不涨说明项目方实力不够
+TAG_PROGRESS_TIERS = [
+    (0.25, 0.02),  # ≥15min:  ≥2%
+    (0.5,  0.05),  # ≥30min:  ≥5%
+    (1.0,  0.08),  # ≥1h:     ≥8%
+    (2.0,  0.15),  # ≥2h:     ≥15%
+    (4.0,  0.30),  # ≥4h:     ≥30%
+    (8.0,  0.50),  # ≥8h:     ≥50%
+    (16.0, 0.70),  # ≥16h:    ≥70%
+]
+
+# --- 基础标签: 流动性 (已毕业, age → min_liquidity) ---
+# 币龄越长流动性要求越高, 反映项目方实力
+TAG_LIQUIDITY_TIERS = [
+    (0.25, 1000),  # ≥15min:  ≥$1k
+    (0.5,  2000),  # ≥30min:  ≥$2k
+    (1.0,  3000),  # ≥1h:     ≥$3k
+    (4.0,  5000),  # ≥4h:     ≥$5k
+    (8.0,  8000),  # ≥8h:     ≥$8k
+    (16.0, 10000), # ≥16h:    ≥$10k
+]
+
+# --- 基础标签: K线 (防追高, age → max_price_change) ---
+# 涨幅过大说明可能追高或正在崩盘途中
+TAG_KLINE_TIERS = [
+    (0.25, 2.0),   # ≥15min:  涨幅 ≤ 200%
+    (1.0,  4.0),   # ≥1h:     涨幅 ≤ 400%
+    (4.0,  8.0),   # ≥4h:     涨幅 ≤ 800%
+    (8.0,  10.0),  # ≥8h:     涨幅 ≤ 1000%
+]
+
+# --- 基础标签: 关联社交媒体 ---
+TAG_SOCIAL_MIN_AGE = 0.25        # 币龄≥15min 才检查社交
+TAG_SOCIAL_MIN_COUNT = 1         # 至少 1 个关联社交媒体
+# flap 社交豁免: flap 代币普遍无社交链接, 当持币和进度足够时豁免社交要求
+TAG_FLAP_SOCIAL_EXEMPT_HOLDERS = 30
+TAG_FLAP_SOCIAL_EXEMPT_PROGRESS = 0.30
 FLAP_SOCIAL_PENDING_MAX_ROUNDS = 2    # flap 社交 pending 最大缓冲轮数
-# 单动能: 最近3轮内持币数有增长 或 价格有上涨
-# 首轮豁免: 首轮入队无历史数据算不出动能, 但自身数据足够强时豁免动能要求
-TAG_FIRST_ROUND_MIN_HOLDERS = 30      # 首轮豁免: 持币数 ≥ 30
-TAG_FIRST_ROUND_MIN_PROGRESS = 0.30   # 首轮豁免: 进度 ≥ 30% (与精筛门槛对齐)
-TAG_FIRST_ROUND_MIN_LIQUIDITY = 10000 # 首轮豁免: 流动性 ≥ $10k
-MOMENTUM_WINDOW = 3                    # 动能检测窗口: 最近3轮
-COPYCAT_MARK_MIN = 3                   # 仿盘数 ≥3 标记 (仅标记, 不排除)
+
+# --- 基础标签: 创建者地址 / 代币地址 ---
+# 创建者不在黑名单 (入场筛已过滤)
+# 代币不在诈骗黑名单 (入场筛已过滤)
+
+# --- 加分标签: 仿盘数 (age → bonus_score, 不排除只加分) ---
+COPYCAT_BONUS_TIERS = [
+    (2.0, 3, 1),    # ≥2h: 仿盘≥3 → +1
+    (8.0, 5, 2),    # ≥8h: 仿盘≥5 → +2
+]
+COPYCAT_MARK_MIN = 3    # 仿盘数 ≥3 在前端标记
+
+# --- 加分标签: 社交质量 (bonus) ---
+SOCIAL_TWITTER_FOLLOWERS_MIN = 100    # 推特关注 ≥100
+SOCIAL_TG_MEMBERS_MIN = 100           # TG 群成员 ≥100
+
+# --- 加分标签: 1h买卖比 (bonus) ---
+BUY_PRESSURE_RATIO = 2.0     # buys/sells ≥ 2x → 强买压
+SELL_PRESSURE_RATIO = 0.5    # buys/sells ≤ 0.5x → 强卖压 (扣分项)
+
+# --- 加分标签: TOP10 持仓占比 ---
+TOP10_CONCENTRATION_MAX = 0.85   # >85% 庄家控盘
+TOP10_CONCENTRATION_MIN = 0.20   # <20% 持仓太分散
+
+# --- 加分标签: 持币数 ≥1000 ---
+BONUS_HOLDERS_1K = 1000          # 持币数 ≥ 1000 → 加分
+
+# --- 加分标签: 流动性 ≥30k ---
+BONUS_LIQUIDITY_30K = 30000     # 流动性 ≥ $30k → 加分
+
+# --- 加分标签权重 ---
+BONUS_WEIGHT_COPYCAT = 1
+BONUS_WEIGHT_SOCIAL_QUALITY = 2
+BONUS_WEIGHT_BUY_PRESSURE = 2
+BONUS_WEIGHT_VOLUME = 1
+BONUS_WEIGHT_QUALITY_DEPLOYER = 3
+BONUS_WEIGHT_BOOST = 1
+BONUS_WEIGHT_HOLDERS_1K = 2      # 持币≥1k
+BONUS_WEIGHT_LIQUIDITY_30K = 2   # 流动性≥$30k
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
 # Gas 大盘指数: ETH/BSC gasUsedRatio + SOL TPS, 反映多链整体活跃度
 # gasUsedRatio: 0~1, 越高=区块越满=链上越活跃; SOL TPS 归一化到 0~1
@@ -268,7 +339,7 @@ FAKE_NAME_BLACKLIST = {
 }
 
 # 精筛后防线阈值
-QUALITY_MAX_TOP10_CONCENTRATION = 0.85 # 精筛后防线: Top10 持仓占比 > 85% 排除 (庄家控盘)
+# 精筛后防线阈值 — 使用 TOP10_CONCENTRATION_MAX (在上方加分标签区定义)
 
 # 淘汰阈值
 ELIM_PRICE_DROP_PCT = 0.90             # 价格从峰值跌 90%
@@ -824,6 +895,199 @@ def flap_batch_details(tokens: list[dict]) -> dict[str, dict]:
             if detail:
                 results[addr] = detail
     return results
+
+
+# ===================================================================
+#  社交质量查询 — Twitter 粉丝数 + TG 群成员数
+# ===================================================================
+
+
+def _extract_twitter_username(url: str) -> str | None:
+    """从推特 URL 中提取用户名"""
+    if not url:
+        return None
+    m = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)(?:/|$|\?)', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_telegram_username(url: str) -> str | None:
+    """从 TG URL 中提取用户名"""
+    if not url:
+        return None
+    m = re.search(r't\.me/([A-Za-z0-9_]+)(?:/|$|\?)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'telegram\.(?:me|dog)/([A-Za-z0-9_]+)(?:/|$|\?)', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _fetch_twitter_followers(username: str) -> int | None:
+    """
+    通过抓取 X 个人页面的嵌入式 JSON 数据获取粉丝数 (无需认证)。
+    X 服务端渲染 HTML 中包含 follow 按钮的 JSON 配置, 里面有 followers_count。
+    返回粉丝数, 失败返回 None。
+    """
+    _ensure_sessions()
+    try:
+        r = _gt_session.get(
+            f"https://x.com/{username}",
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html",
+            },
+        )
+        if r.status_code != 200:
+            return None
+        m = re.search(r'"followers_count":(\d+)', r.text)
+        if m:
+            return int(m.group(1))
+    except Exception as e:
+        log.debug("Twitter 粉丝数查询失败 [%s]: %s", username, e)
+    return None
+
+
+def _fetch_telegram_members(username: str) -> int | None:
+    """
+    通过抓取 Telegram 公共预览页获取群成员/频道订阅数。
+    公共页面 HTML 中包含 'tgme_page_extra' 元数据。
+    返回成员数, 失败返回 None。
+    """
+    _ensure_sessions()
+    try:
+        r = _gt_session.get(
+            f"https://t.me/{username}",
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html",
+            },
+        )
+        if r.status_code != 200:
+            return None
+        html = r.text
+        m = re.search(
+            r'<div[^>]+class="tgme_page_extra"[^>]*>([^<]+)</div>',
+            html,
+        )
+        if not m:
+            return None
+        text = m.group(1).strip().lower()
+        num_str = re.sub(r'[^\d]', '', text.split()[0])
+        if num_str:
+            return int(num_str)
+    except Exception as e:
+        log.debug("TG 成员数查询失败 [%s]: %s", username, e)
+    return None
+
+
+def batch_check_social_quality(candidates: list[dict]) -> None:
+    """
+    并行查询推特粉丝数和 TG 群成员数, 写入候选代币的 _social_quality 字段。
+    - Twitter: 非推文链接且有粉丝数≥100 → 标记质量好
+    - TG: 有成员数≥100 → 标记质量好
+    写入字段 (不调用则默认为 None):
+      _tw_followers: int | None
+      _tg_members: int | None
+      _social_quality_good: bool (任一渠道≥100)
+    """
+    if not candidates:
+        return
+
+    # 收集需要查询的社交链接
+    tw_usernames = {}
+    tg_usernames = {}
+    for t in candidates:
+        social_links = t.get("socialLinks", {})
+        twitter_url = social_links.get("twitter", "")
+        tg_url = social_links.get("telegram", "")
+
+        if twitter_url and "/status/" not in twitter_url:
+            uname = _extract_twitter_username(twitter_url)
+            if uname:
+                tw_usernames.setdefault(uname, set()).add(t["address"])
+
+        if tg_url:
+            uname = _extract_telegram_username(tg_url)
+            if uname:
+                tg_usernames.setdefault(uname, set()).add(t["address"])
+
+    if not tw_usernames and not tg_usernames:
+        return
+
+    tw_results = {}
+    tg_results = {}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        tw_futures = {
+            pool.submit(_fetch_twitter_followers, uname): uname
+            for uname in tw_usernames
+        }
+        for f in as_completed(tw_futures):
+            uname = tw_futures[f]
+            try:
+                count = f.result()
+                if count is not None:
+                    tw_results[uname] = count
+            except Exception:
+                pass
+
+        tg_futures = {
+            pool.submit(_fetch_telegram_members, uname): uname
+            for uname in tg_usernames
+        }
+        for f in as_completed(tg_futures):
+            uname = tg_futures[f]
+            try:
+                count = f.result()
+                if count is not None:
+                    tg_results[uname] = count
+            except Exception:
+                pass
+
+    for t in candidates:
+        social_links = t.get("socialLinks", {})
+        twitter_url = social_links.get("twitter", "")
+        tg_url = social_links.get("telegram", "")
+
+        tw_count = None
+        tg_count = None
+
+        if twitter_url and "/status/" not in twitter_url:
+            uname = _extract_twitter_username(twitter_url)
+            if uname and uname in tw_results:
+                tw_count = tw_results[uname]
+
+        if tg_url:
+            uname = _extract_telegram_username(tg_url)
+            if uname and uname in tg_results:
+                tg_count = tg_results[uname]
+
+        t["_tw_followers"] = tw_count
+        t["_tg_members"] = tg_count
+        good = (
+            (tw_count is not None and tw_count >= 100)
+            or (tg_count is not None and tg_count >= 100)
+        )
+        t["_social_quality_good"] = good
+
+    tw_checked = len(tw_results)
+    tg_checked = len(tg_results)
+    tw_good = sum(1 for v in tw_results.values() if v >= 100)
+    tg_good = sum(1 for v in tg_results.values() if v >= 100)
+    if tw_checked or tg_checked:
+        log.info("社交质量: 推特 %d 个 (%d 达标≥100), TG %d 个 (%d 达标≥100)",
+                 tw_checked, tw_good, tg_checked, tg_good)
 
 
 def flap_get_token_states(addresses: list[str]) -> dict[str, dict]:
@@ -3342,155 +3606,236 @@ def calc_market_sentiment(queue: list[dict], queue_state: dict,
     return result
 
 
+def _age_tier_match(age_hours: float, tiers: list[tuple]) -> float:
+    """
+    币龄阶梯匹配: 找到 age_hours 满足的最高 tier 阈值。
+    tiers: [(age_threshold, value), ...] 按 age 升序排列
+    返回对应的 value; age 未达到任何 tier 时返回 0 (或第一个 tier 的值)
+    """
+    result = tiers[0][1] if tiers else 0
+    for age_th, val in tiers:
+        if age_hours >= age_th:
+            result = val
+    return result
+
+
+def _age_tier_match_bonus(age_hours: float, tiers: list[tuple]) -> int:
+    """
+    仿盘加分阶梯: 找到满足条件的最高 bonus score
+    tiers: [(age_threshold, count_threshold, bonus_score), ...]
+    """
+    best_score = 0
+    for age_th, cnt_th, score in tiers:
+        if age_hours >= age_th:
+            best_score = max(best_score, score)
+    return best_score
+
+
 def tag_filter(candidates: list[dict], now_ms: int,
                market_sentiment: dict | None = None) -> list[dict]:
     """
-    标签制精筛 — 双动能驱动 (v14)
+    标签制精筛 — v15: 基础标签(AND) + 加分标签(优先级排序)
 
-    基于 129 个 ≥3x 代币暴涨前信号剖解:
-      核心发现: "双动能"是唯一强区分信号 — 同一轮内 holders↑ + price↑ 同时发生
-      89/129 (69%) winner 在暴涨前出现双动能信号, 87.6% 的信号后续有更大涨幅
-      仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
+    基础标签 (全部满足才通过, 目标 ~30/天):
+      1. 持币合格: 币龄阶梯持币数检查
+      2. 进度/流动性合格: 未毕业看进度阶梯, 已毕业看流动性阶梯
+      3. K线合格: 币龄阶梯涨幅检查 (防追高)
+      4. 社交合格: 币龄≥15min 后至少 1 个社交媒体
+      5. 创建者/代币合格: 不在诈骗黑名单 (入场筛已过滤)
+      6. 币龄合格: ≤ 48h
 
-    v14 条件 (全部满足, AND):
-      1. 仿盘 ≥ 3 (近48h内)
-      2. 未崩盘 (历史峰值跌幅 < 70%)
-      3. 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业)
-      4a. 未毕业: 双动能 (holders > 上一轮 AND price > 上一轮)
-      4b. 已毕业: 持币≥50 + 流动性≥$5k
-      5. FM未毕业 24h跌幅 ≥ -20%
-      6. 首轮动能豁免: 无历史时持币≥30 + 进度≥30%/流动性≥$10k
+    加分标签 (通过基础标签后计算, 排优先级):
+      - 仿盘加分
+      - 社交质量: 推特账号(非推文) / TG群 + 关注≥100额外加分
+      - 1h买压
+      - 成交额
+      - Top10持仓占比合理
+      - 优质开发者 (发过 10x+ 代币)
+      - 持币≥1k
+      - 流动性≥$30k
+      - Boost推广
+
+    返回按加分总分降序排列的精筛结果
     """
     results = []
 
     for t in candidates:
+        addr = t.get("address", "")
         current_price = t.get("price", 0)
+        if current_price <= 0:
+            continue
+
         holders = t.get("holders", 0)
-        name = t.get("name") or t.get("address", "")[:16]
+        name = t.get("name") or addr[:16]
         progress = t.get("progress", 0)
         liquidity = t.get("liquidity", 0)
         is_graduated = progress >= 1.0
         source = t.get("source", "")
-
-        # === 仿盘 ≥ 3 ===
-        cc = t.get("copycat", {})
-        cc_count = cc.get("count", 0) if cc else 0
-        if cc_count < TAG_DM_MIN_COPYCAT:
-            continue
-
-        # === 未崩盘 (历史峰值跌幅 < 70%) ===
-        if current_price <= 0:
-            continue
+        is_flap = source == "flap"
+        age_hours = (now_ms - t.get("createdAt", 0)) / 3600000
         peak_price = t.get("peakPrice", 0)
-        crash_pct = 1 - current_price / peak_price if peak_price > 0 else 0
-        if crash_pct >= TAG_BASE_MAX_CRASH_PCT:
-            continue
 
-        # === 社交 ===
+        basic_pass = True
+        basic_fail_reasons = []
+
+        # ==================== 基础标签 1: 持币合格 ====================
+        min_holders = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
+        if holders < min_holders:
+            basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{age_hours:.1f}h)")
+            basic_pass = False
+
+        # ==================== 基础标签 2: 进度/流动性合格 ====================
+        if is_graduated:
+            min_liquidity = _age_tier_match(age_hours, TAG_LIQUIDITY_TIERS)
+            if liquidity < min_liquidity:
+                basic_fail_reasons.append(f"毕业流动性${liquidity:.0f}<${min_liquidity:.0f}(币龄{age_hours:.1f}h)")
+                basic_pass = False
+        else:
+            min_progress = _age_tier_match(age_hours, TAG_PROGRESS_TIERS)
+            if progress < min_progress:
+                basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{age_hours:.1f}h)")
+                basic_pass = False
+
+        # ==================== 基础标签 3: K线合格 (防追高) ====================
+        if peak_price > 0 and current_price > 0:
+            price_change = current_price / peak_price - 1
+            max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
+            if price_change > max_change:
+                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{age_hours:.1f}h)")
+                basic_pass = False
+
+        # ==================== 基础标签 4: 社交合格 ====================
         social_count = t.get("socialCount", 0)
-        if social_count < TAG_BASE_MIN_SOCIAL:
-            is_flap = t.get("source") == "flap"
+        if age_hours >= TAG_SOCIAL_MIN_AGE and social_count < TAG_SOCIAL_MIN_COUNT:
             flap_exempt = (is_flap
                            and holders >= TAG_FLAP_SOCIAL_EXEMPT_HOLDERS
                            and (is_graduated or progress >= TAG_FLAP_SOCIAL_EXEMPT_PROGRESS))
             if not flap_exempt:
-                continue
+                basic_fail_reasons.append(f"无社交媒体(币龄{age_hours:.1f}h)")
+                basic_pass = False
 
-        # === 已毕业 / 未毕业 ===
-        h_delta = 0
-        is_first_round = False
-        first_round_strong = False
-        if is_graduated:
-            if holders < TAG_GRAD_MIN_HOLDERS:
-                continue
-            if liquidity < TAG_BASE_MIN_LIQUIDITY:
-                continue
-            path = "graduated"
-            has_momentum = True  # 已毕业不卡动能
-        else:
-            # 未毕业: 双动能 (holders↑ AND price↑, 首轮豁免)
-            h_hist = t.get("holdersHistory", [])
-            holders_up = False
-            price_up = False
-            h_delta = 0
-
-            if h_hist and len(h_hist) >= 2 and h_hist[-2] > 0:
-                h_delta = holders - h_hist[-2]
-                holders_up = h_delta > 0
-
-            last_price = t.get("lastPrice", 0)
-            if last_price > 0 and current_price > last_price:
-                price_up = True
-
-            # 双动能: 必须 holders↑ AND price↑
-            dual_momentum = holders_up and price_up
-
-            # 首轮豁免: 无历史数据但自身够强
-            is_first_round = not h_hist or len(h_hist) <= 1
-            first_round_strong = False
-            if is_first_round:
-                first_round_strong = (holders >= TAG_FIRST_ROUND_MIN_HOLDERS
-                                      and progress >= TAG_FIRST_ROUND_MIN_PROGRESS)
-
-            if not (dual_momentum or first_round_strong):
-                continue
-            path = "dual" if dual_momentum else "first_round"
-
-            # 持币≥20
-            if holders < TAG_DM_MIN_HOLDERS:
-                continue
-
-        # === FM未毕业 24h跌幅过滤 ===
-        if source != "flap" and not is_graduated:
-            price_change_h24 = t.get("priceChangeH24", 0) or 0
-            if price_change_h24 < TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24:
-                continue
-
-        # === 全部通过 ===
-        # 收集信号标签 (仅用于展示, 不影响筛选)
-        signal_tags = []
-        # 优质开发者标签 (发过 10x+ 代币的开发者)
+        # ==================== 基础标签 5: 创建者/代币合格 ====================
+        # 入场筛已过滤黑名单, 此处仅确认
         creator = (t.get("creator") or "").lower()
-        if creator and creator in DEPLOYER_WHITELIST:
-            signal_tags.append("优质开发者")
-            t["_isQualityDeployer"] = True
-        boosts = t.get("boosts", 0)
-        if boosts > 0:
-            signal_tags.append(f"Boost({boosts})")
-        if cc_count >= 100:
-            signal_tags.append(f"仿盘({cc_count})")
-        if h_delta >= 20:
-            signal_tags.append(f"持币增长(+{h_delta})")
-        if social_count >= 3:
-            signal_tags.append(f"社交({social_count})")
-        if is_first_round and first_round_strong:
-            grad_info = f"流动性${liquidity:.0f}" if is_graduated else f"进度{progress * 100:.0f}%"
-            signal_tags.append(f"首轮强势(持币{holders},{grad_info})")
-        # flap 社交豁免标签
-        if social_count < TAG_BASE_MIN_SOCIAL and t.get("source") == "flap":
-            signal_tags.append(f"flap社交豁免(持币{holders})")
-        if path == "dual":
-            signal_tags.append(f"双动能(持币)+{h_delta},价格↑)")
-        elif path == "first_round":
-            signal_tags.append(f"首轮强势(持币{holders},进度{progress*100:.0f}%)")
+        if creator and creator in DEPLOYER_BLACKLIST:
+            basic_fail_reasons.append(f"创建者在黑名单")
+            basic_pass = False
+
+        # ==================== 基础标签 6: 币龄合格 ====================
+        if age_hours > MAX_AGE_HOURS:
+            basic_fail_reasons.append(f"币龄{age_hours:.1f}h>{MAX_AGE_HOURS}h")
+            basic_pass = False
+
+        if not basic_pass:
+            continue
+
+        # ==================== 加分标签计算 ====================
+        bonus_score = 0
+        bonus_tags = []
+
+        # --- 加分: 仿盘数 ---
+        cc = t.get("copycat", {})
+        cc_count = cc.get("count", 0) if cc else 0
+        cc_bonus = _age_tier_match_bonus(age_hours, COPYCAT_BONUS_TIERS)
+        if cc_bonus > 0:
+            bonus_score += cc_bonus * BONUS_WEIGHT_COPYCAT
+            bonus_tags.append(f"仿盘(+{cc_bonus},共{cc_count})")
+
+        # --- 加分: 社交质量 (推特账号 / TG群) ---
+        social_links = t.get("socialLinks", {})
+        social_quality_bonus = 0
+        twitter_url = social_links.get("twitter", "")
+        if twitter_url:
+            is_tweet = "/status/" in twitter_url
+            if not is_tweet:
+                social_quality_bonus += 1
+                tw_followers = t.get("_tw_followers")
+                if tw_followers is not None and tw_followers >= SOCIAL_TWITTER_FOLLOWERS_MIN:
+                    social_quality_bonus += 1  # 粉丝≥100 额外加分
+                    bonus_tags.append(f"推特({tw_followers}粉)")
+                else:
+                    bonus_tags.append("推特账号")
+
+        telegram_url = social_links.get("telegram", "")
+        if telegram_url:
+            social_quality_bonus += 1
+            tg_members = t.get("_tg_members")
+            if tg_members is not None and tg_members >= SOCIAL_TG_MEMBERS_MIN:
+                social_quality_bonus += 1  # 成员≥100 额外加分
+                bonus_tags.append(f"TG({tg_members}人)")
+            else:
+                bonus_tags.append("TG群")
+
+        if social_quality_bonus > 0:
+            bonus_score += social_quality_bonus * BONUS_WEIGHT_SOCIAL_QUALITY
+
+        # --- 加分: 1h买卖压力 ---
         buys_h1 = t.get("buysH1", 0)
         sells_h1 = t.get("sellsH1", 0)
         if sells_h1 > 0:
             bsr = buys_h1 / sells_h1
-            if bsr >= 2.0:
-                signal_tags.append(f"强买压({bsr:.1f})")
-            elif bsr <= 0.5:
-                signal_tags.append(f"强卖压({bsr:.1f})")
+            if bsr >= BUY_PRESSURE_RATIO:
+                bonus_score += BONUS_WEIGHT_BUY_PRESSURE
+                bonus_tags.append(f"强买压{bsr:.1f}x")
+            elif bsr <= SELL_PRESSURE_RATIO:
+                bonus_score -= BONUS_WEIGHT_BUY_PRESSURE
+                bonus_tags.append(f"强卖压{bsr:.1f}x")
 
-        t["_quality_h_delta"] = h_delta
-        t["_quality_bonus_tags"] = signal_tags
+        # --- 加分: 成交额 (1h volume) ---
+        volume_h1 = t.get("volumeH1", 0)
+        if volume_h1 >= 10000:
+            bonus_score += BONUS_WEIGHT_VOLUME
+            bonus_tags.append(f"成交额${volume_h1:.0f}")
+        elif volume_h1 >= 5000:
+            bonus_score += BONUS_WEIGHT_VOLUME * 0.5
+            bonus_tags.append(f"成交额${volume_h1:.0f}")
+
+        # --- 加分: TOP10 持仓占比合理 ---
+        top10_conc = t.get("top10Concentration")
+        if top10_conc is not None:
+            if TOP10_CONCENTRATION_MIN <= top10_conc <= TOP10_CONCENTRATION_MAX:
+                bonus_score += BONUS_WEIGHT_BUY_PRESSURE
+                bonus_tags.append(f"持仓合理({top10_conc*100:.0f}%)")
+            elif top10_conc > TOP10_CONCENTRATION_MAX:
+                bonus_tags.append(f"庄家控盘({top10_conc*100:.0f}%)")
+
+        # --- 加分: 优质开发者 ---
+        if creator and creator in DEPLOYER_WHITELIST:
+            bonus_score += BONUS_WEIGHT_QUALITY_DEPLOYER
+            bonus_tags.append("优质开发者")
+            t["_isQualityDeployer"] = True
+
+        # --- 加分: 持币数≥1000 ---
+        if holders >= BONUS_HOLDERS_1K:
+            bonus_score += BONUS_WEIGHT_HOLDERS_1K
+            bonus_tags.append(f"持币≥1k({holders})")
+
+        # --- 加分: 流动性≥$30k ---
+        if liquidity >= BONUS_LIQUIDITY_30K:
+            bonus_score += BONUS_WEIGHT_LIQUIDITY_30K
+            bonus_tags.append(f"流动性${liquidity:.0f}")
+
+        # --- 加分: Boost推广 ---
+        boosts = t.get("boosts", 0)
+        if boosts > 0:
+            bonus_score += BONUS_WEIGHT_BOOST
+            bonus_tags.append(f"Boost({boosts})")
+
+        t["_bonus_score"] = bonus_score
+        t["_bonus_tags"] = bonus_tags
+        t["_age_hours"] = age_hours
+        t["_min_holders"] = min_holders
         t["isGraduated"] = is_graduated
         results.append(t)
 
-        grad_str = "毕业" if is_graduated else f"进度{progress * 100:.0f}%"
-        log.info("标签精筛: ✓ %s — 持币=%d, %s, 仿盘=%d, 社交=%d, 动能=持币%+d/价格%s, 信号=[%s]",
-                 name, holders, grad_str, cc_count, social_count, h_delta,
-                 "↑" if price_up else "↓", ", ".join(signal_tags) if signal_tags else "无")
+        grad_str = "毕业" if is_graduated else f"进度{progress*100:.0f}%"
+        log.info("标签精筛: ✓ %s — 持币=%d/%d, %s, 仿盘=%d, 社交=%d, 币龄=%.1fh, "
+                 "加分=%d, 标签=[%s]",
+                 name, holders, min_holders, grad_str, cc_count, social_count,
+                 age_hours, bonus_score,
+                 ", ".join(bonus_tags) if bonus_tags else "无")
+
+    results.sort(key=lambda x: x.get("_bonus_score", 0), reverse=True)
 
     return results
 
@@ -3530,7 +3875,7 @@ def post_quality_defense(candidates: list[dict], api_key: str) -> list[dict]:
                 if total_supply > 0:
                     concentration = top10_total / total_supply
                     t["top10Concentration"] = round(concentration, 4)
-                    if concentration > QUALITY_MAX_TOP10_CONCENTRATION:
+                    if concentration > TOP10_CONCENTRATION_MAX:
                         exclude_reason = "Top10持仓{:.0f}% (庄家控盘)".format(concentration * 100)
         except Exception as e:
             log.debug("Top Holder 查询失败 %s: %s", name, e)
@@ -4015,6 +4360,8 @@ def scan_once(cfg: dict) -> None:
             t["copycat"] = cc
 
     # 精筛 (标签制: 基础标签 + 加分项, 统一通道)
+    # 先批量查询社交质量 (Twitter 粉丝数 + TG 成员数, 用于加分计算)
+    batch_check_social_quality(survivors)
     # 计算大盘情绪
     market_sentiment = calc_market_sentiment(survivors, queue_state)
     scan_round = queue_state.get("scanRound", _scan_count - 1) + 1
@@ -4246,7 +4593,8 @@ def scan_once(cfg: dict) -> None:
                 "price": item.get("price", 0),
                 "socialCount": item.get("socialCount", 0),
                 "socialLinks": item.get("socialLinks", {}),
-                "_quality_bonus_tags": item.get("_quality_bonus_tags", []),
+                "_bonus_tags": item.get("_bonus_tags", []),
+                "_bonus_score": item.get("_bonus_score", 0),
             }
             to_buy.append((token_data, detail_data))
         log.info("自动买入: 准备买入 %d 个代币", len(to_buy))
