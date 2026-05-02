@@ -38,16 +38,20 @@ v6 架构: 极速扫描 (15 分钟一轮)
   - 币龄 > 48h
   - 价格突破: 峰值价格 ≥ 0.0001 → 标记为已突破, 跳过常规淘汰条件, 仅受币龄>48h淘汰
 
-精筛条件 (标签制, v13: 双路径 — 稳健型 + 动能型):
-  基于 108,206 个历史代币全量回测:
-    数据: 28个≥10x, 101个3-10x, 市场极度右偏
-    最佳策略: (持币≥100+仿盘≥30) OR (持币增50%+仿盘≥50), EV+5.8%
-    关键发现: 持币增长是最强动能信号, 仿盘≥30有效过滤噪音
-  双路径 (任一通过即可):
-  - Path A 稳健型: 持币≥80 + 进度≥30% + 仿盘≥30 + 未崩盘 + 社交≥1 + 有动能
-  - Path B 动能型: 持币增长≥20% + 进度≥20% + 仿盘≥30 + 未崩盘 + 社交≥1 + 有动能
-  - 已毕业: 持币≥50 + 流动性≥$5k + 仿盘≥30 + 未崩盘 + 有动能
-  - 共通条件: 仿盘≥30 (从≥50放宽), 未崩盘(近三期跌幅<30%), 社交≥1, flap社交豁免
+精筛条件 (标签制, v14: 双动能驱动):
+  基于 129 个 ≥3x 代币暴涨前信号剖解:
+    核心发现: "双动能"是唯一强区分信号 — 同一轮内 holders↑ + price↑ 同时发生
+    89/129 winner (69%) 在暴涨前出现双动能信号, 且 87.6% 的信号后续有更大涨幅
+    仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
+    价格信号比持币信号更领先 — winner 往往先拉盘、后吸引持币
+  双动能条件 (全部满足, AND):
+  - 双动能 (同一轮内): holders > 上一轮 AND price > 上一轮
+  - 持币 ≥ 20 (过滤散户盘)
+  - 仿盘 ≥ 3 (近48h内, 热门概念)
+  - 未崩盘 (近三期跌幅 < 30%)
+  - 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业 时跳过)
+  - 首轮豁免: 无历史数据时, 持币≥30 + 进度≥30%/流动性≥$10k 视为有动能
+  - 已毕业: 持币≥50 + 流动性≥$5k + 仿盘≥3 + 未崩盘 + 有动能
 """
 
 from __future__ import annotations
@@ -181,53 +185,30 @@ TOTAL_SUPPLY = 1_000_000_000           # 10亿
 #   效果: 胜率35%→38.7%, 亏损率65%→61.3%, 平均最高涨幅+110%→+131%
 #         精筛数量705→573 (减少19%), 被拦132个中126个亏损 (精准率95.5%)
 #
-# 基础标签组 (全部满足, AND):
-#   1. 持币数+进度/流动性 (分来源、分毕业状态):
-#      - four.meme 未毕业: 持币≥20, 进度≥15% (FM未毕业亏损率73%, 收紧过滤垃圾币)
-#      - flap 未毕业: 持币≥15, 进度≥12% (flap胜率高, 适度收紧)
-#      - 已毕业 (不分来源): 持币≥20, 流动性≥$5k
-#   2. 仿盘数 ≥ 3
-#   3. 未崩盘 (近三期最高点跌幅 < 30%, 从35%收紧)
-#   4. 社交 ≥ 1 (flap 豁免: 持币≥20 且 进度≥15%/已毕业 时跳过社交要求)
-#   5. 单动能触发: 最近3轮内持币数有增长 或 价格有上涨 (任一即可)
-#      首轮豁免: 首轮入队无历史数据时, 持币≥20 + 进度≥15%/流动性≥$5k 视为有动能
-#   6. four.meme 未毕业: 24h涨跌幅 ≥ -20% (排除已在下跌通道的币)
-#   (大盘情绪: Gas指数仍计算并记录, 仅用于数据分析, 不作为精筛条件)
-# v12 精筛策略 (数据驱动, 1342轮14天全量回测 + 实战止盈止损模拟):
-#   核心发现: 入队时高涨幅币与垃圾币几乎无法区分 (静态特征精准率仅10%)
-#   但"进度增长"是强信号: 进度≥30% + 进度增长≥10% + 仿盘≥50 的组合
-#   在止盈80%/止损20%下: 胜率25%, 盈亏比4.0, 每笔均PnL +6.3%
-#   策略本质: 低胜率高盈亏比, 小亏大赚, 靠交易次数平滑波动
+# v14 精筛策略 (数据驱动, 基于 129 个 ≥3x 代币暴涨前信号剖解):
+#   核心发现: "双动能"(holders↑+price↑同一轮)是唯一强区分信号
+#   89/129 (69%) winner 暴涨前出现双动能, 87.6%的信号后续有更大涨幅
+#   仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
+#   价格信号比持币信号更领先 — winner 往往先拉盘、后吸引持币
 #
-# 精筛条件 (v12: 进度增长驱动 + 高仿盘过滤):
-#   未毕业 (不分来源):
-#     - 当前进度 ≥ 30%
-#     - 进度增长 ≥ 10% (相比入队时 addedProgress, 确认有真实买盘推进)
-#     - 仿盘数 ≥ 50 (热门概念, 过滤冷门币)
-#     - 社交 ≥ 1
-#     - 未崩盘 (近三期最高点跌幅 < 30%)
-#     - 单动能触发 (最近3轮内持币增长或价格上涨)
-#   已毕业 (不分来源):
-#     - 持币 ≥ 20, 流动性 ≥ $10k (保持不变, 已毕业币逻辑不同)
-#     - 仿盘数 ≥ 50
-#     - 社交 ≥ 1, 未崩盘, 单动能触发
+# 精筛条件 (v14: 双动能驱动):
+#   - 仿盘 ≥ 3 (近48h内)
+#   - 未崩盘 (近三期跌幅 < 30%)
+#   - 社交 ≥ 1 (flap 豁免)
+#   - 双动能: holders > 上一轮 AND price > 上一轮 (首轮豁免)
+#   - 持币 ≥ 20
+#   - 已毕业: 持币≥50 + 流动性≥$5k
+#   - FM未毕业: 24h跌幅 ≥ -20%
 #
-# --- 未毕业门槛 (v13: 双路径 — 稳健型 + 动能型) ---
-TAG_FM_UNGRAD_MIN_HOLDERS = 0          # 未毕业: 不卡持币数 (动能型靠持币增长, 稳健型另设门槛)
-TAG_FM_UNGRAD_MIN_PROGRESS = 0.20      # 未毕业 (动能型): 进度 ≥ 20% (放宽, 靠动能信号过滤)
-TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅过滤 (保留)
-TAG_FLAP_UNGRAD_MIN_HOLDERS = 0        # 未毕业: 不卡持币数 (与FM统一)
-TAG_FLAP_UNGRAD_MIN_PROGRESS = 0.20    # 未毕业: 进度 ≥ 20% (放宽)
-TAG_MIN_PROGRESS_GROWTH = 0.00         # 未毕业: 进度增长要求 (v13: 移除, 改用持币增长信号)
-# --- v13 新增: 双路径精筛 ---
-TAG_STEADY_MIN_HOLDERS = 80           # 稳健型: 持币 ≥ 80
-TAG_STEADY_MIN_PROGRESS = 0.30         # 稳健型: 进度 ≥ 30%
-TAG_MOMENTUM_MIN_HOLDER_GROWTH = 0.20  # 动能型: 持币数增长 ≥ 20% (vs 上一轮)
-# --- 已毕业门槛 (v13: 收紧持币, 放松流动性) ---
-TAG_GRAD_MIN_HOLDERS = 50              # 已毕业: 持币≥50 (从20提高)
-TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k (从10k放宽)
+# --- 未毕业门槛 (v14: 双动能驱动) ---
+# 核心: 同一轮内 holders↑ AND price↑ 同时发生
+TAG_DM_MIN_HOLDERS = 20               # 双动能: 最低持币数 (过滤散户盘)
+TAG_DM_MIN_COPYCAT = 3                # 双动能: 最低仿盘数 (近48h内, 热门概念)
+TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24 = -20  # FM未毕业: 24h跌幅过滤
+# --- 已毕业门槛 (v13保持) ---
+TAG_GRAD_MIN_HOLDERS = 50              # 已毕业: 持币≥50
+TAG_BASE_MIN_LIQUIDITY = 5000          # 已毕业: 流动性 ≥ $5k
 # --- 通用标签 ---
-TAG_BASE_MIN_COPYCAT = 30             # 基础: 仿盘数 ≥ 30 (从50放宽, 数据验证≥30即有效)
 TAG_BASE_MAX_CRASH_PCT = 0.30         # 基础: 近三期最高点跌幅 < 30%
 TAG_BASE_MIN_SOCIAL = 1               # 基础: 社交 ≥ 1
 # flap 社交豁免: flap 代币普遍无社交链接, 当持币数和进度足够时豁免社交要求
@@ -3404,19 +3385,21 @@ def calc_market_sentiment(queue: list[dict], queue_state: dict,
 def tag_filter(candidates: list[dict], now_ms: int,
                market_sentiment: dict | None = None) -> list[dict]:
     """
-    标签制精筛 — 双路径策略 (v13)
+    标签制精筛 — 双动能驱动 (v14)
 
-    基于 108,206 个历史代币全量回测 (1393轮扫描数据):
-      数据: 28个≥10x, 101个3-10x. 市场极度右偏, 绝大部分代币归零.
-      最佳策略 猜想D: (持币≥100+仿盘≥30) OR (持币增50%+仿盘≥50)
-        471笔交易, 22.3%胜率, EV+5.8%, $200→$472
-      关键发现: 持币增长是最强动能信号 (EV+101%), 仿盘≥30过滤噪音
+    基于 129 个 ≥3x 代币暴涨前信号剖解:
+      核心发现: "双动能"是唯一强区分信号 — 同一轮内 holders↑ + price↑ 同时发生
+      89/129 (69%) winner 在暴涨前出现双动能信号, 87.6% 的信号后续有更大涨幅
+      仅凭持币增长不可靠: 57/129 winner 暴涨前持币零增长甚至负增长
 
-    v13 双路径精筛 (任一通过即可):
-      Path A — 稳健型: 持币≥80 + 进度≥30% + 仿盘≥30 + 未崩盘 + 社交≥1 + 有动能
-      Path B — 动能型: 持币增长≥20% (vs上一轮) + 进度≥20% + 仿盘≥30 + 未崩盘 + 社交≥1 + 有动能
-      已毕业: 持币≥50 + 流动性≥$5k + 仿盘≥30 + 未崩盘 + 有动能
-      共通: 仿盘≥30, 未崩盘, 社交≥1, 首轮动能豁免, flap社交豁免
+    v14 条件 (全部满足, AND):
+      1. 仿盘 ≥ 3 (近48h内)
+      2. 未崩盘 (近三期跌幅 < 30%)
+      3. 社交 ≥ 1 (flap 豁免: 持币≥30 且 进度≥30%/已毕业)
+      4a. 未毕业: 双动能 (holders > 上一轮 AND price > 上一轮)
+      4b. 已毕业: 持币≥50 + 流动性≥$5k
+      5. FM未毕业 24h跌幅 ≥ -20%
+      6. 首轮动能豁免: 无历史时持币≥30 + 进度≥30%/流动性≥$10k
     """
     results = []
 
@@ -3429,10 +3412,10 @@ def tag_filter(candidates: list[dict], now_ms: int,
         is_graduated = progress >= 1.0
         source = t.get("source", "")
 
-        # === 仿盘数 ===
+        # === 仿盘 ≥ 3 ===
         cc = t.get("copycat", {})
         cc_count = cc.get("count", 0) if cc else 0
-        if cc_count < TAG_BASE_MIN_COPYCAT:
+        if cc_count < TAG_DM_MIN_COPYCAT:
             continue
 
         # === 未崩盘 ===
@@ -3458,67 +3441,55 @@ def tag_filter(candidates: list[dict], now_ms: int,
             if not flap_exempt:
                 continue
 
-        # === 已毕业 / 未毕业 分路径 ===
-        holder_growth = 0
+        # === 已毕业 / 未毕业 ===
+        h_delta = 0
+        is_first_round = False
+        first_round_strong = False
         if is_graduated:
-            # 已毕业: 持币≥50 + 流动性≥$5k
             if holders < TAG_GRAD_MIN_HOLDERS:
                 continue
             if liquidity < TAG_BASE_MIN_LIQUIDITY:
                 continue
             path = "graduated"
+            has_momentum = True  # 已毕业不卡动能
         else:
-            # 未毕业: 双路径
+            # 未毕业: 双动能 (holders↑ AND price↑, 首轮豁免)
             h_hist = t.get("holdersHistory", [])
-            holder_growth = 0
+            holders_up = False
+            price_up = False
+            h_delta = 0
+
             if h_hist and len(h_hist) >= 2 and h_hist[-2] > 0:
-                holder_growth = (holders - h_hist[-2]) / h_hist[-2]
+                h_delta = holders - h_hist[-2]
+                holders_up = h_delta > 0
 
-            path_a = (holders >= TAG_STEADY_MIN_HOLDERS
-                      and progress >= TAG_STEADY_MIN_PROGRESS)
-            path_b = (holder_growth >= TAG_MOMENTUM_MIN_HOLDER_GROWTH
-                      and progress >= TAG_FM_UNGRAD_MIN_PROGRESS)
+            last_price = t.get("lastPrice", 0)
+            if last_price > 0 and current_price > last_price:
+                price_up = True
 
-            if not (path_a or path_b):
+            # 双动能: 必须 holders↑ AND price↑
+            dual_momentum = holders_up and price_up
+
+            # 首轮豁免: 无历史数据但自身够强
+            is_first_round = not h_hist or len(h_hist) <= 1
+            first_round_strong = False
+            if is_first_round:
+                first_round_strong = (holders >= TAG_FIRST_ROUND_MIN_HOLDERS
+                                      and progress >= TAG_FIRST_ROUND_MIN_PROGRESS)
+
+            if not (dual_momentum or first_round_strong):
                 continue
-            path = "steady" if path_a else "momentum"
+            path = "dual" if dual_momentum else "first_round"
+
+            # 持币≥20
+            if holders < TAG_DM_MIN_HOLDERS:
+                continue
 
         # === FM未毕业 24h跌幅过滤 ===
         if source != "flap" and not is_graduated:
             price_change_h24 = t.get("priceChangeH24", 0) or 0
             if price_change_h24 < TAG_FM_UNGRAD_MIN_PRICE_CHANGE_H24:
                 continue
-
-        # === 动能: 持币或价格增长 (首轮豁免) ===
-        h_hist = t.get("holdersHistory", [])
-        holders_up = False
-        h_delta = 0
-        if h_hist:
-            window = h_hist[-MOMENTUM_WINDOW:]
-            min_in_window = min(window)
-            h_delta = holders - min_in_window
-            holders_up = holders > min_in_window
-        last_price = t.get("lastPrice", 0)
-        price_up = current_price > last_price if last_price > 0 else False
-        if not price_up and price_hist:
-            window_prices = price_hist[-MOMENTUM_WINDOW:]
-            min_price_in_window = min(p for p in window_prices if p and p > 0) if any(p and p > 0 for p in window_prices) else 0
-            if min_price_in_window > 0 and current_price > min_price_in_window:
-                price_up = True
-
-        is_first_round = not h_hist
-        first_round_strong = False
-        if is_first_round:
-            if is_graduated:
-                first_round_strong = (holders >= TAG_FIRST_ROUND_MIN_HOLDERS
-                                      and liquidity >= TAG_FIRST_ROUND_MIN_LIQUIDITY)
-            else:
-                first_round_strong = (holders >= TAG_FIRST_ROUND_MIN_HOLDERS
-                                      and progress >= TAG_FIRST_ROUND_MIN_PROGRESS)
-
-        has_momentum = (holders_up or price_up) or first_round_strong
-        if not has_momentum:
-            continue
 
         # === 全部通过 ===
         # 收集信号标签 (仅用于展示, 不影响筛选)
@@ -3543,10 +3514,10 @@ def tag_filter(candidates: list[dict], now_ms: int,
         # flap 社交豁免标签
         if social_count < TAG_BASE_MIN_SOCIAL and t.get("source") == "flap":
             signal_tags.append(f"flap社交豁免(持币{holders})")
-        if path == "momentum":
-            signal_tags.append(f"动能型(持币增速{holder_growth*100:.0f}%)")
-        elif path == "steady":
-            signal_tags.append(f"稳健型(持币{holders})")
+        if path == "dual":
+            signal_tags.append(f"双动能(持币)+{h_delta},价格↑)")
+        elif path == "first_round":
+            signal_tags.append(f"首轮强势(持币{holders},进度{progress*100:.0f}%)")
         buys_h1 = t.get("buysH1", 0)
         sells_h1 = t.get("sellsH1", 0)
         if sells_h1 > 0:
