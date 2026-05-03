@@ -3912,15 +3912,6 @@ def tag_filter(candidates: list[dict], now_ms: int,
                 bonus_score -= BONUS_WEIGHT_BUY_PRESSURE
                 bonus_tags.append(f"强卖压{bsr:.1f}x")
 
-        # --- 加分: 成交额 (1h volume) ---
-        volume_h1 = t.get("volumeH1", 0)
-        if volume_h1 >= 10000:
-            bonus_score += BONUS_WEIGHT_VOLUME
-            bonus_tags.append(f"成交额${volume_h1:.0f}")
-        elif volume_h1 >= 5000:
-            bonus_score += BONUS_WEIGHT_VOLUME * 0.5
-            bonus_tags.append(f"成交额${volume_h1:.0f}")
-
         # --- 加分: TOP10 持仓占比合理 ---
         top10_conc = t.get("top10Concentration")
         if top10_conc is not None:
