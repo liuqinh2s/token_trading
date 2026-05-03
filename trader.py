@@ -23,7 +23,7 @@ BSC 自动交易模块 - PancakeSwap V2 + four.meme Bonding Curve + flap Bonding
     1. 盈利 15% 后触发回撤止盈跟踪:
        - 15%~30% 区间: 回撤 15% 止盈 (实际 10% 预留缓冲, 从最高价回撤 10% 即卖出)
        - 30% 以上: 中点止盈法 (价格 ≤ (最高价 + 买入价) / 2 时卖出)
-    2. 固定止损: 亏损 30% 止损 (实际 25% 预留缓冲)
+    2. 固定止损: 亏损 40% 止损 (实际 35% 预留缓冲)
     3. 动能衰竭止盈: 持币数/流动性/进度 多指标同时恶化时止盈
     4. 超期清仓: 持仓超过 12h 且亏损 → 卖出
 """
@@ -2065,7 +2065,7 @@ def check_sell_conditions(pos: dict, current_price: float,
       1. 回撤止盈: 盈利 15% 后触发跟踪 (5%缓冲: 实际 10% 触发)
          - 15%~30% 区间: 回撤 15% 止盈 (5%缓冲: 实际回撤 10% 即卖出)
          - 30% 以上: 中点止盈法, 价格 ≤ (最高价 + 买入价) / 2
-      2. 固定止损: 亏损 30% 止损 (5%缓冲: 实际 25% 止损)
+      2. 固定止损: 亏损 40% 止损 (5%缓冲: 实际 35% 止损)
       3. 动能衰竭止盈: ≥2 个指标同时恶化且当前盈利 → 止盈
       4. 超期清仓: 持仓超过 12h 且仍亏损 → 卖出
 
@@ -2127,8 +2127,8 @@ def check_sell_conditions(pos: dict, current_price: float,
         return True, f"EXPIRE_LOSS (持仓 {hold_hours:.0f}h, 亏损 {profit_pct:.0f}%)"
 
     # ==================== 策略4: 固定止损 ====================
-    stop_loss_original = trading_cfg.get("stop_loss_pct", -30)
-    stop_loss_buffered = stop_loss_original + BUFFER_PCT  # -30 + 5 = -25
+    stop_loss_original = trading_cfg.get("stop_loss_pct", -40)
+    stop_loss_buffered = stop_loss_original + BUFFER_PCT  # -40 + 5 = -35
 
     if profit_pct <= stop_loss_buffered:
         return True, (f"STOP_LOSS (亏损 {profit_pct:.0f}%, "
