@@ -1,9 +1,9 @@
 """
-BSC Token Scanner v6 — 极速扫描, 以快致胜
+BSC Token Scanner v7 — 极速扫描, 以快致胜
 数据源: BSC RPC (链上事件) + four.meme API (详情) + DexScreener (价格/涨跌幅/Boost) + GeckoTerminal (持币数)
 代币来源: four.meme + flap (BSC 链上两大代币发射平台, 均使用 bonding curve 机制)
 
-v15 架构: 标签制精筛 (基础标签 AND + 加分标签排优先级)
+v16 架构: 标签制精筛 (基础标签 AND + 加分标签排优先级)
   1. 链上发现 (~1s): BSC RPC eth_getLogs → four.meme + flap 合约 TokenCreated 事件 → 新代币地址
   2. 入场筛 (~数秒): four.meme Detail API + flap.sh 页面 SSR 社交数据 + 链上 totalSupply → 淘汰无社交 / 总量≠10亿 / 币龄>5min
   3. 淘汰检查 (~数秒): DexScreener 批量查价(含涨跌幅/Boost) + GeckoTerminal 持币数 + Detail API → 永久淘汰弃盘币
@@ -11,10 +11,10 @@ v15 架构: 标签制精筛 (基础标签 AND + 加分标签排优先级)
   4. 精筛 (瞬时): 标签制精筛, 基础标签全部满足(AND) + 加分标签排优先级
   5. 仿盘检测: 本地统计同名代币数量 (零 API 调用)
 
-v15 精筛策略 (标签制: 基础标签 + 加分标签):
+v16 精筛策略 (标签制: 基础标签 + 加分标签):
   每个维度按币龄精细化分层, 币龄越长要求越高
   基础标签: 持币数/进度/流动性/K线/社交/创建者/币龄 — 全部满足才通过, 目标 ~30/天
-  加分标签: 仿盘/社交质量/买压/成交额/持仓占比/优质开发者/持币≥1k/流动性≥30k/Boost — 排优先级
+  加分标签: 仿盘/小涨跌不动/成交额异动/流动性异动/优质开发者/持币≥1k/流动性≥30k/Boost — 排优先级, 至少一项才开仓
 
 砍掉的慢环节 (v5 → v6):
   - GeckoTerminal K线 (每个代币 2s+)
@@ -52,13 +52,13 @@ v15 精筛策略 (标签制: 基础标签 + 加分标签):
   - 创建者合格: 不在黑名单
   - 币龄合格: ≤48h
 
-  加分标签 (通过基础后计算, 排优先级):
+  加分标签 (通过基础后计算, 排优先级, 至少一项才开仓):
   - 仿盘加分: ≥2h且仿盘≥3(+1) → ≥8h且仿盘≥5(+2)
-  - 社交质量: 推特粉丝≥100+1, TG群成员≥100+1
-  - 1h买压: 强买压(买/卖≥2x)+2, 强卖压(买/卖≤0.5x)-2
-  - 成交额: ≥$10k(+1), ≥$5k(+0.5)
-  - 持仓合理: 20%≤Top10≤85%(+2)
-  - 优质开发者+3, Boost推广+1
+  - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h(+1)
+  - 成交额异动: 15min成交额比上一根增≥20%, 且价格涨幅<100%(+1)
+  - 流动性异动: 仅已毕业, 15min流动性比上一根增≥20%, 且价格涨幅<100%(+1)
+  - 优质开发者+1, Boost推广+1
+  - 持币≥1k(+1), 流动性≥$30k(+1)
 """
 
 from __future__ import annotations
@@ -182,9 +182,9 @@ BINANCE_HEADERS = {
 # ================================================================
 #  精筛阈值 — 标签制 (基础标签 AND + 加分标签排优先级)
 #
-#  v15 架构: 每个数据维度按币龄精细化分层, 币龄越长要求越高
+#  v16 架构: 每个数据维度按币龄精细化分层, 币龄越长要求越高
 #  基础标签: 全部满足才通过精筛, 目标每天~30个 (AND 逻辑)
-#  加分标签: 给通过基础标签的代币排优先级, 高优先级优先买入
+#  加分标签: 给通过基础标签的代币排优先级, 高优先级优先买入, 至少一项才开仓
 #  持仓队列: 最多 10 个, 每仓 1%
 #
 #  v14 核心发现 (129 个 ≥3x 代币暴涨前信号剖解):
@@ -314,15 +314,7 @@ COPYCAT_BONUS_TIERS = [
 ]
 COPYCAT_MARK_MIN = 3    # 仿盘数 ≥3 在前端标记
 
-# --- 加分标签: 社交质量 (bonus) ---
-SOCIAL_TWITTER_FOLLOWERS_MIN = 100    # 推特关注 ≥100
-SOCIAL_TG_MEMBERS_MIN = 100           # TG 群成员 ≥100
-
-# --- 加分标签: 1h买卖比 (bonus) ---
-BUY_PRESSURE_RATIO = 2.0     # buys/sells ≥ 2x → 强买压
-SELL_PRESSURE_RATIO = 0.5    # buys/sells ≤ 0.5x → 强卖压 (扣分项)
-
-# --- 加分标签: TOP10 持仓占比 ---
+# --- 加分标签: TOP10 持仓占比 (用于淘汰/后防线, 非加分项) ---
 TOP10_CONCENTRATION_MAX = 0.85   # >85% 庄家控盘
 TOP10_CONCENTRATION_MIN = 0.20   # <20% 持仓太分散
 
@@ -332,15 +324,34 @@ BONUS_HOLDERS_1K = 1000          # 持币数 ≥ 1000 → 加分
 # --- 加分标签: 流动性 ≥30k ---
 BONUS_LIQUIDITY_30K = 30000     # 流动性 ≥ $30k → 加分
 
+# --- 加分标签: 小涨跌不动 (横盘整理) ---
+# 小涨: 最低价到最高价涨幅 ≤ 3.5倍
+# 跌不下去: 最高价到最低价跌幅 ≤ 55%
+# 横盘时间区间: ≥ 3h 且 ≤ 8h
+BONUS_CONSOLIDATION_MAX_GAIN = 3.5       # 横盘区间最大涨幅 (倍)
+BONUS_CONSOLIDATION_MAX_DRAWDOWN = 0.55  # 横盘区间最大回撤 (比例)
+BONUS_CONSOLIDATION_MIN_HOURS = 3.0      # 横盘最少时间 (小时)
+BONUS_CONSOLIDATION_MAX_HOURS = 8.0      # 横盘最多时间 (小时)
+
+# --- 加分标签: 成交额异动 (volume surge) ---
+# 本15分钟成交额比上一根15分钟成交额多 ≥ 20%, 且价格涨幅 < 100%
+BONUS_VOLUME_SURGE_RATIO = 1.20        # 成交额增长比例
+BONUS_VOLUME_SURGE_MAX_PRICE_GAIN = 1.0  # 价格涨幅上限 (1.0 = 100%)
+
+# --- 加分标签: 流动性异动 (liquidity surge, 仅已毕业) ---
+# 本15分钟流动性比上一根15分钟流动性多 ≥ 20%, 且价格涨幅 < 100%
+BONUS_LIQ_SURGE_RATIO = 1.20            # 流动性增长比例
+BONUS_LIQ_SURGE_MAX_PRICE_GAIN = 1.0    # 价格涨幅上限 (1.0 = 100%)
+
 # --- 加分标签权重 (所有加分项权重相同) ---
 BONUS_WEIGHT_COPYCAT = 1
-BONUS_WEIGHT_SOCIAL_QUALITY = 1
-BONUS_WEIGHT_BUY_PRESSURE = 1
-BONUS_WEIGHT_VOLUME = 1
 BONUS_WEIGHT_QUALITY_DEPLOYER = 1
 BONUS_WEIGHT_BOOST = 1
 BONUS_WEIGHT_HOLDERS_1K = 1      # 持币≥1k
 BONUS_WEIGHT_LIQUIDITY_30K = 1   # 流动性≥$30k
+BONUS_WEIGHT_CONSOLIDATION = 1   # 小涨跌不动
+BONUS_WEIGHT_VOLUME_SURGE = 1    # 成交额异动
+BONUS_WEIGHT_LIQ_SURGE = 1       # 流动性异动
 # 大盘情绪: 纯 Gas 趋势判定 (当前 Gas 指数 vs 12h前快照)
 # Gas 大盘指数: ETH/BSC gasUsedRatio + SOL TPS, 反映多链整体活跃度
 # gasUsedRatio: 0~1, 越高=区块越满=链上越活跃; SOL TPS 归一化到 0~1
@@ -3249,6 +3260,11 @@ def elimination_check(queue: list[dict], now_ms: int,
         liq_hist = t.get("liquidityHistory", [])
         liq_hist.append(current_liq)
         t["liquidityHistory"] = liq_hist[-5:]
+        # 记录成交额历史 (volume24h, 只保留最近 5 轮, 用于成交额异动检测)
+        current_volume = t.get("volume24h", 0)
+        vol_hist = t.get("volumeHistory", [])
+        vol_hist.append(current_volume)
+        t["volumeHistory"] = vol_hist[-5:]
         t["progress"] = current_progress
         if detail:
             t["socialCount"] = detail["socialCount"]
@@ -3717,10 +3733,48 @@ def _age_tier_match_bonus(age_hours: float, tiers: list[tuple]) -> int:
     return best_score
 
 
+def _check_consolidation(price_hist: list[float], age_hours: float) -> float:
+    """
+    检测小涨跌不动(横盘整理): 最近 ≥3h 且 ≤8h 内:
+      最低价→最高价涨幅 ≤ 3.5倍, 且最高价→最低价跌幅 ≤ 55%
+    返回横盘持续时间(小时), 0 表示不满足
+
+    每轮 15min, 3h=12轮, 8h=32轮
+    """
+    min_rounds = int(BONUS_CONSOLIDATION_MIN_HOURS * 4)   # 12
+    max_rounds = int(BONUS_CONSOLIDATION_MAX_HOURS * 4)   # 32
+    total_rounds = len(price_hist)
+    if total_rounds < min_rounds:
+        return 0.0
+
+    actual_rounds = min(max_rounds, total_rounds)
+    best_hours = 0.0
+
+    for window_size in range(min_rounds, actual_rounds + 1):
+        window = price_hist[-window_size:]
+        valid_prices = [p for p in window if p > 0]
+        if len(valid_prices) < 2:
+            continue
+        price_min = min(valid_prices)
+        price_max = max(valid_prices)
+        if price_min <= 0 or price_max <= 0:
+            continue
+
+        gain_ratio = price_max / price_min           # 最低→最高涨幅倍数
+        drawdown = (price_max - price_min) / price_max  # 最高→最低跌幅
+
+        if gain_ratio <= BONUS_CONSOLIDATION_MAX_GAIN and drawdown <= BONUS_CONSOLIDATION_MAX_DRAWDOWN:
+            hours = window_size / 4.0
+            if hours > best_hours:
+                best_hours = hours
+
+    return best_hours
+
+
 def tag_filter(candidates: list[dict], now_ms: int,
                market_sentiment: dict | None = None) -> list[dict]:
     """
-    标签制精筛 — v15: 基础标签(AND) + 加分标签(优先级排序)
+    标签制精筛 — v16: 基础标签(AND) + 加分标签(优先级排序)
 
     基础标签 (全部满足才通过):
       大盘向上: 近1h平均GAS ≥ 近12hGAS
@@ -3729,9 +3783,11 @@ def tag_filter(candidates: list[dict], now_ms: int,
       波动充足: 近3轮振幅有至少一根 ≥ 20%
       趋势向上: 当前价格 ≥ 4轮前价格 (≈1h)
 
-    加分标签 (通过基础标签后计算, 排优先级):
-      - 仿盘加分 / 社交质量 / 1h买压 / 成交额
-      - Top10持仓占比合理 / 优质开发者 / 持币≥1k / 流动性≥$30k / Boost
+    加分标签 (通过基础标签后计算, 排优先级, 至少一项才开仓):
+      - 仿盘加分 / 小涨跌不动 / 成交额异动 / 流动性异动 / 优质开发者 / 持币≥1k / 流动性≥$30k / Boost
+      - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h
+      - 成交额异动: 15min成交额比上一根≥1.2x, 且价格涨幅<100%
+      - 流动性异动: 仅已毕业, 15min流动性比上一根≥1.2x, 且价格涨幅<100%
 
     返回按加分总分降序排列的精筛结果
     """
@@ -3872,49 +3928,6 @@ def tag_filter(candidates: list[dict], now_ms: int,
             bonus_score += cc_bonus * BONUS_WEIGHT_COPYCAT
             bonus_tags.append(f"仿盘(+{cc_bonus},共{cc_count})")
 
-        # --- 加分: 社交质量 (推特粉丝≥100 / TG成员≥100) ---
-        social_links = t.get("socialLinks", {})
-        social_quality_bonus = 0
-        twitter_url = social_links.get("twitter", "")
-        if twitter_url:
-            is_tweet = "/status/" in twitter_url
-            if not is_tweet:
-                tw_followers = t.get("_tw_followers")
-                if tw_followers is not None and tw_followers >= SOCIAL_TWITTER_FOLLOWERS_MIN:
-                    social_quality_bonus += 1
-                    bonus_tags.append(f"推特({tw_followers}粉)")
-
-        telegram_url = social_links.get("telegram", "")
-        if telegram_url:
-            tg_members = t.get("_tg_members")
-            if tg_members is not None and tg_members >= SOCIAL_TG_MEMBERS_MIN:
-                social_quality_bonus += 1
-                bonus_tags.append(f"TG({tg_members}人)")
-
-        if social_quality_bonus > 0:
-            bonus_score += social_quality_bonus * BONUS_WEIGHT_SOCIAL_QUALITY
-
-        # --- 加分: 1h买卖压力 ---
-        buys_h1 = t.get("buysH1", 0)
-        sells_h1 = t.get("sellsH1", 0)
-        if sells_h1 > 0:
-            bsr = buys_h1 / sells_h1
-            if bsr >= BUY_PRESSURE_RATIO:
-                bonus_score += BONUS_WEIGHT_BUY_PRESSURE
-                bonus_tags.append(f"强买压{bsr:.1f}x")
-            elif bsr <= SELL_PRESSURE_RATIO:
-                bonus_score -= BONUS_WEIGHT_BUY_PRESSURE
-                bonus_tags.append(f"强卖压{bsr:.1f}x")
-
-        # --- 加分: TOP10 持仓占比合理 ---
-        top10_conc = t.get("top10Concentration")
-        if top10_conc is not None:
-            if TOP10_CONCENTRATION_MIN <= top10_conc <= TOP10_CONCENTRATION_MAX:
-                bonus_score += BONUS_WEIGHT_BUY_PRESSURE
-                bonus_tags.append(f"持仓合理({top10_conc*100:.0f}%)")
-            elif top10_conc > TOP10_CONCENTRATION_MAX:
-                bonus_tags.append(f"庄家控盘({top10_conc*100:.0f}%)")
-
         # --- 加分: 优质开发者 ---
         if creator and creator in DEPLOYER_WHITELIST:
             bonus_score += BONUS_WEIGHT_QUALITY_DEPLOYER
@@ -3930,6 +3943,38 @@ def tag_filter(candidates: list[dict], now_ms: int,
         if liquidity >= BONUS_LIQUIDITY_30K:
             bonus_score += BONUS_WEIGHT_LIQUIDITY_30K
             bonus_tags.append(f"流动性${liquidity:.0f}")
+
+        # --- 加分: 小涨跌不动 (横盘整理 ≥3h 且 ≤8h) ---
+        if price_hist and len(price_hist) >= 2:
+            consolidation = _check_consolidation(price_hist, age_hours)
+            if consolidation:
+                bonus_score += BONUS_WEIGHT_CONSOLIDATION
+                bonus_tags.append(f"小涨跌不动(横盘{consolidation:.1f}h)")
+
+        # --- 加分: 成交额异动 (15min volume surge, 价格未大涨) ---
+        vol_hist = t.get("volumeHistory", [])
+        if len(vol_hist) >= 3:
+            vol_cur = vol_hist[-1] - vol_hist[-2]
+            vol_prev = vol_hist[-2] - vol_hist[-3]
+            if vol_prev > 0 and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO:
+                if len(price_hist) >= 2 and price_hist[-2] > 0:
+                    price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
+                    if price_gain < BONUS_VOLUME_SURGE_MAX_PRICE_GAIN:
+                        bonus_score += BONUS_WEIGHT_VOLUME_SURGE
+                        bonus_tags.append(f"成交额异动({vol_cur/vol_prev:.1f}x)")
+
+        # --- 加分: 流动性异动 (仅已毕业, 15min liq surge, 价格未大涨) ---
+        if is_graduated:
+            liq_hist = t.get("liquidityHistory", [])
+            if len(liq_hist) >= 3:
+                liq_cur = liq_hist[-1] - liq_hist[-2]
+                liq_prev = liq_hist[-2] - liq_hist[-3]
+                if liq_prev > 0 and liq_cur >= liq_prev * BONUS_LIQ_SURGE_RATIO:
+                    if len(price_hist) >= 2 and price_hist[-2] > 0:
+                        price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
+                        if price_gain < BONUS_LIQ_SURGE_MAX_PRICE_GAIN:
+                            bonus_score += BONUS_WEIGHT_LIQ_SURGE
+                            bonus_tags.append(f"流动性异动({liq_cur/liq_prev:.1f}x)")
 
         # --- 加分: Boost推广 ---
         boosts = t.get("boosts", 0)
