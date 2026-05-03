@@ -3910,8 +3910,8 @@ def tag_filter(candidates: list[dict], now_ms: int,
         t["_min_holders"] = min_holders
         t["isGraduated"] = is_graduated
 
-        # 至少一个加分项才能通过精筛
-        if bonus_score <= 0:
+        # 至少两个加分项才能通过精筛
+        if bonus_score < 2:
             continue
 
         results.append(t)
