@@ -413,6 +413,7 @@ ELIM_MID_AGE_HOURS = 1                # 1 小时
 ELIM_LATE_PEAK_HOLDERS = 8            # 币龄>2h 最高持币数 < 8 淘汰 (数据验证: 峰值持币8~9的代币偶有后续增长, 留出缓冲)
 ELIM_LATE_AGE_HOURS = 2               # 2 小时
 ELIM_PRICE_DROP_MIN_PRICE = 1e-7      # 价格暴跌保护: 当前价格低于此值视为 API 异常, 跳过价格跌幅淘汰
+ELIM_KLINESINGLE_DROP_PCT = 0.40     # 单根15min K线跌幅 >40% → 过山车币淘汰 (防暴涨后暴跌)
 
 # flap quote token 分类 (用于价格换算)
 # 零地址 = 原生 BNB, 需乘 BNB/USD; 稳定币 = 已是 USD 计价, 无需换算; 其他 = 非标代币计价
@@ -952,13 +953,24 @@ def flap_batch_details(tokens: list[dict]) -> dict[str, dict]:
 # ===================================================================
 
 
+_TWITTER_RESERVED_PATHS = {
+    'search', 'i', 'home', 'explore', 'notifications', 'messages',
+    'settings', 'signup', 'login', 'logout', 'account', 'privacy',
+    'tos', 'rules', 'help', 'about', 'blog', 'intent', 'status',
+    'hashtag', 'lists', 'topics', 'bookmarks', 'communities',
+    'jobs', 'ads', 'business', 'developers', 'api', 'share',
+}
+
+
 def _extract_twitter_username(url: str) -> str | None:
     """从推特 URL 中提取用户名"""
     if not url:
         return None
     m = re.search(r'(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)(?:/|$|\?)', url)
     if m:
-        return m.group(1)
+        username = m.group(1)
+        if username.lower() not in _TWITTER_RESERVED_PATHS:
+            return username
     return None
 
 
@@ -2574,15 +2586,17 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
     用于:
       1. 补充 peakPrice (扫描间隔内的价格冲高不会被 DexScreener 实时价捕获)
       2. 检测过山车行情 (klineHigh/klineLow 比值过大 = 已被炒过一轮)
+      3. 检测单根K线暴跌 (maxCandleDrop > 40% = 过山车币, 暴涨后暴跌风险大)
     OHLCV 格式: [timestamp, open, high, low, close, volume]
-      c[2] = high, c[3] = low
+      c[1] = open, c[2] = high, c[3] = low, c[4] = close
 
     K线数量策略:
       - 首次查询 (无 klineFixed 标记): 拉 24 根 (6h), 覆盖历史冲高
       - 后续轮次 (已有 klineFixed 标记): 拉 4 根 (1h), 只补上一轮间隔的遗漏
     限流策略: 3 线程并发 + 令牌桶限流 (~30 req/min), 遇 429 动态降速
 
-    返回: {address: {"high": float, "low": float}} — 每个代币的 K线最高价和最低价
+    返回: {address: {"high": float, "low": float, "maxCandleDrop": float}}
+        maxCandleDrop: 所有K线中单根最大跌幅 (close/open-1, 负值), 如 -0.45 表示某根K线跌45%
     """
     result = {}
     if not tokens:
@@ -2616,7 +2630,6 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
 
     def _query_one(t: dict) -> tuple[str, dict | None]:
         addr = t["address"]
-        # 首次查询拉 24 根 (6h 历史), 后续只拉 4 根 (1h)
         limit = 4 if t.get("klineFixed") else 24
         _rate_wait()
         try:
@@ -2626,8 +2639,15 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
                 high = max(float(c[2]) for c in candles)
                 lows = [float(c[3]) for c in candles if float(c[3]) > 0]
                 low = min(lows) if lows else 0
+                drops = []
+                for c in candles:
+                    o = float(c[1])
+                    cl = float(c[4])
+                    if o > 0:
+                        drops.append((cl - o) / o)
+                max_candle_drop = min(drops) if drops else 0.0
                 if high > 0:
-                    return addr, {"high": high, "low": low}
+                    return addr, {"high": high, "low": low, "maxCandleDrop": max_candle_drop}
             else:
                 _on_success()
         except Exception as e:
@@ -3317,6 +3337,12 @@ def elimination_check(queue: list[dict], now_ms: int,
                 and current_price < peak * (1 - ELIM_PRICE_DROP_PCT)):
             elim_reason = (f"价格跌{(1 - current_price / peak) * 100:.0f}% "
                            f"(峰:{peak:.2e} 现:{current_price:.2e})")
+
+        # 1b. 单根K线暴跌 (过山车币): 任何一根15min K线 close/open 跌超阈值
+        if not elim_reason:
+            kmd = t.get("klineMaxDrop")
+            if kmd is not None and kmd <= -ELIM_KLINESINGLE_DROP_PCT:
+                elim_reason = f"单根K线跌{abs(kmd)*100:.0f}% (过山车币, >{ELIM_KLINESINGLE_DROP_PCT*100:.0f}%阈值)"
 
         # 2. 持币数从 30+ 跌破 10
         if not elim_reason:
@@ -4230,6 +4256,8 @@ def fetch_scanner_quality_tokens() -> tuple[list[dict], str]:
                 "sellsH1": t.get("sells_h1", 0),
                 "buysH24": t.get("buys_h24", 0),
                 "sellsH24": t.get("sells_h24", 0),
+                "_bonus_score": t.get("bonus_score", 0),
+                "_bonus_tags": t.get("bonus_tags", []),
                 "_from_scanner": True,  # 标记来源
             })
         log.info("拉取 scanner 精筛结果: %d 个代币 (scanTime=%s)", len(result), scan_time_str)
@@ -4501,6 +4529,7 @@ def scan_once(cfg: dict) -> None:
 
     # 精筛代币K线修正: 仅对精筛通过的少量代币拉 GT K线
     # 用 K线 high/low 补充 peakPrice, 并记录 klineHigh/klineLow 供过山车检测
+    # 同时记录 klineMaxDrop (单根K线最大跌幅) 供过山车暴跌检测
     if quality_results:
         log.info("精筛K线修正: 查询 %d 个代币...", len(quality_results))
         kline_data = gt_batch_peak_prices(quality_results)
@@ -4509,10 +4538,10 @@ def scan_once(cfg: dict) -> None:
             if kd:
                 kline_high = kd["high"]
                 kline_low = kd["low"]
+                kline_max_drop = kd.get("maxCandleDrop", 0)
                 old_peak = t.get("peakPrice", 0)
                 if kline_high > old_peak:
                     t["peakPrice"] = kline_high
-                    # 同步更新队列中的对应代币
                     for s in survivors:
                         if s["address"] == t["address"]:
                             s["peakPrice"] = kline_high
@@ -4523,12 +4552,13 @@ def scan_once(cfg: dict) -> None:
                              (kline_high / old_peak - 1) * 100 if old_peak > 0 else 0)
                 t["klineHigh"] = kline_high
                 t["klineLow"] = kline_low
+                t["klineMaxDrop"] = kline_max_drop
                 t["klineFixed"] = True
-                # 同步 K线数据到队列
                 for s in survivors:
                     if s["address"] == t["address"]:
                         s["klineHigh"] = kline_high
                         s["klineLow"] = kline_low
+                        s["klineMaxDrop"] = kline_max_drop
                         s["klineFixed"] = True
                         break
 
@@ -4556,6 +4586,11 @@ def scan_once(cfg: dict) -> None:
             if current_price < peak_price * (1 - ELIM_PRICE_DROP_PCT):
                 elim_reason = (f"价格跌{(1 - current_price / peak_price) * 100:.0f}% "
                                f"(峰:{peak_price:.2e} 现:{current_price:.2e})")
+        # 单根K线暴跌 (过山车币): 任何一根15min K线 close/open 跌超阈值
+        if not elim_reason:
+            kmd = t.get("klineMaxDrop")
+            if kmd is not None and kmd <= -ELIM_KLINESINGLE_DROP_PCT:
+                elim_reason = f"单根K线跌{abs(kmd)*100:.0f}% (过山车币, >{ELIM_KLINESINGLE_DROP_PCT*100:.0f}%阈值)"
         # 持币数从 30+ 跌破 10
         if not elim_reason:
             if (t.get("peakHolders", 0) >= ELIM_HOLDERS_PEAK_MIN
@@ -4706,6 +4741,11 @@ def scan_once(cfg: dict) -> None:
                 "_bonus_score": item.get("_bonus_score", 0),
             }
             bonus_str = " | ".join(detail_data["_bonus_tags"]) if detail_data["_bonus_tags"] else "无"
+            if detail_data["_bonus_score"] <= 0:
+                log.info("  📦 %s [%s] 无加分项, 跳过买入 (bonus=%d)",
+                         token_data["shortName"] or token_data["name"],
+                         token_data["source"], detail_data["_bonus_score"])
+                continue
             log.info("  📦 %s [%s] 加分(%d): %s",
                      token_data["shortName"] or token_data["name"],
                      token_data["source"], detail_data["_bonus_score"], bonus_str)

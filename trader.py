@@ -2062,9 +2062,9 @@ def check_sell_conditions(pos: dict, current_price: float,
     返回: (是否应该卖出, 卖出原因)
 
     v16 策略:
-      1. 回撤止盈: 盈利 15% 后触发跟踪 (5%缓冲: 实际 10% 触发)
-         - 15%~30% 区间: 回撤 15% 止盈 (5%缓冲: 实际回撤 10% 即卖出)
-         - 30% 以上: 中点止盈法, 价格 ≤ (最高价 + 买入价) / 2
+      1. 回撤止盈: 盈利达到 tp_trigger_pct 后触发跟踪
+         - 触发~tp_midpoint_pct 区间: 从最高价回撤 (tp_drawdown_pct - 5%) 即卖出 (5%缓冲提前触发)
+         - tp_midpoint_pct 以上: 中点止盈法, 价格 ≤ (最高价 + 买入价) / 2
       2. 固定止损: 亏损 40% 止损 (5%缓冲: 实际 35% 止损)
       3. 动能衰竭止盈: ≥2 个指标同时恶化且当前盈利 → 止盈
       4. 超期清仓: 持仓超过 12h 且仍亏损 → 卖出
@@ -2089,9 +2089,8 @@ def check_sell_conditions(pos: dict, current_price: float,
     tp_midpoint_pct = trading_cfg.get("tp_midpoint_pct", 30)
     tp_drawdown_pct = trading_cfg.get("tp_drawdown_pct", 15)
 
-    # 触发跟踪 (带缓冲)
-    tp_trigger_buffered = tp_trigger_pct - BUFFER_PCT
-    if max_profit_pct >= tp_trigger_buffered:
+    # 触发跟踪 (触发阈值不受缓冲影响, 缓冲仅用于回撤卖出线)
+    if max_profit_pct >= tp_trigger_pct:
         if max_profit_pct >= tp_midpoint_pct:
             # 30% 以上: 中点止盈法 (价格 ≤ (最高价 + 买入价) / 2)
             midpoint = (max_price + buy_price) / 2
