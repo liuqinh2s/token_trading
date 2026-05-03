@@ -2901,20 +2901,26 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
             if value_usd < 0.1:
                 continue
 
-            # 获取代币名称
+            # 获取代币名称和代码
             try:
                 name_abi = [{"name": "name", "type": "function", "stateMutability": "view",
                              "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
+                sym_abi = [{"name": "symbol", "type": "function", "stateMutability": "view",
+                            "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
                 name_contract = _w3.eth.contract(address=token_cs, abi=name_abi)
+                sym_contract = _w3.eth.contract(address=token_cs, abi=sym_abi)
                 token_name = name_contract.functions.name().call()
+                token_symbol = sym_contract.functions.symbol().call()
             except Exception:
                 token_name = addr[:16]
+                token_symbol = addr[:10]
 
             venue = detect_venue(addr)
 
             holdings.append({
                 "address": addr,
                 "name": token_name,
+                "symbol": token_symbol,
                 "decimals": decimals,
                 "balance": str(balance),
                 "price_usd": price_usd,
@@ -2922,7 +2928,7 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
                 "venue": venue if venue != "UNKNOWN" else "PANCAKE",
             })
             log.info("  发现持仓 %s: %.2f 个, $%.10f/个, 价值 $%.2f [%s]",
-                     token_name, token_amount, price_usd, value_usd, venue)
+                     token_symbol, token_amount, price_usd, value_usd, venue)
 
         except Exception as e:
             log.debug("检查代币余额 [%s]: %s", addr[:16], e)
