@@ -3067,11 +3067,11 @@ def elimination_check(queue: list[dict], now_ms: int,
         elif peak_h == 0 and t.get("peakProgress", 0) > 0:
             pass
         elif age_hours > ELIM_EARLY_AGE_MIN and peak_h < ELIM_EARLY_PEAK_HOLDERS:
-            elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{peak_h}"
+            elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{peak_h}"
         elif age_hours > ELIM_MID_AGE_HOURS and peak_h < ELIM_MID_PEAK_HOLDERS:
-            elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{peak_h}"
+            elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{peak_h}"
         elif age_hours > ELIM_LATE_AGE_HOURS and peak_h < ELIM_LATE_PEAK_HOLDERS:
-            elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{peak_h}"
+            elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{peak_h}"
 
         if elim_reason:
             eliminated.append({**t, "eliminatedAt": now_ms, "elimReason": elim_reason})
@@ -3331,28 +3331,28 @@ def elimination_check(queue: list[dict], now_ms: int,
         if not elim_reason:
             for age_h, min_prog in ELIM_PROGRESS_TIERS:
                 if age_hours > age_h and current_progress < min_prog:
-                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{age_hours:.1f}h (阈值{min_prog*100:.0f}%)"
+                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{_fmt_age(age_hours)} (阈值{min_prog*100:.0f}%)"
                     break
 
         # 6. 币龄>15min 最高持币数 < 3
         if not elim_reason:
             if age_hours > ELIM_EARLY_AGE_MIN and t.get("peakHolders", 0) < ELIM_EARLY_PEAK_HOLDERS:
-                elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{t.get('peakHolders', 0)}"
+                elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{t.get('peakHolders', 0)}"
 
         # 7. 币龄>1h 最高持币数 < 5
         if not elim_reason:
             if age_hours > ELIM_MID_AGE_HOURS and t.get("peakHolders", 0) < ELIM_MID_PEAK_HOLDERS:
-                elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{t.get('peakHolders', 0)}"
+                elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{t.get('peakHolders', 0)}"
 
         # 7b. 币龄>2h 最高持币数 < 8 (清理僵尸币, 数据验证: 峰值持币8~9偶有后续增长, 留缓冲)
         if not elim_reason:
             if age_hours > ELIM_LATE_AGE_HOURS and t.get("peakHolders", 0) < ELIM_LATE_PEAK_HOLDERS:
-                elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{t.get('peakHolders', 0)}"
+                elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{t.get('peakHolders', 0)}"
 
         # 8. 修正后币龄 > 48h
         if not elim_reason:
             if age_hours > MAX_AGE_HOURS:
-                elim_reason = f"币龄>{MAX_AGE_HOURS}h (修正后{age_hours:.1f}h)"
+                elim_reason = f"币龄>{MAX_AGE_HOURS}h (修正后{_fmt_age(age_hours)})"
 
         # 9. 持币数从峰值跌 70% (清理僵尸币, 避免占位)
         if not elim_reason:
@@ -3644,6 +3644,16 @@ def calc_market_sentiment(queue: list[dict], queue_state: dict,
     return result
 
 
+def _fmt_age(age_hours: float) -> str:
+    """格式化币龄: <1h→分钟, 1h~24h→小时, ≥24h→天"""
+    if age_hours < 1:
+        return f"{age_hours * 60:.0f}m"
+    elif age_hours < 24:
+        return f"{age_hours:.1f}h"
+    else:
+        return f"{age_hours / 24:.1f}d"
+
+
 def _age_tier_match(age_hours: float, tiers: list[tuple]) -> float:
     """
     币龄阶梯匹配: 找到 age_hours 满足的最高 tier 阈值。
@@ -3721,19 +3731,19 @@ def tag_filter(candidates: list[dict], now_ms: int,
         # ==================== 基本面: 持币合格 ====================
         min_holders = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
         if holders < min_holders:
-            basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{age_hours:.1f}h)")
+            basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{_fmt_age(age_hours)})")
             basic_pass = False
 
         # ==================== 基本面: 进度/流动性合格 ====================
         if is_graduated:
             min_liquidity = _age_tier_match(age_hours, TAG_LIQUIDITY_TIERS)
             if liquidity < min_liquidity:
-                basic_fail_reasons.append(f"毕业流动性${liquidity:.0f}<${min_liquidity:.0f}(币龄{age_hours:.1f}h)")
+                basic_fail_reasons.append(f"毕业流动性${liquidity:.0f}<${min_liquidity:.0f}(币龄{_fmt_age(age_hours)})")
                 basic_pass = False
         else:
             min_progress = _age_tier_match(age_hours, TAG_PROGRESS_TIERS)
             if progress < min_progress:
-                basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{age_hours:.1f}h)")
+                basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{_fmt_age(age_hours)})")
                 basic_pass = False
 
         # ==================== 基本面: 1h买卖数合格 ====================
@@ -3742,7 +3752,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
         min_buys = _age_tier_match(age_hours, TAG_BUYS_TIERS)
         if buys_h1 > 0 or sells_h1 > 0:
             if buys_h1 < min_buys:
-                basic_fail_reasons.append(f"1h买入{buys_h1}<{min_buys}(币龄{age_hours:.1f}h)")
+                basic_fail_reasons.append(f"1h买入{buys_h1}<{min_buys}(币龄{_fmt_age(age_hours)})")
                 basic_pass = False
             elif buys_h1 <= sells_h1:
                 basic_fail_reasons.append(f"1h买入{buys_h1}≤卖出{sells_h1}")
@@ -3752,7 +3762,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
         volume_h1 = t.get("volumeH1", 0)
         min_volume = _age_tier_match(age_hours, TAG_VOLUME_TIERS)
         if volume_h1 > 0 and volume_h1 < min_volume:
-            basic_fail_reasons.append(f"成交额${volume_h1:.0f}<${min_volume}(币龄{age_hours:.1f}h)")
+            basic_fail_reasons.append(f"成交额${volume_h1:.0f}<${min_volume}(币龄{_fmt_age(age_hours)})")
             basic_pass = False
 
         # ==================== 基本面: 社交合格 ====================
@@ -3762,7 +3772,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
                            and holders >= TAG_FLAP_SOCIAL_EXEMPT_HOLDERS
                            and (is_graduated or progress >= TAG_FLAP_SOCIAL_EXEMPT_PROGRESS))
             if not flap_exempt:
-                basic_fail_reasons.append(f"无社交媒体(币龄{age_hours:.1f}h)")
+                basic_fail_reasons.append(f"无社交媒体(币龄{_fmt_age(age_hours)})")
                 basic_pass = False
 
         # ==================== 基本面: 创建者/代币合格 ====================
@@ -3773,7 +3783,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
 
         # ==================== 基本面: 币龄合格 ====================
         if age_hours > MAX_AGE_HOURS:
-            basic_fail_reasons.append(f"币龄{age_hours:.1f}h>{MAX_AGE_HOURS}h")
+            basic_fail_reasons.append(f"币龄{_fmt_age(age_hours)}>{MAX_AGE_HOURS}h")
             basic_pass = False
 
         # ==================== 基础标签: 未追高 (K线) ====================
@@ -3781,7 +3791,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
             price_change = current_price / peak_price - 1
             max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
             if price_change > max_change:
-                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{age_hours:.1f}h)")
+                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{_fmt_age(age_hours)})")
                 basic_pass = False
 
         # ==================== 基础标签: 波动充足 (近3轮振幅≥20%) ====================
@@ -4551,15 +4561,15 @@ def scan_once(cfg: dict) -> None:
         if not elim_reason:
             for age_h, min_prog in ELIM_PROGRESS_TIERS:
                 if age_hours > age_h and current_progress < min_prog:
-                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{age_hours:.1f}h (阈值{min_prog*100:.0f}%)"
+                    elim_reason = f"进度{current_progress * 100:.1f}% 币龄{_fmt_age(age_hours)} (阈值{min_prog*100:.0f}%)"
                     break
         # 早期/中期持币数不足
         if not elim_reason:
             if age_hours > ELIM_EARLY_AGE_MIN and t.get("peakHolders", 0) < ELIM_EARLY_PEAK_HOLDERS:
-                elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{t.get('peakHolders', 0)}"
+                elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{t.get('peakHolders', 0)}"
         if not elim_reason:
             if age_hours > ELIM_MID_AGE_HOURS and t.get("peakHolders", 0) < ELIM_MID_PEAK_HOLDERS:
-                elim_reason = f"币龄{age_hours:.1f}h 最高持币仅{t.get('peakHolders', 0)}"
+                elim_reason = f"币龄{_fmt_age(age_hours)} 最高持币仅{t.get('peakHolders', 0)}"
 
         if elim_reason:
             # 从队列存活中移除, 加入淘汰列表
