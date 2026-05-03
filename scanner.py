@@ -54,7 +54,7 @@ v15 精筛策略 (标签制: 基础标签 + 加分标签):
 
   加分标签 (通过基础后计算, 排优先级):
   - 仿盘加分: ≥2h且仿盘≥3(+1) → ≥8h且仿盘≥5(+2)
-  - 社交质量: 推特账号(非推文)+1, TG群+1
+  - 社交质量: 推特粉丝≥100+1, TG群成员≥100+1
   - 1h买压: 强买压(买/卖≥2x)+2, 强卖压(买/卖≤0.5x)-2
   - 成交额: ≥$10k(+1), ≥$5k(+0.5)
   - 持仓合理: 20%≤Top10≤85%(+2)
@@ -3872,30 +3872,24 @@ def tag_filter(candidates: list[dict], now_ms: int,
             bonus_score += cc_bonus * BONUS_WEIGHT_COPYCAT
             bonus_tags.append(f"仿盘(+{cc_bonus},共{cc_count})")
 
-        # --- 加分: 社交质量 (推特账号 / TG群) ---
+        # --- 加分: 社交质量 (推特粉丝≥100 / TG成员≥100) ---
         social_links = t.get("socialLinks", {})
         social_quality_bonus = 0
         twitter_url = social_links.get("twitter", "")
         if twitter_url:
             is_tweet = "/status/" in twitter_url
             if not is_tweet:
-                social_quality_bonus += 1
                 tw_followers = t.get("_tw_followers")
                 if tw_followers is not None and tw_followers >= SOCIAL_TWITTER_FOLLOWERS_MIN:
-                    social_quality_bonus += 1  # 粉丝≥100 额外加分
+                    social_quality_bonus += 1
                     bonus_tags.append(f"推特({tw_followers}粉)")
-                else:
-                    bonus_tags.append("推特账号")
 
         telegram_url = social_links.get("telegram", "")
         if telegram_url:
-            social_quality_bonus += 1
             tg_members = t.get("_tg_members")
             if tg_members is not None and tg_members >= SOCIAL_TG_MEMBERS_MIN:
-                social_quality_bonus += 1  # 成员≥100 额外加分
+                social_quality_bonus += 1
                 bonus_tags.append(f"TG({tg_members}人)")
-            else:
-                bonus_tags.append("TG群")
 
         if social_quality_bonus > 0:
             bonus_score += social_quality_bonus * BONUS_WEIGHT_SOCIAL_QUALITY
