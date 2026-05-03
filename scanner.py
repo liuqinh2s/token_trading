@@ -47,8 +47,8 @@ v16 精筛策略 (标签制: 基础全过 + 加分标签):
 
   加分标签 (只三项硬指标):
   - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h(+1)
-  - 成交额异动: 15min成交额比上一根增≥20%, 且价格涨幅<100%(+1)
-  - 流动性异动: 仅已毕业, 15min流动性比上一根增≥20%, 且价格涨幅<100%(+1)
+  - 成交额异动: 阳线 + 增量≥前根×7 + K线涨幅≤100% + 增量>500u(+1)
+  - 流动性异动: 仅已毕业, 阳线 + 增量≥前根×1.2 + 价格涨幅<100% + 增量≥$15k(+1)
 """
 
 from __future__ import annotations
@@ -324,13 +324,13 @@ BONUS_CONSOLIDATION_MIN_HOURS = 3.0      # 横盘最少时间 (小时)
 BONUS_CONSOLIDATION_MAX_HOURS = 8.0      # 横盘最多时间 (小时)
 
 # --- 加分标签: 成交额异动 (volume surge) ---
-# 本15分钟成交额比上一根15分钟成交额多 ≥ 20%, 且价格涨幅 < 100%
-BONUS_VOLUME_SURGE_RATIO = 1.20        # 成交额增长比例
-BONUS_VOLUME_SURGE_MAX_PRICE_GAIN = 1.0  # 价格涨幅上限 (1.0 = 100%)
-BONUS_VOLUME_SURGE_MIN_DELTA = 1000     # 成交额异动最低金额 ($)
+# 要求: 当前15min K线阳线 + 成交额增量≥前1根×7 + K线涨幅≤100% + 增量>500u
+BONUS_VOLUME_SURGE_RATIO = 7            # 成交额增长比例 (7倍)
+BONUS_VOLUME_SURGE_MAX_PRICE_GAIN = 1.0 # 价格涨幅上限 (1.0 = 100%)
+BONUS_VOLUME_SURGE_MIN_DELTA = 500      # 成交额异动最低金额 ($)
 
 # --- 加分标签: 流动性异动 (liquidity surge, 仅已毕业) ---
-# 本15分钟流动性比上一根15分钟流动性多 ≥ 20%, 且价格涨幅 < 100%
+# 要求: 当前15min K线阳线 + 流动性增量≥前1根×1.2 + 价格涨幅<100% + 增量≥$15k
 BONUS_LIQ_SURGE_RATIO = 1.20            # 流动性增长比例
 BONUS_LIQ_SURGE_MAX_PRICE_GAIN = 1.0    # 价格涨幅上限 (1.0 = 100%)
 BONUS_LIQ_SURGE_MIN_DELTA = 15000       # 流动性异动最低金额 ($)
@@ -3767,8 +3767,8 @@ def tag_filter(candidates: list[dict], now_ms: int,
 
     加分标签 (只三项硬指标, 至少一项才开仓):
       - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h
-      - 成交额异动: 15min成交额比上一根≥1.2x, 且价格涨幅<100%
-      - 流动性异动: 仅已毕业, 15min流动性比上一根≥1.2x, 且价格涨幅<100%
+      - 成交额异动: 阳线 + 成交额增量≥前根×7 + K线涨幅≤100% + 增量>500u
+      - 流动性异动: 仅已毕业, 阳线 + 流动性增量≥前根×1.2 + 价格涨幅<100% + 增量≥$15k
 
     返回按加分总分降序排列的精筛结果
     """
@@ -3915,30 +3915,34 @@ def tag_filter(candidates: list[dict], now_ms: int,
                 bonus_score += BONUS_WEIGHT_CONSOLIDATION
                 bonus_tags.append(f"小涨跌不动(横盘{consolidation:.1f}h)")
 
-        # --- 加分: 成交额异动 (15min volume surge, 价格未大涨) ---
+        # --- 加分: 成交额异动 (15min K线阳线 + 成交量爆炸 + 涨幅≤100%) ---
         vol_hist = t.get("volumeHistory", [])
-        if len(vol_hist) >= 3:
+        if len(vol_hist) >= 3 and len(price_hist) >= 2 and price_hist[-2] > 0:
+            is_bullish_candle = price_hist[-1] > price_hist[-2]
             vol_cur = vol_hist[-1] - vol_hist[-2]
             vol_prev = vol_hist[-2] - vol_hist[-3]
-            if vol_prev > 0 and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO and vol_cur >= BONUS_VOLUME_SURGE_MIN_DELTA:
-                if len(price_hist) >= 2 and price_hist[-2] > 0:
-                    price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
-                    if price_gain < BONUS_VOLUME_SURGE_MAX_PRICE_GAIN:
-                        bonus_score += BONUS_WEIGHT_VOLUME_SURGE
-                        bonus_tags.append(f"成交额异动({vol_cur/vol_prev:.1f}x)")
+            price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
+            if (is_bullish_candle and vol_prev > 0
+                    and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO
+                    and vol_cur > BONUS_VOLUME_SURGE_MIN_DELTA
+                    and price_gain <= BONUS_VOLUME_SURGE_MAX_PRICE_GAIN):
+                bonus_score += BONUS_WEIGHT_VOLUME_SURGE
+                bonus_tags.append(f"成交额异动({vol_cur/vol_prev:.1f}x)")
 
-        # --- 加分: 流动性异动 (仅已毕业, 15min liq surge, 价格未大涨) ---
+        # --- 加分: 流动性异动 (仅已毕业, 15min K线阳线 + liq surge) ---
         if is_graduated:
             liq_hist = t.get("liquidityHistory", [])
-            if len(liq_hist) >= 3:
+            if len(liq_hist) >= 3 and len(price_hist) >= 2 and price_hist[-2] > 0:
+                is_bullish_candle = price_hist[-1] > price_hist[-2]
                 liq_cur = liq_hist[-1] - liq_hist[-2]
                 liq_prev = liq_hist[-2] - liq_hist[-3]
-                if liq_prev > 0 and liq_cur >= liq_prev * BONUS_LIQ_SURGE_RATIO and liq_cur >= BONUS_LIQ_SURGE_MIN_DELTA:
-                    if len(price_hist) >= 2 and price_hist[-2] > 0:
-                        price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
-                        if price_gain < BONUS_LIQ_SURGE_MAX_PRICE_GAIN:
-                            bonus_score += BONUS_WEIGHT_LIQ_SURGE
-                            bonus_tags.append(f"流动性异动({liq_cur/liq_prev:.1f}x)")
+                price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
+                if (is_bullish_candle and liq_prev > 0
+                        and liq_cur >= liq_prev * BONUS_LIQ_SURGE_RATIO
+                        and liq_cur >= BONUS_LIQ_SURGE_MIN_DELTA
+                        and price_gain < BONUS_LIQ_SURGE_MAX_PRICE_GAIN):
+                    bonus_score += BONUS_WEIGHT_LIQ_SURGE
+                    bonus_tags.append(f"流动性异动({liq_cur/liq_prev:.1f}x)")
 
         t["_bonus_score"] = bonus_score
         t["_bonus_tags"] = bonus_tags
