@@ -11,10 +11,9 @@ v16 架构: 标签制精筛 (基础标签 AND + 加分标签排优先级)
   4. 精筛 (瞬时): 标签制精筛, 基础标签全部满足(AND) + 加分标签排优先级
   5. 仿盘检测: 本地统计同名代币数量 (零 API 调用)
 
-v16 精筛策略 (标签制: 基础标签 + 加分标签):
-  每个维度按币龄精细化分层, 币龄越长要求越高
-  基础标签: 持币数/进度/流动性/K线/社交/创建者/币龄 — 全部满足才通过, 目标 ~30/天
-  加分标签: 仿盘/小涨跌不动/成交额异动/流动性异动/优质开发者/持币≥1k/流动性≥30k/Boost — 排优先级, 至少一项才开仓
+v16 精筛策略 (标签制: 基础全过 + 加分标签):
+  基础标签已注释, 所有代币基础全过
+  加分标签: 小涨跌不动/成交额异动/流动性异动 — 三项硬指标, 至少一项才开仓
 
 砍掉的慢环节 (v5 → v6):
   - GeckoTerminal K线 (每个代币 2s+)
@@ -43,22 +42,13 @@ v16 精筛策略 (标签制: 基础标签 + 加分标签):
 
 精筛条件 (v15: 标签制 — 基础标签 AND + 加分标签排优先级):
 
-  基础标签 (全部满足, AND, 每个维度均按币龄精细化分层):
-  - 持币合格 (币龄阶梯): 15min≥10 → 30min≥20 → 1h≥50 → 2h≥80 → 4h≥120 → 8h≥150 → 16h≥200
-  - 进度合格 (币龄阶梯, 未毕业): 15min≥2% → 30min≥5% → 1h≥8% → 2h≥15% → 4h≥30% → 8h≥50% → 16h≥70%
-  - 流动性合格 (已毕业, 币龄阶梯): 15min≥$1k → 30min≥$2k → 1h≥$3k → 4h≥$5k → 8h≥$8k → 16h≥$10k
-  - K线合格 (币龄阶梯, 防追高): 15min≤200% → 1h≤400% → 4h≤800% → 8h≤1000%
-  - 社交合格: 币龄≥15min 后 ≥1
-  - 创建者合格: 不在黑名单
-  - 币龄合格: ≤48h
+  基础标签 (已注释, 全部放行):
+  - 持币合格 / 进度合格 / 流动性合格 / K线合格 / 社交合格 / 创建者合格 / 币龄合格
 
-  加分标签 (通过基础后计算, 排优先级, 至少一项才开仓):
-  - 仿盘加分: ≥2h且仿盘≥3(+1) → ≥8h且仿盘≥5(+2)
+  加分标签 (只三项硬指标):
   - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h(+1)
   - 成交额异动: 15min成交额比上一根增≥20%, 且价格涨幅<100%(+1)
   - 流动性异动: 仅已毕业, 15min流动性比上一根增≥20%, 且价格涨幅<100%(+1)
-  - 优质开发者+1, Boost推广+1
-  - 持币≥1k(+1), 流动性≥$30k(+1)
 """
 
 from __future__ import annotations
@@ -337,18 +327,15 @@ BONUS_CONSOLIDATION_MAX_HOURS = 8.0      # 横盘最多时间 (小时)
 # 本15分钟成交额比上一根15分钟成交额多 ≥ 20%, 且价格涨幅 < 100%
 BONUS_VOLUME_SURGE_RATIO = 1.20        # 成交额增长比例
 BONUS_VOLUME_SURGE_MAX_PRICE_GAIN = 1.0  # 价格涨幅上限 (1.0 = 100%)
+BONUS_VOLUME_SURGE_MIN_DELTA = 1000     # 成交额异动最低金额 ($)
 
 # --- 加分标签: 流动性异动 (liquidity surge, 仅已毕业) ---
 # 本15分钟流动性比上一根15分钟流动性多 ≥ 20%, 且价格涨幅 < 100%
 BONUS_LIQ_SURGE_RATIO = 1.20            # 流动性增长比例
 BONUS_LIQ_SURGE_MAX_PRICE_GAIN = 1.0    # 价格涨幅上限 (1.0 = 100%)
+BONUS_LIQ_SURGE_MIN_DELTA = 15000       # 流动性异动最低金额 ($)
 
-# --- 加分标签权重 (所有加分项权重相同) ---
-BONUS_WEIGHT_COPYCAT = 1
-BONUS_WEIGHT_QUALITY_DEPLOYER = 1
-BONUS_WEIGHT_BOOST = 1
-BONUS_WEIGHT_HOLDERS_1K = 1      # 持币≥1k
-BONUS_WEIGHT_LIQUIDITY_30K = 1   # 流动性≥$30k
+# --- 加分标签权重 (只保留三项硬指标加分) ---
 BONUS_WEIGHT_CONSOLIDATION = 1   # 小涨跌不动
 BONUS_WEIGHT_VOLUME_SURGE = 1    # 成交额异动
 BONUS_WEIGHT_LIQ_SURGE = 1       # 流动性异动
@@ -3774,17 +3761,11 @@ def _check_consolidation(price_hist: list[float], age_hours: float) -> float:
 def tag_filter(candidates: list[dict], now_ms: int,
                market_sentiment: dict | None = None) -> list[dict]:
     """
-    标签制精筛 — v16: 基础标签(AND) + 加分标签(优先级排序)
+    标签制精筛 — v16: 加分标签(优先级排序)
 
-    基础标签 (全部满足才通过):
-      大盘向上: 近1h平均GAS ≥ 近12hGAS
-      基本面: 持币 + 进度/流动性 + 1h买卖数 + 成交额 + 社交 + 创建者/代币 + 币龄
-      未追高: K线币龄阶梯涨幅检查
-      波动充足: 近3轮振幅有至少一根 ≥ 20%
-      趋势向上: 当前价格 ≥ 4轮前价格 (≈1h)
+    基础标签: 已注释, 全部放行
 
-    加分标签 (通过基础标签后计算, 排优先级, 至少一项才开仓):
-      - 仿盘加分 / 小涨跌不动 / 成交额异动 / 流动性异动 / 优质开发者 / 持币≥1k / 流动性≥$30k / Boost
+    加分标签 (只三项硬指标, 至少一项才开仓):
       - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h
       - 成交额异动: 15min成交额比上一根≥1.2x, 且价格涨幅<100%
       - 流动性异动: 仅已毕业, 15min流动性比上一根≥1.2x, 且价格涨幅<100%
@@ -3814,135 +3795,118 @@ def tag_filter(candidates: list[dict], now_ms: int,
         age_hours = (now_ms - t.get("createdAt", 0)) / 3600000
         peak_price = t.get("peakPrice", 0)
 
-        basic_pass = True
-        basic_fail_reasons = []
+        # basic_pass = True
+        # basic_fail_reasons = []
 
-        # ==================== 基础标签 1: 大盘向上 ====================
-        if not is_bullish:
-            basic_fail_reasons.append("大盘向下(近1hGAS<近12hGAS)")
-            basic_pass = False
+        # ==================== 基础标签: 全部已注释 (v16: 基础全过, 只看加分项) ====================
+        # basic_pass = True
+        # basic_fail_reasons = []
+        #
+        # # === 大盘向上 ===
+        # if not is_bullish:
+        #     basic_fail_reasons.append("大盘向下(近1hGAS<近12hGAS)")
+        #     basic_pass = False
+        #
+        # # === 持币合格 ===
+        # min_holders = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
+        # if holders < min_holders:
+        #     basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{_fmt_age(age_hours)})")
+        #     basic_pass = False
+        #
+        # # === 进度/流动性合格 ===
+        # if is_graduated:
+        #     min_liquidity = _age_tier_match(age_hours, TAG_LIQUIDITY_TIERS)
+        #     if liquidity < min_liquidity:
+        #         basic_fail_reasons.append(f"毕业流动性${liquidity:.0f}<${min_liquidity:.0f}(币龄{_fmt_age(age_hours)})")
+        #         basic_pass = False
+        # else:
+        #     min_progress = _age_tier_match(age_hours, TAG_PROGRESS_TIERS)
+        #     if progress < min_progress:
+        #         basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{_fmt_age(age_hours)})")
+        #         basic_pass = False
+        #
+        # # === 1h买卖数合格 ===
+        # buys_h1 = t.get("buysH1", 0)
+        # sells_h1 = t.get("sellsH1", 0)
+        # min_buys = _age_tier_match(age_hours, TAG_BUYS_TIERS)
+        # if buys_h1 > 0 or sells_h1 > 0:
+        #     if buys_h1 < min_buys:
+        #         basic_fail_reasons.append(f"1h买入{buys_h1}<{min_buys}(币龄{_fmt_age(age_hours)})")
+        #         basic_pass = False
+        #     elif buys_h1 <= sells_h1:
+        #         basic_fail_reasons.append(f"1h买入{buys_h1}≤卖出{sells_h1}")
+        #         basic_pass = False
+        #
+        # # === 成交额合格 ===
+        # volume_h1 = t.get("volumeH1", 0)
+        # min_volume = _age_tier_match(age_hours, TAG_VOLUME_TIERS)
+        # if volume_h1 > 0 and volume_h1 < min_volume:
+        #     basic_fail_reasons.append(f"成交额${volume_h1:.0f}<${min_volume}(币龄{_fmt_age(age_hours)})")
+        #     basic_pass = False
+        #
+        # # === 社交合格 ===
+        # social_count = t.get("socialCount", 0)
+        # if age_hours >= TAG_SOCIAL_MIN_AGE and social_count < TAG_SOCIAL_MIN_COUNT:
+        #     flap_exempt = (is_flap
+        #                    and holders >= TAG_FLAP_SOCIAL_EXEMPT_HOLDERS
+        #                    and (is_graduated or progress >= TAG_FLAP_SOCIAL_EXEMPT_PROGRESS))
+        #     if not flap_exempt:
+        #         basic_fail_reasons.append(f"无社交媒体(币龄{_fmt_age(age_hours)})")
+        #         basic_pass = False
+        #
+        # # === 创建者/代币合格 ===
+        # creator = (t.get("creator") or "").lower()
+        # if creator and creator in DEPLOYER_BLACKLIST:
+        #     basic_fail_reasons.append(f"创建者在黑名单")
+        #     basic_pass = False
+        #
+        # # === 币龄合格 ===
+        # if age_hours > MAX_AGE_HOURS:
+        #     basic_fail_reasons.append(f"币龄{_fmt_age(age_hours)}>{MAX_AGE_HOURS}h")
+        #     basic_pass = False
+        #
+        # # === 未追高 (K线) ===
+        # if peak_price > 0 and current_price > 0:
+        #     price_change = current_price / peak_price - 1
+        #     max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
+        #     if price_change > max_change:
+        #         basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{_fmt_age(age_hours)})")
+        #         basic_pass = False
+        #
+        # # === 波动充足 (近3轮振幅≥20%) ===
+        # price_hist = t.get("priceHistory", [])
+        # if price_hist and len(price_hist) >= 2:
+        #     window = price_hist[-TAG_AMPLITUDE_WINDOW:]
+        #     has_amplitude = False
+        #     for i in range(1, len(window)):
+        #         prev = window[i - 1]
+        #         curr = window[i]
+        #         if prev > 0 and curr > 0:
+        #             amp = abs(curr - prev) / prev
+        #             if amp >= TAG_AMPLITUDE_MIN_RATIO:
+        #                 has_amplitude = True
+        #                 break
+        #     if not has_amplitude:
+        #         if len(price_hist) >= TAG_AMPLITUDE_WINDOW:
+        #             basic_fail_reasons.append(f"波动不足(近{min(len(window),TAG_AMPLITUDE_WINDOW)}轮振幅<20%)")
+        #             basic_pass = False
+        #
+        # # === 趋势向上 (当前价≥4轮前价) ===
+        # if price_hist and len(price_hist) >= TAG_TREND_WINDOW:
+        #     price_4_ago = price_hist[-TAG_TREND_WINDOW]
+        #     if price_4_ago > 0 and current_price < price_4_ago:
+        #         basic_fail_reasons.append(f"趋势向下(当前{current_price:.2e}<{TAG_TREND_WINDOW}轮前{price_4_ago:.2e})")
+        #         basic_pass = False
+        #
+        # if not basic_pass:
+        #     continue
 
-        # ==================== 基本面: 持币合格 ====================
-        min_holders = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
-        if holders < min_holders:
-            basic_fail_reasons.append(f"持币{holders}<{min_holders}(币龄{_fmt_age(age_hours)})")
-            basic_pass = False
-
-        # ==================== 基本面: 进度/流动性合格 ====================
-        if is_graduated:
-            min_liquidity = _age_tier_match(age_hours, TAG_LIQUIDITY_TIERS)
-            if liquidity < min_liquidity:
-                basic_fail_reasons.append(f"毕业流动性${liquidity:.0f}<${min_liquidity:.0f}(币龄{_fmt_age(age_hours)})")
-                basic_pass = False
-        else:
-            min_progress = _age_tier_match(age_hours, TAG_PROGRESS_TIERS)
-            if progress < min_progress:
-                basic_fail_reasons.append(f"进度{progress*100:.0f}%<{min_progress*100:.0f}%(币龄{_fmt_age(age_hours)})")
-                basic_pass = False
-
-        # ==================== 基本面: 1h买卖数合格 ====================
-        buys_h1 = t.get("buysH1", 0)
-        sells_h1 = t.get("sellsH1", 0)
-        min_buys = _age_tier_match(age_hours, TAG_BUYS_TIERS)
-        if buys_h1 > 0 or sells_h1 > 0:
-            if buys_h1 < min_buys:
-                basic_fail_reasons.append(f"1h买入{buys_h1}<{min_buys}(币龄{_fmt_age(age_hours)})")
-                basic_pass = False
-            elif buys_h1 <= sells_h1:
-                basic_fail_reasons.append(f"1h买入{buys_h1}≤卖出{sells_h1}")
-                basic_pass = False
-
-        # ==================== 基本面: 成交额合格 ====================
-        volume_h1 = t.get("volumeH1", 0)
-        min_volume = _age_tier_match(age_hours, TAG_VOLUME_TIERS)
-        if volume_h1 > 0 and volume_h1 < min_volume:
-            basic_fail_reasons.append(f"成交额${volume_h1:.0f}<${min_volume}(币龄{_fmt_age(age_hours)})")
-            basic_pass = False
-
-        # ==================== 基本面: 社交合格 ====================
-        social_count = t.get("socialCount", 0)
-        if age_hours >= TAG_SOCIAL_MIN_AGE and social_count < TAG_SOCIAL_MIN_COUNT:
-            flap_exempt = (is_flap
-                           and holders >= TAG_FLAP_SOCIAL_EXEMPT_HOLDERS
-                           and (is_graduated or progress >= TAG_FLAP_SOCIAL_EXEMPT_PROGRESS))
-            if not flap_exempt:
-                basic_fail_reasons.append(f"无社交媒体(币龄{_fmt_age(age_hours)})")
-                basic_pass = False
-
-        # ==================== 基本面: 创建者/代币合格 ====================
-        creator = (t.get("creator") or "").lower()
-        if creator and creator in DEPLOYER_BLACKLIST:
-            basic_fail_reasons.append(f"创建者在黑名单")
-            basic_pass = False
-
-        # ==================== 基本面: 币龄合格 ====================
-        if age_hours > MAX_AGE_HOURS:
-            basic_fail_reasons.append(f"币龄{_fmt_age(age_hours)}>{MAX_AGE_HOURS}h")
-            basic_pass = False
-
-        # ==================== 基础标签: 未追高 (K线) ====================
-        if peak_price > 0 and current_price > 0:
-            price_change = current_price / peak_price - 1
-            max_change = _age_tier_match(age_hours, TAG_KLINE_TIERS)
-            if price_change > max_change:
-                basic_fail_reasons.append(f"涨幅{price_change*100:.0f}%>{max_change*100:.0f}%(币龄{_fmt_age(age_hours)})")
-                basic_pass = False
-
-        # ==================== 基础标签: 波动充足 (近3轮振幅≥20%) ====================
         price_hist = t.get("priceHistory", [])
-        if price_hist and len(price_hist) >= 2:
-            window = price_hist[-TAG_AMPLITUDE_WINDOW:]
-            has_amplitude = False
-            for i in range(1, len(window)):
-                prev = window[i - 1]
-                curr = window[i]
-                if prev > 0 and curr > 0:
-                    amp = abs(curr - prev) / prev
-                    if amp >= TAG_AMPLITUDE_MIN_RATIO:
-                        has_amplitude = True
-                        break
-            if not has_amplitude:
-                if len(price_hist) >= TAG_AMPLITUDE_WINDOW:
-                    basic_fail_reasons.append(f"波动不足(近{min(len(window),TAG_AMPLITUDE_WINDOW)}轮振幅<20%)")
-                    basic_pass = False
+        creator = (t.get("creator") or "").lower()
 
-        # ==================== 基础标签: 趋势向上 (当前价≥4轮前价) ====================
-        if price_hist and len(price_hist) >= TAG_TREND_WINDOW:
-            price_4_ago = price_hist[-TAG_TREND_WINDOW]
-            if price_4_ago > 0 and current_price < price_4_ago:
-                basic_fail_reasons.append(f"趋势向下(当前{current_price:.2e}<{TAG_TREND_WINDOW}轮前{price_4_ago:.2e})")
-                basic_pass = False
-
-        if not basic_pass:
-            continue
-
-        # ==================== 加分标签计算 ====================
+        # ==================== 加分标签计算 (只三项硬指标) ====================
         bonus_score = 0
         bonus_tags = []
-
-        # --- 加分: 仿盘数 ---
-        cc = t.get("copycat", {})
-        cc_count = cc.get("count", 0) if cc else 0
-        cc_bonus = _age_tier_match_bonus(age_hours, COPYCAT_BONUS_TIERS)
-        if cc_bonus > 0:
-            bonus_score += cc_bonus * BONUS_WEIGHT_COPYCAT
-            bonus_tags.append(f"仿盘(+{cc_bonus},共{cc_count})")
-
-        # --- 加分: 优质开发者 ---
-        if creator and creator in DEPLOYER_WHITELIST:
-            bonus_score += BONUS_WEIGHT_QUALITY_DEPLOYER
-            bonus_tags.append("优质开发者")
-            t["_isQualityDeployer"] = True
-
-        # --- 加分: 持币数≥1000 ---
-        if holders >= BONUS_HOLDERS_1K:
-            bonus_score += BONUS_WEIGHT_HOLDERS_1K
-            bonus_tags.append(f"持币≥1k({holders})")
-
-        # --- 加分: 流动性≥$30k ---
-        if liquidity >= BONUS_LIQUIDITY_30K:
-            bonus_score += BONUS_WEIGHT_LIQUIDITY_30K
-            bonus_tags.append(f"流动性${liquidity:.0f}")
 
         # --- 加分: 小涨跌不动 (横盘整理 ≥3h 且 ≤8h) ---
         if price_hist and len(price_hist) >= 2:
@@ -3956,7 +3920,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
         if len(vol_hist) >= 3:
             vol_cur = vol_hist[-1] - vol_hist[-2]
             vol_prev = vol_hist[-2] - vol_hist[-3]
-            if vol_prev > 0 and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO:
+            if vol_prev > 0 and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO and vol_cur >= BONUS_VOLUME_SURGE_MIN_DELTA:
                 if len(price_hist) >= 2 and price_hist[-2] > 0:
                     price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
                     if price_gain < BONUS_VOLUME_SURGE_MAX_PRICE_GAIN:
@@ -3969,23 +3933,17 @@ def tag_filter(candidates: list[dict], now_ms: int,
             if len(liq_hist) >= 3:
                 liq_cur = liq_hist[-1] - liq_hist[-2]
                 liq_prev = liq_hist[-2] - liq_hist[-3]
-                if liq_prev > 0 and liq_cur >= liq_prev * BONUS_LIQ_SURGE_RATIO:
+                if liq_prev > 0 and liq_cur >= liq_prev * BONUS_LIQ_SURGE_RATIO and liq_cur >= BONUS_LIQ_SURGE_MIN_DELTA:
                     if len(price_hist) >= 2 and price_hist[-2] > 0:
                         price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
                         if price_gain < BONUS_LIQ_SURGE_MAX_PRICE_GAIN:
                             bonus_score += BONUS_WEIGHT_LIQ_SURGE
                             bonus_tags.append(f"流动性异动({liq_cur/liq_prev:.1f}x)")
 
-        # --- 加分: Boost推广 ---
-        boosts = t.get("boosts", 0)
-        if boosts > 0:
-            bonus_score += BONUS_WEIGHT_BOOST
-            bonus_tags.append(f"Boost({boosts})")
-
         t["_bonus_score"] = bonus_score
         t["_bonus_tags"] = bonus_tags
         t["_age_hours"] = age_hours
-        t["_min_holders"] = min_holders
+        t["_min_holders"] = _age_tier_match(age_hours, TAG_HOLDERS_TIERS)
         t["isGraduated"] = is_graduated
 
         # 至少一个加分项才能通过精筛
@@ -3995,10 +3953,8 @@ def tag_filter(candidates: list[dict], now_ms: int,
         results.append(t)
 
         grad_str = "毕业" if is_graduated else f"进度{progress*100:.0f}%"
-        log.info("标签精筛: ✓ %s — 持币=%d/%d, %s, 仿盘=%d, 社交=%d, 币龄=%.1fh, "
-                 "加分=%d, 标签=[%s]",
-                 name, holders, min_holders, grad_str, cc_count, social_count,
-                 age_hours, bonus_score,
+        log.info("标签精筛: ✓ %s — 币龄=%.1fh, 加分=%d, 标签=[%s]",
+                 name, age_hours, bonus_score,
                  ", ".join(bonus_tags) if bonus_tags else "无")
 
     results.sort(key=lambda x: x.get("_bonus_score", 0), reverse=True)
