@@ -2645,7 +2645,15 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
                         drops.append((cl - o) / o)
                 max_candle_drop = min(drops) if drops else 0.0
                 if high > 0:
-                    return addr, {"high": high, "low": low, "maxCandleDrop": max_candle_drop}
+                    last_candles = []
+                    for c in candles[-3:]:
+                        last_candles.append({
+                            "o": float(c[1]),
+                            "c": float(c[4]),
+                            "v": float(c[5]),
+                        })
+                    return addr, {"high": high, "low": low, "maxCandleDrop": max_candle_drop,
+                                  "klineCandles": last_candles}
             else:
                 _on_success()
         except Exception as e:
@@ -4544,12 +4552,17 @@ def scan_once(cfg: dict) -> None:
                 t["klineLow"] = kline_low
                 t["klineMaxDrop"] = kline_max_drop
                 t["klineFixed"] = True
+                kline_candles_data = kd.get("klineCandles", [])
+                if kline_candles_data:
+                    t["klineCandles"] = kline_candles_data
                 for s in survivors:
                     if s["address"] == t["address"]:
                         s["klineHigh"] = kline_high
                         s["klineLow"] = kline_low
                         s["klineMaxDrop"] = kline_max_drop
                         s["klineFixed"] = True
+                        if kline_candles_data:
+                            s["klineCandles"] = kline_candles_data
                         break
 
     # 精筛再验证: K线更新后重新检查淘汰条件 + 精筛条件
@@ -4622,7 +4635,58 @@ def scan_once(cfg: dict) -> None:
             log.info("精筛再验证: ✗ %s → 淘汰 (%s)",
                      t.get("name") or t["address"][:16], elim_reason)
         else:
-            revalidated.append(t)
+            # K线成交额异动修正: 用 GT 15min K线真实成交量重新判定
+            kline_candles = t.get("klineCandles", [])
+            if len(kline_candles) >= 2:
+                cur_candle = kline_candles[-1]
+                prev_candle = kline_candles[-2]
+                is_bullish_kline = cur_candle["c"] > cur_candle["o"]
+                kline_vol_cur = cur_candle["v"]
+                kline_vol_prev = prev_candle["v"]
+                if prev_candle["c"] > 0:
+                    kline_price_gain = (cur_candle["c"] - prev_candle["c"]) / prev_candle["c"]
+                else:
+                    kline_price_gain = 0
+
+                old_tags = t.get("_bonus_tags", [])
+                had_volume_surge = any("成交额异动" in tag for tag in old_tags)
+
+                kline_surge = (is_bullish_kline and kline_vol_prev > 0
+                               and kline_vol_cur >= kline_vol_prev * BONUS_VOLUME_SURGE_RATIO
+                               and kline_vol_cur > BONUS_VOLUME_SURGE_MIN_DELTA
+                               and kline_price_gain <= BONUS_VOLUME_SURGE_MAX_PRICE_GAIN)
+
+                if kline_surge:
+                    if not had_volume_surge:
+                        t["_bonus_tags"] = old_tags + [f"成交额异动({kline_vol_cur/kline_vol_prev:.1f}x)"]
+                        t["_bonus_score"] = t.get("_bonus_score", 0) + BONUS_WEIGHT_VOLUME_SURGE
+                        log.info("  K线成交额修正 %s: +成交额异动(%.1fx, 实K线)",
+                                 t.get("name") or t["address"][:16],
+                                 kline_vol_cur / kline_vol_prev)
+                elif had_volume_surge:
+                    t["_bonus_tags"] = [tag for tag in old_tags if "成交额异动" not in tag]
+                    t["_bonus_score"] = max(0, t.get("_bonus_score", 0) - BONUS_WEIGHT_VOLUME_SURGE)
+                    log.info("  K线成交额修正 %s: -成交额异动(假阳性, 实K线量 %.0f/%.0f)",
+                             t.get("name") or t["address"][:16],
+                             kline_vol_cur, kline_vol_prev)
+
+                if t.get("_bonus_score", 0) <= 0:
+                    elim_reason = "K线成交额修正后无加分项"
+                    survivors[:] = [s for s in survivors if s["address"] != t["address"]]
+                    eliminated.append({**t, "eliminatedAt": now_ms, "elimReason": elim_reason})
+                    queue_state["eliminated"].append({
+                        "address": t["address"], "name": t.get("name", ""),
+                        "symbol": t.get("symbol", ""),
+                        "elimReason": elim_reason, "eliminatedAt": now_ms,
+                        "createdAt": t.get("createdAt", 0),
+                    })
+                    demoted_to_elim += 1
+                    log.info("精筛再验证: ✗ %s → 淘汰 (%s)",
+                             t.get("name") or t["address"][:16], elim_reason)
+                else:
+                    revalidated.append(t)
+            else:
+                revalidated.append(t)
 
     # 再验证后的精筛结果替换原列表
     quality_results = revalidated
