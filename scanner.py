@@ -47,7 +47,7 @@ v16 精筛策略 (标签制: 基础全过 + 加分标签):
 
   加分标签 (只三项硬指标):
   - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h(+1)
-  - 成交额异动: 阳线 + 增量≥前根×7 + K线涨幅≤100% + 增量>500u(+1)
+  - 成交额异动: 阳线 + 增量≥前根×7 + K线涨幅≤100% + 增量≥500u(+1)
   - 流动性异动: 仅已毕业, 阳线 + 增量≥前根×1.2 + 价格涨幅<100% + 增量≥$15k(+1)
 """
 
@@ -324,7 +324,7 @@ BONUS_CONSOLIDATION_MIN_HOURS = 3.0      # 横盘最少时间 (小时)
 BONUS_CONSOLIDATION_MAX_HOURS = 8.0      # 横盘最多时间 (小时)
 
 # --- 加分标签: 成交额异动 (volume surge) ---
-# 要求: 当前15min K线阳线 + 成交额增量≥前1根×7 + K线涨幅≤100% + 增量>500u
+# 要求: 当前15min K线阳线 + 成交额增量≥前1根×7 + K线涨幅≤100% + 增量≥500u
 BONUS_VOLUME_SURGE_RATIO = 7            # 成交额增长比例 (7倍)
 BONUS_VOLUME_SURGE_MAX_PRICE_GAIN = 1.0 # 价格涨幅上限 (1.0 = 100%)
 BONUS_VOLUME_SURGE_MIN_DELTA = 500      # 成交额异动最低金额 ($)
@@ -2421,6 +2421,7 @@ def ds_batch_prices(addresses: list[str]) -> dict[str, dict]:
                         "boosts": boosts_active,
                         "name": p["baseToken"].get("name", ""),
                         "symbol": p["baseToken"].get("symbol", ""),
+                        "pairAddress": (p.get("pairAddress") or "").lower(),
                     }
                 break  # 成功则跳出重试循环
             except (ConnectionError, ConnectionResetError) as e:
@@ -2627,11 +2628,12 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
             _interval[0] = max(_min_interval, _interval[0] - 0.1)
 
     def _query_one(t: dict) -> tuple[str, dict | None]:
-        addr = t["address"]
+        token_addr = t["address"]
+        pool_addr = t.get("gtPoolAddress") or token_addr
         limit = 4 if t.get("klineFixed") else 24
         _rate_wait()
         try:
-            candles = gt_ohlcv_15min(addr, limit=limit)
+            candles = gt_ohlcv_15min(pool_addr, limit=limit)
             if candles:
                 _on_success()
                 high = max(float(c[2]) for c in candles)
@@ -2652,13 +2654,13 @@ def gt_batch_peak_prices(tokens: list[dict]) -> dict[str, dict]:
                             "c": float(c[4]),
                             "v": float(c[5]),
                         })
-                    return addr, {"high": high, "low": low, "maxCandleDrop": max_candle_drop,
+                    return token_addr, {"high": high, "low": low, "maxCandleDrop": max_candle_drop,
                                   "klineCandles": last_candles}
             else:
                 _on_success()
         except Exception as e:
-            log.debug("GT K线查询失败 [%s]: %s", addr[:16], e)
-        return addr, None
+            log.debug("GT K线查询失败 [%s]: %s", token_addr[:16], e)
+        return token_addr, None
 
     # 3 线程并发查询, 令牌桶控制全局速率
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -3298,6 +3300,10 @@ def elimination_check(queue: list[dict], now_ms: int,
         if ds:
             t["name"] = ds.get("name") or t.get("name", "")
             t["symbol"] = ds.get("symbol") or t.get("symbol", "")
+            # 记录 GT 池子地址 (用于 GT K线查询, 部分代币 tokenAddress ≠ poolAddress)
+            ds_pool = ds.get("pairAddress", "")
+            if ds_pool:
+                t["gtPoolAddress"] = ds_pool
             # 更新交易量和买卖笔数 (DexScreener)
             t["volume24h"] = ds.get("volume24h", 0)
             t["volumeH1"] = ds.get("volumeH1", 0)
@@ -3775,7 +3781,7 @@ def tag_filter(candidates: list[dict], now_ms: int,
 
     加分标签 (只三项硬指标, 至少一项才开仓):
       - 小涨跌不动: 最低→最高涨幅≤3.5倍 且 最高→最低跌幅≤55%, 横盘≥3h且≤8h
-      - 成交额异动: 阳线 + 成交额增量≥前根×7 + K线涨幅≤100% + 增量>500u
+      - 成交额异动: 阳线 + 成交额增量≥前根×7 + K线涨幅≤100% + 增量≥500u
       - 流动性异动: 仅已毕业, 阳线 + 流动性增量≥前根×1.2 + 价格涨幅<100% + 增量≥$15k
 
     返回按加分总分降序排列的精筛结果
@@ -3932,10 +3938,10 @@ def tag_filter(candidates: list[dict], now_ms: int,
             price_gain = (price_hist[-1] - price_hist[-2]) / price_hist[-2]
             if (is_bullish_candle and vol_prev > 0
                     and vol_cur >= vol_prev * BONUS_VOLUME_SURGE_RATIO
-                    and vol_cur > BONUS_VOLUME_SURGE_MIN_DELTA
+                    and vol_cur >= BONUS_VOLUME_SURGE_MIN_DELTA
                     and price_gain <= BONUS_VOLUME_SURGE_MAX_PRICE_GAIN):
                 bonus_score += BONUS_WEIGHT_VOLUME_SURGE
-                bonus_tags.append(f"成交额异动({vol_cur/vol_prev:.1f}x)")
+                bonus_tags.append(f"成交额异动({vol_cur/vol_prev:.1f}x, 当前${vol_cur:.0f}/前根${vol_prev:.0f})")
 
         # --- 加分: 流动性异动 (仅已毕业, 15min K线阳线 + liq surge) ---
         if is_graduated:
@@ -4034,8 +4040,9 @@ def post_quality_defense(candidates: list[dict], api_key: str) -> list[dict]:
         # 特征 C: 1min K线头部脉冲 + 后续全是死线 = 拉盘后无人接盘
         if not exclude_reason:
             try:
-                candles_15m = gt_ohlcv_15min(addr, limit=12)  # 最近 3 小时的 15min K线
-                candles_1m = gt_ohlcv_1min(addr, limit=30)    # 最近 30 根 1min K线
+                kline_query_addr = t.get("gtPoolAddress") or addr
+                candles_15m = gt_ohlcv_15min(kline_query_addr, limit=12)  # 最近 3 小时的 15min K线
+                candles_1m = gt_ohlcv_1min(kline_query_addr, limit=30)    # 最近 30 根 1min K线
                 fake_result = detect_fake_candles(candles_15m, candles_1m)
                 t["fakeCandle"] = fake_result
                 if fake_result["fake"]:
@@ -4653,16 +4660,16 @@ def scan_once(cfg: dict) -> None:
 
                 kline_surge = (is_bullish_kline and kline_vol_prev > 0
                                and kline_vol_cur >= kline_vol_prev * BONUS_VOLUME_SURGE_RATIO
-                               and kline_vol_cur > BONUS_VOLUME_SURGE_MIN_DELTA
+                               and kline_vol_cur >= BONUS_VOLUME_SURGE_MIN_DELTA
                                and kline_price_gain <= BONUS_VOLUME_SURGE_MAX_PRICE_GAIN)
 
                 if kline_surge:
                     if not had_volume_surge:
-                        t["_bonus_tags"] = old_tags + [f"成交额异动({kline_vol_cur/kline_vol_prev:.1f}x)"]
+                        t["_bonus_tags"] = old_tags + [f"成交额异动({kline_vol_cur/kline_vol_prev:.1f}x, 当前${kline_vol_cur:.0f}/前根${kline_vol_prev:.0f})"]
                         t["_bonus_score"] = t.get("_bonus_score", 0) + BONUS_WEIGHT_VOLUME_SURGE
-                        log.info("  K线成交额修正 %s: +成交额异动(%.1fx, 实K线)",
+                        log.info("  K线成交额修正 %s: +成交额异动(%.1fx, 实K线 当前$%.0f/前根$%.0f)",
                                  t.get("name") or t["address"][:16],
-                                 kline_vol_cur / kline_vol_prev)
+                                 kline_vol_cur / kline_vol_prev, kline_vol_cur, kline_vol_prev)
                 elif had_volume_surge:
                     t["_bonus_tags"] = [tag for tag in old_tags if "成交额异动" not in tag]
                     t["_bonus_score"] = max(0, t.get("_bonus_score", 0) - BONUS_WEIGHT_VOLUME_SURGE)
@@ -4686,7 +4693,28 @@ def scan_once(cfg: dict) -> None:
                 else:
                     revalidated.append(t)
             else:
-                revalidated.append(t)
+                old_tags = t.get("_bonus_tags", [])
+                had_volume_surge = any("成交额异动" in tag for tag in old_tags)
+                if had_volume_surge:
+                    t["_bonus_tags"] = [tag for tag in old_tags if "成交额异动" not in tag]
+                    t["_bonus_score"] = max(0, t.get("_bonus_score", 0) - BONUS_WEIGHT_VOLUME_SURGE)
+                    log.info("  K线成交额修正 %s: -成交额异动(K线数据不足无法验证, 移除标签)",
+                             t.get("name") or t["address"][:16])
+                if t.get("_bonus_score", 0) <= 0:
+                    elim_reason = "K线成交额修正后无加分项"
+                    survivors[:] = [s for s in survivors if s["address"] != t["address"]]
+                    eliminated.append({**t, "eliminatedAt": now_ms, "elimReason": elim_reason})
+                    queue_state["eliminated"].append({
+                        "address": t["address"], "name": t.get("name", ""),
+                        "symbol": t.get("symbol", ""),
+                        "elimReason": elim_reason, "eliminatedAt": now_ms,
+                        "createdAt": t.get("createdAt", 0),
+                    })
+                    demoted_to_elim += 1
+                    log.info("精筛再验证: ✗ %s → 淘汰 (%s)",
+                             t.get("name") or t["address"][:16], elim_reason)
+                else:
+                    revalidated.append(t)
 
     # 再验证后的精筛结果替换原列表
     quality_results = revalidated
