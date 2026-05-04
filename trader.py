@@ -2704,25 +2704,23 @@ def stop_monitor():
 
 
 # ===================================================================
-#  启动时清理低价值历史记录
+#  启动时清理过期历史记录
 # ===================================================================
-CLEANUP_VALUE_THRESHOLD = 0.1  # 低于 $0.1 的已平仓记录直接删除
+COOLDOWN_PROTECT_MS = 48 * 3600 * 1000  # 48h 冷却保护, 超过此时间的 CLOSED 记录无保留价值
 
 
 def _cleanup_low_value_positions(bnb_price_usd: float):
     """
-    清理数据库中价值极低的已平仓记录, 减少启动时链上扫描量
-    删除条件: status=CLOSED 且持仓价值低于阈值 且已过冷却期
+    清理数据库中过期的已平仓记录
+    删除条件: status=CLOSED 且 sell_time 已过 48h 冷却保护期
+    冷却期内 (48h) 的记录必须保留, 否则 is_in_cooldown 会失效
     不会删除 OPEN 持仓, 不调用任何 API
-    注意: 冷却期内的 CLOSED 记录绝不删除, 否则 is_in_cooldown 会失效
     """
     conn = sqlite3.connect(str(DB_PATH))
     _init_positions_db(conn)
 
-    # 查询所有 CLOSED 记录, 用数据库中已有的价格数据判断
     rows = conn.execute("""
-        SELECT id, token_address, token_name, buy_amount, token_decimals,
-               sell_price_usd, current_price, sell_time
+        SELECT id, token_address, token_name, sell_time
         FROM positions
         WHERE status = 'CLOSED'
     """).fetchall()
@@ -2732,37 +2730,21 @@ def _cleanup_low_value_positions(bnb_price_usd: float):
         return
 
     now_ms = int(time.time() * 1000)
-    # 冷却保护: 平仓后 48h 内的记录不删除 (取盈利/亏损冷却期的较大值再加缓冲)
-    COOLDOWN_PROTECT_MS = 48 * 3600 * 1000
 
     delete_ids = []
     for row in rows:
-        pos_id, addr, name, buy_amount_str, decimals, sell_price, current_price, sell_time = row
+        pos_id, addr, name, sell_time = row
 
-        # 冷却期保护: 平仓时间在保护期内的记录绝不删除
-        if sell_time and (now_ms - sell_time) < COOLDOWN_PROTECT_MS:
-            continue
-
-        # 用 buy_amount * best_price 估算持仓价值 (不能用单价和阈值比较, meme 币单价极低)
-        best_price = max(sell_price or 0, current_price or 0)
-        try:
-            amount = int(buy_amount_str or "0")
-            dec = decimals or 18
-            token_amount = amount / (10 ** dec)
-            value = token_amount * best_price
-            if value < CLEANUP_VALUE_THRESHOLD:
-                delete_ids.append((pos_id, name or addr[:16]))
-        except (ValueError, TypeError, OverflowError):
-            # 无法计算价值时, 用买入金额兜底 (buy_bnb * bnb_price)
-            pass
+        if sell_time and (now_ms - sell_time) >= COOLDOWN_PROTECT_MS:
+            delete_ids.append((pos_id, name or (addr or "")[:16]))
 
     if delete_ids:
         conn.execute(
             f"DELETE FROM positions WHERE id IN ({','.join(str(d[0]) for d in delete_ids)})"
         )
         conn.commit()
-        log.info("数据库清理: 删除 %d 条低价值已平仓记录 (价值<$%.2f, 已过冷却保护期)",
-                 len(delete_ids), CLEANUP_VALUE_THRESHOLD)
+        log.info("数据库清理: 删除 %d 条过期已平仓记录 (平仓超 48h, 冷却保护已失效)",
+                 len(delete_ids))
 
     remaining = conn.execute("SELECT COUNT(DISTINCT token_address) FROM positions").fetchone()[0]
     log.info("数据库清理: 剩余 %d 个不同代币地址", remaining)
@@ -2787,8 +2769,8 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
     扫描钱包中所有 BEP-20 代币, 返回价值 > $0.1 的持仓列表 (排除 BNB/USDT 等稳定币)
 
     代币地址来源 (多源合并):
-      1. 数据库历史持仓记录 (OPEN + CLOSED)
-      2. BSCScan tokentx API (有 key 时)
+      1. 数据库未平仓持仓 (status=OPEN, 已平仓的余额必为 0 无需查)
+      2. BSCScan tokentx API (有 key 时, 可发现钱包新买入的代币)
     然后逐个查链上余额 + 询价, 筛选价值 > $0.1 的
     """
     if not _w3 or not _wallet_address:
@@ -2798,18 +2780,20 @@ def _scan_wallet_tokens(bnb_price_usd: float) -> list[dict]:
 
     token_addrs: set[str] = set()
 
-    # 来源 1: 数据库历史持仓
+    # 来源 1: 数据库未平仓持仓 (已平仓的不需要查链上余额, 余额必为 0)
     try:
         conn = sqlite3.connect(str(DB_PATH))
         _init_positions_db(conn)
-        rows = conn.execute("SELECT DISTINCT token_address FROM positions").fetchall()
+        rows = conn.execute(
+            "SELECT DISTINCT token_address FROM positions WHERE status = 'OPEN'"
+        ).fetchall()
         for (addr,) in rows:
             addr_lower = (addr or "").lower()
             if addr_lower and addr_lower not in SKIP_TOKENS:
                 token_addrs.add(addr_lower)
         conn.close()
         if token_addrs:
-            log.info("持仓同步: 从数据库获取 %d 个历史代币地址", len(token_addrs))
+            log.info("持仓同步: 从数据库获取 %d 个未平仓代币地址", len(token_addrs))
     except Exception as e:
         log.debug("读取数据库历史持仓失败: %s", e)
 
