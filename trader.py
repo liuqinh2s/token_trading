@@ -45,6 +45,11 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 log = logging.getLogger(__name__)
 
+try:
+    from error_handler import send_error_manually as _send_error
+except ImportError:
+    _send_error = None
+
 # ===================================================================
 #  常量 & 合约地址 (BSC Mainnet)
 # ===================================================================
@@ -2672,6 +2677,8 @@ def monitor_positions(cfg_loader, bnb_price_func):
 
         except Exception as e:
             log.error("监控异常: %s", e, exc_info=True)
+            if _send_error:
+                _send_error(f"持仓监控异常: {e}", exc_info=True)
 
         _monitor_stop.wait(trading_cfg.get("monitor_interval_sec", 60) if 'trading_cfg' in dir() else 60)
 

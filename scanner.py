@@ -92,8 +92,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+try:
+    from error_handler import init_error_handler, send_error_manually
+    init_error_handler()
+    _HAS_ERROR_HANDLER = True
+except Exception as _eh_err:
+    _HAS_ERROR_HANDLER = False
+    log.warning("全局异常处理器加载失败: %s", _eh_err)
+
 if not _HAS_TRADER:
     log.warning("trader 模块导入失败: %s (自动交易不可用)", _trader_err)
+    if _HAS_ERROR_HANDLER:
+        send_error_manually(f"trader 模块导入失败: {_trader_err}", exc_info=True)
 
 # ===================================================================
 #  配置
@@ -4871,6 +4881,8 @@ def main():
             log.info("交易模块未安装 (缺少 web3), 仅运行扫描模式")
     except Exception as e:
         log.warning("交易模块加载异常: %s, 仅运行扫描模式", e)
+        if _HAS_ERROR_HANDLER:
+            send_error_manually(f"交易模块加载异常: {e}", exc_info=True)
 
     while True:
         try:
@@ -4902,6 +4914,8 @@ def main():
             break
         except Exception as e:
             log.error("扫描异常: %s", e, exc_info=True)
+            if _HAS_ERROR_HANDLER:
+                send_error_manually(f"扫描循环异常: {e}", exc_info=True)
             time.sleep(60)
 
 
